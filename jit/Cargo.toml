@@ -1,0 +1,23 @@
+[package]
+name = "jit"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[dependencies]
+rust = { git = "https://github.com/drift-labs/jit-proxy", commit = "b3c3ed0" }
+solana-sdk = "1.14.16"
+drift-sdk = { git = "https://github.com/drift-labs/drift-rs", commit = "755d40d" }
+tokio = { version = "1.35.1", features = ["full"] }
+drift = { git = "https://github.com/drift-labs/protocol-v2.git", commit = "2bbe28c", features = ["mainnet-beta"]}
+dotenv = "0.15.0"
+thiserror = "1.0.58"
+async-trait = "0.1.79"
+log = "0.4.21"
+env_logger = "0.11.3"
