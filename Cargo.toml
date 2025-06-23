@@ -1,0 +1,21 @@
+[package]
+name = "filler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-lang = "*"
+axum = "0.7.9" # pinned due to tonic 0.12.3
+clap = { version = "4.5.40", "features" = ["env", "derive"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+dotenv = "0.15.0"
+drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "5834a00" }
+env_logger = "0.11"
+log = "0.4"
+prometheus = "*"
+futures-util = "0.3.31"
+solana-rpc-client-api = "2"
+solana-sdk = "2"
+solana-account-decoder-client-types = "2"
+solana-transaction-status-client-types = "2"
+tokio = "*"

@@ -1,0 +1,51 @@
+name: build_and_test
+
+on:
+  pull_request:
+    branches:
+      - master
+      - mainnet-beta
+
+jobs:
+  build_and_test:
+    runs-on: ubicloud
+    container: rust:1.84.1
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        task: ["build", "test"]
+    env:
+      CARGO_DRIFT_FFI_PATH: /usr/local/lib
+    steps:
+      # Common steps
+      - name: Checkout main
+        uses: actions/checkout@v3
+
+      - name: Install OS dependencies
+        run: apt-get update && apt-get install -y git cmake jq
+
+      - name: Install rustfmt and toolchain
+        run: rustup component add rustfmt
+
+      - name: Install libdrift_ffi
+        run: |
+          SO_URL=$(curl -s https://api.github.com/repos/drift-labs/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url')
+          echo "downloading libdrift: $SO_URL"
+          curl -L -o libdrift_ffi_sys.so "$SO_URL"
+          cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Fmt
+        if: matrix.task == 'build'
+        run: cargo fmt
+
+      - name: Build
+        if: matrix.task == 'build'
+        run: cargo check
