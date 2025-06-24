@@ -1,7 +1,4 @@
-//! Example swift maker bot
-//!
-//! The `TODO:` comments should be altered depending on individual maker strategy
-//!
+//! Filler Bot
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -117,7 +114,7 @@ struct FillerBot {
 
 impl FillerBot {
     async fn new(config: Config, metrics: Arc<Metrics>) -> Self {
-        let _ = env_logger::init();
+        env_logger::init();
         let _ = dotenv::dotenv();
         let wallet: Wallet = Keypair::from_base58_string(
             &std::env::var("BOT_PRIVATE_KEY").expect("base58 BOT_PRIVATE_KEY set"),
@@ -149,12 +146,12 @@ impl FillerBot {
         )
         .await;
 
-        let _ = drift
+        drift
             .subscribe_blockhashes()
             .await
             .expect("subscribed blockhashes");
 
-        let _ = drift
+        drift
             .subscribe_account(&filler_subaccount)
             .await
             .expect("subscribed filler subaccount");
@@ -259,7 +256,7 @@ impl FillerBot {
                                 let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order);
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
-                                    try_swift_fill(drift.clone(), config.clone(), filler_subaccount, signed_order, crosses, tx_worker_ref.clone());
+                                    try_swift_fill(drift.clone(), config.clone(), filler_subaccount, signed_order, crosses, tx_worker_ref.clone()).await;
                                     break;
                                 }
                             }
@@ -280,7 +277,7 @@ impl FillerBot {
 
                         if !crosses.is_empty() {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses:?}", market.index());
-                            try_auction_fill(drift.clone(), config.clone(), market.index(), filler_subaccount, crosses, tx_worker_ref.clone())
+                            try_auction_fill(drift.clone(), config.clone(), market.index(), filler_subaccount, crosses, tx_worker_ref.clone()).await;
                         }
                     }
                 }
@@ -321,7 +318,7 @@ fn on_slot_update_fn(
                     .expect("sent");
             }
         }
-        let _ = slot_tx.try_send(new_slot).expect("sent");
+        slot_tx.try_send(new_slot).expect("sent");
     }
 }
 
@@ -330,8 +327,9 @@ fn on_account_update_fn(
     drift: DriftClient,
 ) -> impl Fn(&AccountUpdate) + Send + Sync + 'static {
     move |update| {
-        let new_user = drift_rs::utils::deser_user(update.data);
+        let new_user = drift_rs::utils::deser_zero_copy(update.data);
         match drift
+            .backend()
             .account_map()
             .account_data_and_slot::<User>(&update.pubkey)
         {
@@ -340,7 +338,7 @@ fn on_account_update_fn(
                     let user_order_deltas = drift_rs::dlob::util::compare_user_orders(
                         update.pubkey,
                         &stored.data,
-                        &new_user,
+                        new_user,
                     );
                     for delta in user_order_deltas {
                         dlob_notifier
@@ -374,7 +372,7 @@ fn on_account_update_fn(
 }
 
 /// Try to fill a swift order
-fn try_swift_fill(
+async fn try_swift_fill(
     drift: DriftClient,
     config: Config,
     filler_subaccount: Pubkey,
@@ -390,8 +388,9 @@ fn try_swift_fill(
         .try_get_account::<User>(&filler_subaccount)
         .expect("filler account");
     let taker_account_data = drift
-        .try_get_account::<User>(&taker_subaccount)
-        .expect("taker account");
+        .get_account_value::<User>(&taker_subaccount)
+        .await
+        .unwrap();
     let taker_stats = drift
         .try_get_account::<UserStats>(&Wallet::derive_stats_account(&taker_account_data.authority))
         .expect("taker stats");
@@ -438,7 +437,7 @@ fn try_swift_fill(
 /// Try to fill an auction order
 ///
 /// - `auction_crosses` list of one or more crosses to fill
-fn try_auction_fill(
+async fn try_auction_fill(
     drift: DriftClient,
     config: Config,
     market_index: u16,
@@ -455,8 +454,9 @@ fn try_auction_fill(
         let taker_subaccount = taker_order_metadata.user;
 
         let taker_account_data = drift
-            .try_get_account::<User>(&taker_subaccount)
-            .expect("taker account");
+            .get_account_value::<User>(&taker_subaccount)
+            .await
+            .unwrap();
         let taker_stats = drift
             .try_get_account::<UserStats>(&Wallet::derive_stats_account(
                 &taker_account_data.authority,
@@ -543,7 +543,7 @@ async fn sync_stats_accounts(drift: &DriftClient) {
     match stats_sync_result {
         Ok(accounts) => {
             for (pubkey, account) in accounts {
-                drift.account_map().on_account_fn()(&AccountUpdate {
+                drift.backend().account_map().on_account_fn()(&AccountUpdate {
                     pubkey,
                     data: &account.data,
                     lamports: account.lamports,
@@ -583,7 +583,7 @@ async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifier) {
     match sync_result {
         Ok(accounts) => {
             for (pubkey, account) in accounts {
-                let user: &User = drift_rs::utils::deser_user(&account.data);
+                let user: &User = drift_rs::utils::deser_zero_copy(&account.data);
                 for order in user.orders {
                     if order.status == OrderStatus::Open
                         && order.base_asset_amount > order.base_asset_amount_filled
@@ -599,7 +599,7 @@ async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifier) {
                             .expect("sent");
                     }
                 }
-                drift.account_map().on_account_fn()(&AccountUpdate {
+                drift.backend().account_map().on_account_fn()(&AccountUpdate {
                     pubkey,
                     data: &account.data,
                     lamports: account.lamports,
@@ -853,7 +853,7 @@ impl TxWorker {
                                         intent_label.as_str(),
                                         if amm_fill { "amm" } else { "orderbook" },
                                     ])
-                                    .inc_by(actual_fills as u64);
+                                    .inc_by(actual_fills);
                                 metrics
                                     .confirmation_slots
                                     .with_label_values(&[intent_label.as_str()])

@@ -9,7 +9,7 @@ axum = "0.7.9" # pinned due to tonic 0.12.3
 clap = { version = "4.5.40", "features" = ["env", "derive"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "5834a00" }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "69422102", features = ["unsafe_pub"] }
 env_logger = "0.11"
 log = "0.4"
 prometheus = "*"
