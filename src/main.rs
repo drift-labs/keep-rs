@@ -123,10 +123,10 @@ impl FillerBot {
         )
         .into();
 
-        log::info!(target: "filler", "bot started: authority={:?}, subaccount={:?}", wallet.authority(), wallet.default_sub_account());
+        let filler_subaccount = wallet.default_sub_account();
+        log::info!(target: "filler", "bot started: authority={:?}, subaccount={:?}", wallet.authority(), filler_subaccount);
         log::info!(target: "filler", "mainnet={}, markets={}", config.mainnet, config.market_ids);
 
-        let filler_subaccount = wallet.default_sub_account();
         let context = if config.mainnet {
             drift_rs::types::Context::MainNet
         } else {
@@ -143,30 +143,8 @@ impl FillerBot {
         let tx_worker = TxWorker::new(drift.clone(), metrics);
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
-        let slot_rx = setup_grpc(
-            drift.clone(),
-            dlob,
-            &config.market_id_vec(),
-            tx_worker_ref.clone(),
-        )
-        .await;
-
-        drift
-            .subscribe_blockhashes()
-            .await
-            .expect("subscribed blockhashes");
-
-        drift
-            .subscribe_account(&filler_subaccount)
-            .await
-            .expect("subscribed filler subaccount");
 
         let market_ids = config.market_id_vec();
-        let swift_order_stream = drift
-            .subscribe_swift_orders(&market_ids, Some(true))
-            .await
-            .expect("subscribed swift orders");
-
         let market_pubkeys: Vec<Pubkey> = market_ids
             .iter()
             .map(|x| {
@@ -177,9 +155,33 @@ impl FillerBot {
                     .pubkey
             })
             .collect();
+
         let priority_fee_subscriber =
             PriorityFeeSubscriber::new(drift.rpc().url(), &market_pubkeys);
         let priority_fee_subscriber = priority_fee_subscriber.subscribe();
+
+        let slot_rx = setup_grpc(
+            drift.clone(),
+            dlob,
+            &config.market_id_vec(),
+            tx_worker_ref.clone(),
+        )
+        .await;
+
+        let swift_order_stream = drift
+            .subscribe_swift_orders(&market_ids, Some(true))
+            .await
+            .expect("subscribed swift orders");
+
+        drift
+            .subscribe_blockhashes()
+            .await
+            .expect("subscribed blockhashes");
+
+        drift
+            .subscribe_account(&filler_subaccount)
+            .await
+            .expect("subscribed filler subaccount");
 
         FillerBot {
             drift,
@@ -363,7 +365,7 @@ fn on_account_update_fn(
             .account_data_and_slot::<User>(&update.pubkey)
         {
             Some(stored) => {
-                if stored.slot < update.slot {
+                if stored.slot <= update.slot {
                     let user_order_deltas = drift_rs::dlob::util::compare_user_orders(
                         update.pubkey,
                         &stored.data,
@@ -377,6 +379,8 @@ fn on_account_update_fn(
                             })
                             .expect("sent");
                     }
+                } else {
+                    log::warn!(target: "filler", "out of order update at slot: {:?} - {:?}", stored.slot, update.slot);
                 }
             }
             None => {
@@ -660,8 +664,7 @@ async fn subscribe_grpc(
             "https://api.rpcpool.com".into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
-                .interslot_updates_on()
-                .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
+                .commitment(solana_sdk::commitment_config::CommitmentLevel::Confirmed)
                 .usermap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
