@@ -14,6 +14,7 @@ use drift_rs::{
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
     grpc::{grpc_subscriber::AccountFilter, AccountUpdate, TransactionUpdate},
+    priority_fee_subscriber::PriorityFeeSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
         accounts::{User, UserStats},
@@ -110,6 +111,7 @@ struct FillerBot {
     market_ids: Vec<MarketId>,
     config: Config,
     tx_worker_ref: TxSender,
+    priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
 }
 
 impl FillerBot {
@@ -165,6 +167,20 @@ impl FillerBot {
             .await
             .expect("subscribed swift orders");
 
+        let market_pubkeys: Vec<Pubkey> = market_ids
+            .iter()
+            .map(|x| {
+                drift
+                    .program_data()
+                    .perp_market_config_by_index(x.index())
+                    .unwrap()
+                    .pubkey
+            })
+            .collect();
+        let priority_fee_subscriber =
+            PriorityFeeSubscriber::new(drift.rpc().url(), &market_pubkeys);
+        let priority_fee_subscriber = priority_fee_subscriber.subscribe();
+
         FillerBot {
             drift,
             dlob,
@@ -176,6 +192,7 @@ impl FillerBot {
             market_ids,
             config,
             tx_worker_ref,
+            priority_fee_subscriber,
         }
     }
 
@@ -190,6 +207,7 @@ impl FillerBot {
         let market_ids = self.market_ids;
         let config = self.config.clone();
         let tx_worker_ref = self.tx_worker_ref.clone();
+        let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
 
         loop {
             tokio::select! {
@@ -259,7 +277,15 @@ impl FillerBot {
                                 let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order);
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
-                                    try_swift_fill(drift.clone(), config.clone(), filler_subaccount, signed_order, crosses, tx_worker_ref.clone()).await;
+                                    try_swift_fill(
+                                        drift.clone(),
+                                        priority_fee_subscriber.priority_fee_nth(0.8),
+                                        config.swift_cu_limit,
+                                        filler_subaccount,
+                                        signed_order,
+                                        crosses,
+                                        tx_worker_ref.clone()
+                                    ).await;
                                     break;
                                 }
                             }
@@ -280,7 +306,7 @@ impl FillerBot {
 
                         if !crosses.is_empty() {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses:?}", market.index());
-                            try_auction_fill(drift.clone(), config.clone(), market.index(), filler_subaccount, crosses, tx_worker_ref.clone()).await;
+                            try_auction_fill(drift.clone(), priority_fee_subscriber.priority_fee_nth(0.8), config.fill_cu_limit, market.index(), filler_subaccount, crosses, tx_worker_ref.clone()).await;
                         }
                     }
                 }
@@ -377,7 +403,8 @@ fn on_account_update_fn(
 /// Try to fill a swift order
 async fn try_swift_fill(
     drift: DriftClient,
-    config: Config,
+    priority_fee: u64,
+    cu_limit: u32,
     filler_subaccount: Pubkey,
     swift_order: SignedOrderInfo,
     crosses: MakerCrosses,
@@ -416,7 +443,7 @@ async fn try_swift_fill(
 
     // let taker_order_id = taker_account_data.next_order_id;
     let tx = tx_builder
-        .with_priority_fee(config.priority_fee, Some(config.swift_cu_limit))
+        .with_priority_fee(priority_fee, Some(cu_limit))
         .place_swift_order(&swift_order, &taker_account_data)
         .fill_perp_order(
             taker_order.market_index,
@@ -433,7 +460,7 @@ async fn try_swift_fill(
         TxIntent::SwiftFill {
             maker_crosses: crosses,
         },
-        config.swift_cu_limit as u64,
+        cu_limit as u64,
     );
 }
 
@@ -442,7 +469,8 @@ async fn try_swift_fill(
 /// - `auction_crosses` list of one or more crosses to fill
 async fn try_auction_fill(
     drift: DriftClient,
-    config: Config,
+    priority_fee: u64,
+    cu_limit: u32,
     market_index: u16,
     filler_subaccount: Pubkey,
     auction_crosses: Vec<(OrderMetadata, MakerCrosses)>,
@@ -484,7 +512,7 @@ async fn try_auction_fill(
 
         // let taker_order_id = taker_account_data.next_order_id;
         let tx = tx_builder
-            .with_priority_fee(config.priority_fee, Some(config.fill_cu_limit))
+            .with_priority_fee(priority_fee, Some(cu_limit))
             .fill_perp_order(
                 market_index,
                 taker_subaccount,
@@ -501,7 +529,7 @@ async fn try_auction_fill(
                 taker_order_id: taker_order_metadata.order_id,
                 maker_crosses: crosses,
             },
-            config.fill_cu_limit as u64,
+            cu_limit as u64,
         );
     }
 }
