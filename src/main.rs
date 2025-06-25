@@ -121,6 +121,9 @@ impl FillerBot {
         )
         .into();
 
+        log::info!(target: "filler", "bot started: authority={:?}, subaccount={:?}", wallet.authority(), wallet.default_sub_account());
+        log::info!(target: "filler", "mainnet={}, markets={}", config.mainnet, config.market_ids);
+
         let filler_subaccount = wallet.default_sub_account();
         let context = if config.mainnet {
             drift_rs::types::Context::MainNet
