@@ -224,7 +224,9 @@ impl FillerBot {
                         Some(signed_order) => {
                             let order_params = signed_order.order_params();
                             let tick_size = drift.program_data().perp_market_config_by_index(order_params.market_index).unwrap().amm.order_tick_size;
-                            let oracle_price = drift.try_get_oracle_price_data_and_slot(MarketId::perp(order_params.market_index)).expect("got oracle price").data.price;
+                            let oracle_price = drift.try_get_oracle_price_data_and_slot(MarketId::perp(order_params.market_index)).expect("got oracle price");
+                            log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
+                            let oracle_price = oracle_price.data.price;
 
                             let order = Order {
                                 slot,
@@ -302,8 +304,10 @@ impl FillerBot {
                     slot = new_slot.expect("got slot update");
 
                     for market in &market_ids {
-                        let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price").data.price;
-                        let mut crosses = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price as u64);
+                        let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
+                        log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
+                        dbg!(oracle_price.data.price as u64);
+                        let mut crosses = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price.data.price as u64);
                         crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if !crosses.is_empty() {
@@ -335,9 +339,9 @@ fn on_slot_update_fn(
     slot_tx: tokio::sync::mpsc::Sender<u64>,
     market_ids: &[MarketId],
 ) -> impl Fn(u64) + Send + Sync + 'static {
-    let market_ids: &'static [MarketId] = unsafe { std::mem::transmute(market_ids) };
+    let market_ids: Vec<MarketId> = market_ids.to_vec();
     move |new_slot| {
-        for market in market_ids {
+        for market in &market_ids {
             if let Some(oracle_price) = drift.try_get_oracle_price_data_and_slot(*market) {
                 dlob_notifier
                     .send(DLOBEvent::SlotOrPriceUpdate {
@@ -664,7 +668,7 @@ async fn subscribe_grpc(
             "https://api.rpcpool.com".into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
-                .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
+                .commitment(solana_sdk::commitment_config::CommitmentLevel::Confirmed)
                 .usermap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
