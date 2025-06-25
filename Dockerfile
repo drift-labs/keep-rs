@@ -22,9 +22,9 @@ RUN cargo build --release
 # ---- Runtime Stage ----
 FROM debian:bookworm-slim
 COPY --from=builder  /usr/local/lib/libdrift_ffi_sys.so /lib/
-COPY --from=builder /app/target/release/filler /usr/local/bin/filler
+COPY --from=builder /app/target/release/keeprs /usr/local/bin/keeprs
 
 EXPOSE 9898
 ENV METRICS_PORT=9898
 
-ENTRYPOINT ["./filler"] 
+ENTRYPOINT ["./keeprs"] 
