@@ -306,7 +306,6 @@ impl FillerBot {
                     for market in &market_ids {
                         let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
-                        dbg!(oracle_price.data.price as u64);
                         let mut crosses = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price.data.price as u64);
                         crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
