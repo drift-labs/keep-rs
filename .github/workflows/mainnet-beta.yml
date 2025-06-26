@@ -21,13 +21,10 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Install kubectl
-        run: |
-          curl -o kubectl https://s3.us-west-2.amazonaws.com/amazon-eks/1.23.7/2022-06-29/bin/linux/amd64/kubectl
-          curl https://s3.us-west-2.amazonaws.com/amazon-eks/1.23.7/2022-06-29/bin/linux/amd64/kubectl.sha256
-          openssl sha1 -sha256 kubectl
-          chmod +x ./kubectl
-          kubectl version --client=true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: v0.10.0
 
       - name: Docker build
         uses: docker/build-push-action@v6
