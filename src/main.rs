@@ -28,10 +28,7 @@ use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
 };
-use solana_sdk::{
-    signature::{Keypair, Signature},
-    transaction::TransactionError,
-};
+use solana_sdk::{signature::Signature, transaction::TransactionError};
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use tokio::{runtime::Handle, sync::RwLock};
 

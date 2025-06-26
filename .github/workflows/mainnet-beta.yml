@@ -39,8 +39,6 @@ jobs:
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}-${{ env.BRANCH_NAME }}
             ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest-${{ env.BRANCH_NAME }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   deploy:
     runs-on: ubicloud
