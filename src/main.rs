@@ -53,9 +53,9 @@ pub struct Config {
     pub mainnet: bool,
     #[clap(long, default_value = "512")]
     pub priority_fee: u64,
-    #[clap(long, default_value = "320000")]
+    #[clap(long, default_value = "240000")]
     pub swift_cu_limit: u32,
-    #[clap(long, default_value = "420000")]
+    #[clap(long, default_value = "320000")]
     pub fill_cu_limit: u32,
 }
 
@@ -84,7 +84,7 @@ async fn main() {
         .expect("bind metrics port");
 
     let metrics_ref = Arc::clone(&metrics);
-    let http_task = tokio::spawn(async move {
+    let _http_task = tokio::spawn(async move {
         axum::serve(
             listener,
             axum::Router::new()
@@ -283,7 +283,7 @@ impl FillerBot {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
                                     try_swift_fill(
                                         drift.clone(),
-                                        priority_fee_subscriber.priority_fee_nth(0.8),
+                                        priority_fee_subscriber.priority_fee_nth(0.5),
                                         config.swift_cu_limit,
                                         filler_subaccount,
                                         signed_order,
@@ -311,7 +311,7 @@ impl FillerBot {
 
                         if !crosses.is_empty() {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses:?}", market.index());
-                            try_auction_fill(drift.clone(), priority_fee_subscriber.priority_fee_nth(0.8), config.fill_cu_limit, market.index(), filler_subaccount, crosses, tx_worker_ref.clone()).await;
+                            try_auction_fill(drift.clone(), priority_fee_subscriber.priority_fee_nth(0.5), config.fill_cu_limit, market.index(), filler_subaccount, crosses, tx_worker_ref.clone()).await;
                         }
                     }
                 }
@@ -809,6 +809,7 @@ impl TxWorker {
         });
     }
     fn confirm_tx(&self, rt: &Handle, tx: Signature) {
+        // TODO: if CU limit is too low send it again with higher amount
         log::debug!(target: "filler", "txworker confirm tx: {tx:?}");
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
