@@ -118,9 +118,10 @@ impl FillerBot {
     async fn new(config: Config, metrics: Arc<Metrics>) -> Self {
         env_logger::init();
         let _ = dotenv::dotenv();
-        let wallet: Wallet = Keypair::from_base58_string(
+        let wallet: Wallet = drift_rs::utils::load_keypair_multi_format(
             &std::env::var("BOT_PRIVATE_KEY").expect("base58 BOT_PRIVATE_KEY set"),
         )
+        .expect("loaded BOT_PRIVATE_KEY")
         .into();
 
         let filler_subaccount = wallet.default_sub_account();
