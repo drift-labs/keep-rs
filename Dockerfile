@@ -24,6 +24,7 @@ RUN cargo build --release
 
 # ---- Runtime Stage ----
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates
 COPY --from=builder /usr/local/lib/libdrift_ffi_sys.so /lib/
 COPY --from=builder /app/target/release/keeprs /usr/local/bin/keeprs
 
