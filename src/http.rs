@@ -26,38 +26,35 @@ impl Metrics {
         let registry = Registry::new();
 
         let tx_sent = IntCounterVec::new(
-            prometheus::Opts::new("drift_tx_sent_total", "Number of transactions sent"),
+            prometheus::Opts::new("rfb_tx_sent_total", "Number of transactions sent"),
             &["intent"],
         )
         .unwrap();
         registry.register(Box::new(tx_sent.clone())).unwrap();
 
         let tx_confirmed = IntCounterVec::new(
-            prometheus::Opts::new(
-                "drift_tx_confirmed_total",
-                "Number of transactions confirmed",
-            ),
+            prometheus::Opts::new("rfb_tx_confirmed_total", "Number of transactions confirmed"),
             &["intent", "result"],
         )
         .unwrap();
         registry.register(Box::new(tx_confirmed.clone())).unwrap();
 
         let tx_failed = IntCounterVec::new(
-            prometheus::Opts::new("drift_tx_failed_total", "Number of transactions failed"),
+            prometheus::Opts::new("rfb_tx_failed_total", "Number of transactions failed"),
             &["intent", "reason"],
         )
         .unwrap();
         registry.register(Box::new(tx_failed.clone())).unwrap();
 
         let fill_expected = IntCounterVec::new(
-            prometheus::Opts::new("drift_fill_expected_total", "Number of expected fills"),
+            prometheus::Opts::new("rfb_fill_expected_total", "Number of expected fills"),
             &["intent"],
         )
         .unwrap();
         registry.register(Box::new(fill_expected.clone())).unwrap();
 
         let fill_actual = IntCounterVec::new(
-            prometheus::Opts::new("drift_fill_actual_total", "Number of actual fills"),
+            prometheus::Opts::new("rfb_fill_actual_total", "Number of actual fills"),
             &["intent", "amm"],
         )
         .unwrap();
@@ -65,7 +62,7 @@ impl Metrics {
 
         let confirmation_slots = HistogramVec::new(
             prometheus::HistogramOpts::new(
-                "drift_tx_confirmation_slots",
+                "rfb_tx_confirmation_slots",
                 "Slots taken to confirm tx",
             ),
             &["intent"],
@@ -76,7 +73,7 @@ impl Metrics {
             .unwrap();
 
         let cu_spent = HistogramVec::new(
-            prometheus::HistogramOpts::new("drift_tx_cu_spent", "Compute units spent per tx"),
+            prometheus::HistogramOpts::new("rfb_tx_cu_spent", "Compute units spent per tx"),
             &["intent"],
         )
         .unwrap();
@@ -101,12 +98,10 @@ pub async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRe
     let encoder = TextEncoder::new();
     encoder.encode(&metric_families, &mut buffer).unwrap();
 
+    let response = String::from_utf8(buffer).unwrap();
     Response::builder()
-        .header(
-            CONTENT_TYPE,
-            "application/openmetrics-text; version=1.0.0; charset=utf-8",
-        )
-        .body(Body::from(buffer))
+        .header(CONTENT_TYPE, "text/plain;version=1.0.0;charset=utf-8")
+        .body(response)
         .unwrap()
 }
 

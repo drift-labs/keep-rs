@@ -2582,8 +2582,10 @@ dependencies = [
  "log",
  "prometheus",
  "solana-account-decoder-client-types",
+ "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-sdk",
+ "solana-transaction-status",
  "solana-transaction-status-client-types",
  "tokio",
 ]

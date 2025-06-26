@@ -59,3 +59,18 @@ flowchart TD
     %% Feedback
     D2 -- "Update Metrics, PendingTxs" --> FillerBot_MainLoop
 ```
+
+## TODO:
+- [x] increase memory for rust-filler pod
+- [ ] increase CU limit for place swift order
+- [ ] use internal endpoint for swift order stream
+- [ ] add swift orders to auctions immediately? (MT filler)
+- [ ] check PMM orders (MT filler)
+
+- [ ] rayon: parallelize the orderbook updates on new slot
+
+## Tx Summary
+print some recent tx stats
+```bash
+ RUST_LOG=info cargo run --release --bin=tx_history F1RsRqBjuLdGeKtQK2LEjVJHJqVbhBYtfUzaUCi8PcFv --rpc-url <RPC_URL>
+ ```
