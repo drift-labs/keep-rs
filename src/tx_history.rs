@@ -74,6 +74,7 @@ async fn main() {
             (sig, tx)
         });
     }
+    log::info!("fetching txs...");
     let tx_results: Vec<_> = futs.collect().await;
 
     // Now process all results serially

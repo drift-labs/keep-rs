@@ -50,7 +50,7 @@ pub struct Config {
     pub mainnet: bool,
     #[clap(long, default_value = "512")]
     pub priority_fee: u64,
-    #[clap(long, default_value = "240000")]
+    #[clap(long, default_value = "330000")]
     pub swift_cu_limit: u32,
     #[clap(long, default_value = "320000")]
     pub fill_cu_limit: u32,
@@ -494,9 +494,10 @@ async fn try_auction_fill(
             .await
             .unwrap();
         let taker_stats = drift
-            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
+            .get_account_value::<UserStats>(&Wallet::derive_stats_account(
                 &taker_account_data.authority,
             ))
+            .await
             .expect("taker stats");
         let tx_builder = TransactionBuilder::new(
             drift.program_data(),
