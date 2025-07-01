@@ -9,7 +9,8 @@ use clap::Parser;
 use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
-        util::OrderDelta, DLOBEvent, DLOBNotifier, MakerCrosses, OrderMetadata, TakerOrder, DLOB,
+        util::OrderDelta, CrossesAndTopMakers, DLOBEvent, DLOBNotifier, MakerCrosses, OrderKind,
+        TakerOrder, DLOB,
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
@@ -18,8 +19,8 @@ use drift_rs::{
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
         accounts::{User, UserStats},
-        CommitmentConfig, MarketId, Order, OrderStatus, OrderType, PostOnlyParam,
-        RpcSendTransactionConfig, VersionedMessage,
+        CommitmentConfig, MarketId, MarketType, Order, OrderStatus, OrderType, PositionDirection,
+        PostOnlyParam, RpcSendTransactionConfig, VersionedMessage,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, RpcClient, TransactionBuilder, Wallet,
 };
@@ -54,6 +55,8 @@ pub struct Config {
     pub swift_cu_limit: u32,
     #[clap(long, default_value = "320000")]
     pub fill_cu_limit: u32,
+    #[clap(long, env = "DRY_RUN", default_value = "false")]
+    pub dry: bool,
 }
 
 impl Config {
@@ -138,7 +141,7 @@ impl FillerBot {
 
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
 
-        let tx_worker = TxWorker::new(drift.clone(), metrics);
+        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry);
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
 
@@ -249,6 +252,7 @@ impl FillerBot {
                                 ..Default::default()
                             };
 
+                            let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                             let lookahead = 1;
                             for offset in 0..=lookahead {
                                 let price = match order_params.order_type {
@@ -276,7 +280,7 @@ impl FillerBot {
                                     }
                                 };
                                 let taker_order = TakerOrder::from_order_params(order_params, price);
-                                let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order);
+                                let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, &perp_market);
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
                                     try_swift_fill(
@@ -304,12 +308,13 @@ impl FillerBot {
                     for market in &market_ids {
                         let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
-                        let mut crosses = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price.data.price as u64);
-                        crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
+                        let perp_market = drift.try_get_perp_market_account(market.index()).expect("got perp market");
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price.data.price as u64, Some(&perp_market));
+                        crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
-                        if !crosses.is_empty() {
-                            log::info!(target: "filler", "found auction crosses. market: {},{crosses:?}", market.index());
-                            try_auction_fill(drift.clone(), priority_fee_subscriber.priority_fee_nth(0.5), config.fill_cu_limit, market.index(), filler_subaccount, crosses, tx_worker_ref.clone()).await;
+                        if !crosses_and_top_makers.crosses.is_empty() {
+                            log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
+                            try_auction_fill(drift.clone(), priority_fee_subscriber.priority_fee_nth(0.5), config.fill_cu_limit, market.index(), filler_subaccount, crosses_and_top_makers, tx_worker_ref.clone()).await;
                         }
                     }
                 }
@@ -426,8 +431,12 @@ async fn try_swift_fill(
         .get_account_value::<User>(&taker_subaccount)
         .await
         .unwrap();
+    // TODO: this should never need to hit rpc...
     let taker_stats = drift
-        .try_get_account::<UserStats>(&Wallet::derive_stats_account(&taker_account_data.authority))
+        .get_account_value::<UserStats>(&Wallet::derive_stats_account(
+            &taker_account_data.authority,
+        ))
+        .await
         .expect("taker stats");
     let tx_builder = TransactionBuilder::new(
         drift.program_data(),
@@ -478,35 +487,75 @@ async fn try_auction_fill(
     cu_limit: u32,
     market_index: u16,
     filler_subaccount: Pubkey,
-    auction_crosses: Vec<(OrderMetadata, MakerCrosses)>,
+    auction_crosses: CrossesAndTopMakers,
     tx_worker_ref: TxSender,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
         .expect("filler account");
 
-    for (taker_order_metadata, crosses) in auction_crosses {
+    let top_maker_asks: Vec<User> = auction_crosses
+        .top_maker_asks
+        .iter()
+        .map(|m| {
+            drift
+                .try_get_account::<User>(m)
+                .expect("maker account syncd")
+        })
+        .collect();
+
+    let top_maker_bids: Vec<User> = auction_crosses
+        .top_maker_bids
+        .iter()
+        .map(|m| {
+            drift
+                .try_get_account::<User>(m)
+                .expect("maker account syncd")
+        })
+        .collect();
+
+    for (taker_order_metadata, crosses) in auction_crosses.crosses {
         log::info!("try fill auction order: {taker_order_metadata:?}");
         let taker_subaccount = taker_order_metadata.user;
 
         let taker_account_data = drift
             .get_account_value::<User>(&taker_subaccount)
             .await
-            .unwrap();
+            .expect("taker account");
+
         let taker_stats = drift
             .get_account_value::<UserStats>(&Wallet::derive_stats_account(
                 &taker_account_data.authority,
             ))
             .await
             .expect("taker stats");
-        let tx_builder = TransactionBuilder::new(
+
+        let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
             filler_subaccount,
             std::borrow::Cow::Borrowed(&filler_account_data),
             false,
         );
+        tx_builder = tx_builder.with_priority_fee(priority_fee, Some(cu_limit));
 
-        let maker_accounts: Vec<User> = crosses
+        if matches!(
+            taker_order_metadata.kind,
+            OrderKind::TriggerMarket | OrderKind::TriggerLimit
+        ) {
+            log::info!(
+                "attempting trigger and fill: {:?}/{:?}",
+                taker_order_metadata.order_id,
+                taker_order_metadata.user
+            );
+            tx_builder = tx_builder.trigger_order(
+                taker_subaccount,
+                &taker_account_data,
+                taker_order_metadata.order_id,
+                (market_index, MarketType::Perp),
+            );
+        }
+
+        let mut maker_accounts: Vec<User> = crosses
             .orders
             .iter()
             .map(|(m, _, _)| {
@@ -516,9 +565,14 @@ async fn try_auction_fill(
             })
             .collect();
 
+        if crosses.taker_direction == PositionDirection::Long {
+            maker_accounts.extend_from_slice(&top_maker_asks);
+        } else {
+            maker_accounts.extend_from_slice(&top_maker_bids);
+        }
+
         // let taker_order_id = taker_account_data.next_order_id;
         let tx = tx_builder
-            .with_priority_fee(priority_fee, Some(cu_limit))
             .fill_perp_order(
                 market_index,
                 taker_subaccount,
@@ -533,6 +587,7 @@ async fn try_auction_fill(
             tx,
             TxIntent::AuctionFill {
                 taker_order_id: taker_order_metadata.order_id,
+                vamm_cross: crosses.has_vamm_cross,
                 maker_crosses: crosses,
             },
             cu_limit as u64,
@@ -702,6 +757,7 @@ pub struct TxWorker {
     drift: &'static DriftClient,
     pending_txs: Arc<RwLock<PendingTxs<1024>>>,
     metrics: Arc<Metrics>,
+    dry_run: bool,
 }
 
 #[derive(Clone)]
@@ -735,11 +791,12 @@ impl TxSender {
 }
 
 impl TxWorker {
-    pub fn new(drift: DriftClient, metrics: Arc<Metrics>) -> Self {
+    pub fn new(drift: DriftClient, metrics: Arc<Metrics>, dry_run: bool) -> Self {
         Self {
             drift: Box::leak(Box::new(drift)),
             pending_txs: Arc::new(RwLock::new(PendingTxs::new())),
             metrics,
+            dry_run,
         }
     }
     pub fn run(self, rt: tokio::runtime::Handle) -> TxSender {
@@ -754,6 +811,10 @@ impl TxWorker {
                         intent,
                         cu_limit,
                     } => {
+                        if self.dry_run {
+                            log::debug!(target: "filler", "skip tx dry run: {intent:?}");
+                            continue;
+                        }
                         self.send_tx(&rt, tx, intent, cu_limit);
                     }
                     TxWork::Confirm { tx, ts } => {

@@ -25,7 +25,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
         }
 
         // Check generations g - 1 and g - 6
-        for i in 1..=6 {
+        for i in 1..=4 {
             let past_g = g.saturating_sub(i);
             let past_idx = (past_g % N as u64) as usize;
 
@@ -55,6 +55,7 @@ pub enum TxIntent {
     AuctionFill {
         taker_order_id: u32,
         maker_crosses: MakerCrosses,
+        vamm_cross: bool,
     },
     SwiftFill {
         maker_crosses: MakerCrosses,
