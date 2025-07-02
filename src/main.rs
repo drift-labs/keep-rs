@@ -280,7 +280,12 @@ impl FillerBot {
                                     }
                                 };
                                 let taker_order = TakerOrder::from_order_params(order_params, price);
-                                let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, &perp_market);
+                                let vamm_price = if order_params.direction == PositionDirection::Long {
+                                    perp_market.calculate_ask_price()
+                                } else {
+                                    perp_market.calculate_bid_price()
+                                };
+                                let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, Some(vamm_price as u64));
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
                                     try_swift_fill(
