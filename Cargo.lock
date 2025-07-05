@@ -1472,7 +1472,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs?rev=df216551#df21655122565310f1640fa42a7615224ffe6849"
+source = "git+https://github.com/drift-labs/drift-rs?rev=9fb3dfb7#9fb3dfb78596bc6733a21f21766e053a71456049"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1485,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs?rev=df216551#df21655122565310f1640fa42a7615224ffe6849"
+source = "git+https://github.com/drift-labs/drift-rs?rev=9fb3dfb7#9fb3dfb78596bc6733a21f21766e053a71456049"
 dependencies = [
  "futures-util",
  "gjson",
@@ -1505,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0-alpha.15"
-source = "git+https://github.com/drift-labs/drift-rs?rev=df216551#df21655122565310f1640fa42a7615224ffe6849"
+source = "git+https://github.com/drift-labs/drift-rs?rev=9fb3dfb7#9fb3dfb78596bc6733a21f21766e053a71456049"
 dependencies = [
  "abi_stable",
  "ahash 0.8.12",

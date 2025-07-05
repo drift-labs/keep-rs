@@ -453,6 +453,7 @@ async fn try_swift_fill(
     let maker_accounts: Vec<User> = crosses
         .orders
         .iter()
+        .filter(|m| m.0.user != taker_subaccount) // can't fill itself
         .map(|(m, _, _)| {
             drift
                 .try_get_account::<User>(&m.user)
@@ -563,6 +564,7 @@ async fn try_auction_fill(
         let mut maker_accounts: Vec<User> = crosses
             .orders
             .iter()
+            .filter(|m| m.0.user != taker_subaccount) // can't fill itself
             .map(|(m, _, _)| {
                 drift
                     .try_get_account::<User>(&m.user)

@@ -144,15 +144,16 @@ flowchart TD
 
 ## TODO:
 - [x] increase memory for rust-filler pod
-
 - [x] increase CU limit for place swift order
 - [x] add athena queries to dashboard to track volume, maybe metrics. fills by market?
 - [x] add vamm price to DLOB, prevent some wasted orders
 - [x] add top makers to cross info
 - [ ] improve metrics so its presentable
+    - [ ] VAMM, fill as taker when crosses limit orders
+    - [ ] limit order, amm is not available and no makers present (maybe same maker == taker??)
+    - [ ] VAMM order size consider during fill?
 - [ ] swift tx retry on error
-- [ ] consider VAMM order size?
-- [ ] safe trigger orders
+ger orders
 - [ ] check PMM orders (MT filler)
 - [ ] use internal endpoint for swift order stream
 - [ ] add swift orders to auctions immediately? (MT filler)
