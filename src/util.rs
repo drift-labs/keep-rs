@@ -55,10 +55,12 @@ pub enum TxIntent {
     AuctionFill {
         taker_order_id: u32,
         maker_crosses: MakerCrosses,
-        vamm_cross: bool,
+        has_trigger: bool,
+        oracle_price: u64,
     },
     SwiftFill {
         maker_crosses: MakerCrosses,
+        oracle_price: u64,
     },
 }
 
@@ -75,7 +77,15 @@ impl TxIntent {
         match self {
             TxIntent::None => 0,
             TxIntent::AuctionFill { maker_crosses, .. } => maker_crosses.orders.len(),
-            TxIntent::SwiftFill { maker_crosses } => maker_crosses.orders.len(),
+            TxIntent::SwiftFill { maker_crosses, .. } => maker_crosses.orders.len(),
+        }
+    }
+
+    /// true if tx was expected to trigger the taker order
+    pub fn expected_trigger(&self) -> bool {
+        match self {
+            TxIntent::AuctionFill { has_trigger, .. } => *has_trigger,
+            _ => false,
         }
     }
 
@@ -90,7 +100,7 @@ impl TxIntent {
                     .collect(),
                 maker_crosses.slot,
             ),
-            TxIntent::SwiftFill { maker_crosses } => (
+            TxIntent::SwiftFill { maker_crosses, .. } => (
                 maker_crosses
                     .orders
                     .iter()
@@ -98,6 +108,13 @@ impl TxIntent {
                     .collect(),
                 maker_crosses.slot,
             ),
+        }
+    }
+    pub fn oracle_price(&self) -> u64 {
+        match self {
+            TxIntent::None => 0,
+            TxIntent::AuctionFill { oracle_price, .. } => *oracle_price,
+            TxIntent::SwiftFill { oracle_price, .. } => *oracle_price,
         }
     }
 }

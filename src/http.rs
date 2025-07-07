@@ -7,16 +7,18 @@ use axum::{
     http::{header::CONTENT_TYPE, Response, StatusCode},
     response::IntoResponse,
 };
-use prometheus::{Encoder, HistogramVec, IntCounterVec, Registry, TextEncoder};
+use prometheus::{Encoder, HistogramVec, IntCounter, IntCounterVec, Registry, TextEncoder};
 
 #[derive(Debug)]
 pub struct Metrics {
     pub tx_sent: IntCounterVec,
     pub tx_confirmed: IntCounterVec,
     pub tx_failed: IntCounterVec,
+    pub trigger_expected: IntCounter,
     pub fill_expected: IntCounterVec,
     pub fill_actual: IntCounterVec,
     pub confirmation_slots: HistogramVec,
+    pub fill_size: HistogramVec,
     pub cu_spent: HistogramVec,
     pub registry: Registry,
 }
@@ -60,6 +62,15 @@ impl Metrics {
         .unwrap();
         registry.register(Box::new(fill_actual.clone())).unwrap();
 
+        let trigger_expected = IntCounter::new(
+            "rfb_trigger_expected_total",
+            "Number of expected triggered orders",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(trigger_expected.clone()))
+            .unwrap();
+
         let confirmation_slots = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "rfb_tx_confirmation_slots",
@@ -71,6 +82,13 @@ impl Metrics {
         registry
             .register(Box::new(confirmation_slots.clone()))
             .unwrap();
+
+        let fill_size = HistogramVec::new(
+            prometheus::HistogramOpts::new("rfb_fill_size", "order fill size"),
+            &["intent", "market"],
+        )
+        .unwrap();
+        registry.register(Box::new(fill_size.clone())).unwrap();
 
         let cu_spent = HistogramVec::new(
             prometheus::HistogramOpts::new("rfb_tx_cu_spent", "Compute units spent per tx"),
@@ -88,6 +106,8 @@ impl Metrics {
             confirmation_slots,
             cu_spent,
             registry,
+            trigger_expected,
+            fill_size,
         }
     }
 }
