@@ -10,7 +10,7 @@ use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
         util::OrderDelta, CrossesAndTopMakers, DLOBEvent, DLOBNotifier, MakerCrosses, OrderKind,
-        TakerOrder, DLOB,
+        OrderMetadata, TakerOrder, DLOB,
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
@@ -68,7 +68,7 @@ enum UseMarkets {
 }
 
 impl Config {
-    pub fn use_markets(&self) -> UseMarkets {
+    fn use_markets(&self) -> UseMarkets {
         if self.all_markets {
             UseMarkets::All
         } else {
@@ -159,10 +159,22 @@ impl FillerBot {
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
 
-        let market_ids = match config.use_markets() {
+        let mut market_ids = match config.use_markets() {
             UseMarkets::All => drift.get_all_perp_market_ids(),
             UseMarkets::Subset(m) => m,
         };
+        // remove bet perp markets
+        market_ids.retain(|x| {
+            let market = drift
+                .program_data()
+                .perp_market_config_by_index(x.index())
+                .unwrap();
+            !core::str::from_utf8(&market.name)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("bet")
+        });
+
         let market_pubkeys: Vec<Pubkey> = market_ids
             .iter()
             .map(|x| {
@@ -329,6 +341,20 @@ impl FillerBot {
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price.data.price as u64, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
+                        if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
+                            log::info!(target: "filler", "found limit uncrosses. market: {},{taker:?}{maker:?}", market.index());
+                            try_uncross(
+                                drift.clone(),
+                                *taker,
+                                *maker,
+                                priority_fee_subscriber.priority_fee_nth(0.5),
+                                config.fill_cu_limit,
+                                market.index(),
+                                filler_subaccount,
+                                tx_worker_ref.clone(),
+                                oracle_price.data.price as u64
+                            ).await;
+                        }
                         if !crosses_and_top_makers.crosses.is_empty() {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
                             try_auction_fill(
@@ -631,6 +657,70 @@ async fn try_auction_fill(
             cu_limit as u64,
         );
     }
+}
+
+async fn try_uncross(
+    drift: DriftClient,
+    taker_order_metadata: OrderMetadata,
+    maker_order_metadata: OrderMetadata,
+    priority_fee: u64,
+    cu_limit: u32,
+    market_index: u16,
+    filler_subaccount: Pubkey,
+    tx_worker_ref: TxSender,
+    oracle_price: u64,
+) {
+    let filler_account_data = drift
+        .try_get_account::<User>(&filler_subaccount)
+        .expect("filler account");
+
+    log::info!("try fill auction order: {taker_order_metadata:?}");
+    let taker_subaccount = taker_order_metadata.user;
+
+    let taker_account_data = drift
+        .try_get_account::<User>(&taker_subaccount)
+        .expect("taker account");
+
+    let taker_stats = drift
+        .get_account_value::<UserStats>(&Wallet::derive_stats_account(
+            &taker_account_data.authority,
+        ))
+        .await
+        .expect("taker stats");
+
+    let maker_accounts = vec![drift
+        .try_get_account::<User>(&maker_order_metadata.user)
+        .expect("maker account syncd")];
+
+    let tx_builder = TransactionBuilder::new(
+        drift.program_data(),
+        filler_subaccount,
+        std::borrow::Cow::Borrowed(&filler_account_data),
+        false,
+    );
+
+    let tx = tx_builder
+        .with_priority_fee(priority_fee, Some(cu_limit))
+        .fill_perp_order(
+            market_index,
+            taker_subaccount,
+            &taker_account_data,
+            &taker_stats,
+            Some(taker_order_metadata.order_id),
+            maker_accounts.as_slice(),
+        )
+        .build();
+
+    tx_worker_ref.send_tx(
+        tx,
+        TxIntent::AuctionFill {
+            taker_order_id: taker_order_metadata.order_id,
+            maker_crosses: MakerCrosses::default(),
+            has_trigger: false,
+            oracle_price,
+        },
+        cu_limit as u64,
+    );
 }
 
 /// Setup gRPC subscriptions
