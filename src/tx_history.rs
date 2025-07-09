@@ -36,7 +36,7 @@ async fn main() {
         .get_signatures_for_address_with_config(
             &pubkey,
             solana_rpc_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                limit: Some(300),
+                limit: Some(256),
                 ..Default::default()
             },
         )
@@ -79,6 +79,7 @@ async fn main() {
 
     // Now process all results serially
     let mut success_count = 0;
+    let mut trigger_count = 0;
     let mut fail_count = 0;
     let mut order_dne_count = 0;
     let mut no_fill_count = 0;
@@ -89,6 +90,7 @@ async fn main() {
         let err = sig_info.err.as_ref();
         let mut had_fill = false;
         let mut had_order_dne = false;
+        let mut had_trigger = false;
         match tx_result {
             Ok(tx_data) => {
                 if let Some(meta) = tx_data.transaction.meta {
@@ -106,6 +108,9 @@ async fn main() {
                         {
                             if let DriftEvent::OrderFill { .. } = event {
                                 had_fill = true;
+                            }
+                            if let DriftEvent::OrderTrigger { .. } = event {
+                                had_trigger = true;
                             }
                         }
                     }
@@ -127,12 +132,16 @@ async fn main() {
         if !had_fill && err.is_none() {
             no_fill_count += 1;
         }
+        if had_trigger && err.is_none() {
+            trigger_count += 1;
+        }
     }
 
     log::info!("\nSummary for {}:", pubkey);
     log::info!("  Success: {}", success_count);
     log::info!("  Failed: {}", fail_count);
     log::info!("  'Order does not exist' logs: {}", order_dne_count);
+    log::info!("  'OrderTrigger' events: {}", trigger_count);
     log::info!("  No OrderFill events: {}", no_fill_count);
     log::info!("  No events: {}", empty_events_count);
 }

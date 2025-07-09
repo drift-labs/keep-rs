@@ -476,17 +476,17 @@ async fn try_swift_fill(
     log::info!(target: "filler", "try fill swift order: {}", swift_order.order_uuid_str());
     let taker_order = swift_order.order_params();
     let taker_subaccount = swift_order.taker_subaccount();
+    let taker_authority = swift_order.taker_authority;
 
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
         .expect("filler account");
-    let taker_account_data = drift
-        .try_get_account::<User>(&taker_subaccount)
-        .expect("load user account");
-    // TODO: this should never need to hit rpc...
-    let taker_stats = drift
-        .try_get_account::<UserStats>(&Wallet::derive_stats_account(&taker_account_data.authority))
-        .expect("taker stats");
+    let taker_stats = Wallet::derive_stats_account(&taker_authority);
+    let (taker_account_data, taker_stats) = tokio::try_join!(
+        drift.get_account_value::<User>(&taker_subaccount),
+        drift.get_account_value::<UserStats>(&taker_stats)
+    )
+    .unwrap();
     let tx_builder = TransactionBuilder::new(
         drift.program_data(),
         filler_subaccount,
