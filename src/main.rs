@@ -313,13 +313,12 @@ impl FillerBot {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
                                     try_swift_fill(
                                         drift.clone(),
-                                        priority_fee_subscriber.priority_fee_nth(0.5),
+                                        priority_fee_subscriber.priority_fee_nth(0.8),
                                         config.swift_cu_limit,
                                         filler_subaccount,
                                         signed_order,
                                         crosses,
                                         tx_worker_ref.clone(),
-                                        oracle_price as u64,
                                     ).await;
                                     break;
                                 }
@@ -334,38 +333,59 @@ impl FillerBot {
                 new_slot = slot_rx.recv() => {
                     slot = new_slot.expect("got slot update");
 
+                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5);
+                    let cu_limit = config.fill_cu_limit;
+
                     for market in &market_ids {
+                        let market_index = market.index();
                         let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
-                        let perp_market = drift.try_get_perp_market_account(market.index()).expect("got perp market");
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market.index(), market.kind(), slot + 1, oracle_price.data.price as u64, Some(&perp_market));
+                        let oracle_price = oracle_price.data.price as u64;
+                        let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot + 1, oracle_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
-                        if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
-                            log::info!(target: "filler", "found limit uncrosses. market: {},{taker:?}{maker:?}", market.index());
-                            try_uncross(
-                                drift.clone(),
-                                *taker,
-                                *maker,
-                                priority_fee_subscriber.priority_fee_nth(0.5),
-                                config.fill_cu_limit,
-                                market.index(),
-                                filler_subaccount,
-                                tx_worker_ref.clone(),
-                                oracle_price.data.price as u64
-                            ).await;
+                        if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
+                            if limiter.allow_event(slot, maker.order_id) {
+                                log::info!(target: "filler", "found vamm taker ask. market: {market_index},{maker:?}");
+                                try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
+                            }
                         }
+
+                        if let Some(maker) = crosses_and_top_makers.vamm_taker_bid {
+                            if limiter.allow_event(slot, maker.order_id) {
+                                log::info!(target: "filler", "found vamm taker bid. market: {market_index},{maker:?}");
+                                try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
+                            }
+                        }
+
+                        if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
+                            if limiter.allow_event(slot, maker.order_id) || limiter.allow_event(slot, taker.order_id) {
+                                log::info!(target: "filler", "found limit uncrosses. market: {},{taker:?}{maker:?}", market_index);
+                                try_limit_uncross(
+                                    drift.clone(),
+                                    market_index,
+                                    slot,
+                                    *taker,
+                                    *maker,
+                                    priority_fee,
+                                    cu_limit,
+                                    filler_subaccount,
+                                    tx_worker_ref.clone(),
+                                ).await;
+                            }
+                        }
+
                         if !crosses_and_top_makers.crosses.is_empty() {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
                             try_auction_fill(
                                 drift.clone(),
-                                priority_fee_subscriber.priority_fee_nth(0.5),
-                                config.fill_cu_limit,
+                                priority_fee,
+                                cu_limit,
                                 market.index(),
                                 filler_subaccount,
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
-                                oracle_price.data.price as u64
                             ).await;
                         }
                     }
@@ -471,7 +491,6 @@ async fn try_swift_fill(
     swift_order: SignedOrderInfo,
     crosses: MakerCrosses,
     tx_worker_ref: TxSender,
-    oracle_price: u64,
 ) {
     log::info!(target: "filler", "try fill swift order: {}", swift_order.order_uuid_str());
     let taker_order = swift_order.order_params();
@@ -520,6 +539,7 @@ async fn try_swift_fill(
             &taker_account_data,
             &taker_stats,
             None, // Some(taker_order_id), // assuming we're fast enough that its the taker_order_id, should be ok for retail
+            None,
             maker_accounts.as_slice(),
         )
         .build();
@@ -528,7 +548,6 @@ async fn try_swift_fill(
         tx,
         TxIntent::SwiftFill {
             maker_crosses: crosses,
-            oracle_price,
         },
         cu_limit as u64,
     );
@@ -545,7 +564,6 @@ async fn try_auction_fill(
     filler_subaccount: Pubkey,
     auction_crosses: CrossesAndTopMakers,
     tx_worker_ref: TxSender,
-    oracle_price: u64,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
@@ -642,6 +660,7 @@ async fn try_auction_fill(
                 &taker_account_data,
                 &taker_stats,
                 Some(taker_order_metadata.order_id),
+                None,
                 maker_accounts.as_slice(),
             )
             .build();
@@ -652,29 +671,28 @@ async fn try_auction_fill(
                 taker_order_id: taker_order_metadata.order_id,
                 maker_crosses: crosses,
                 has_trigger: taker_is_trigger,
-                oracle_price,
             },
             cu_limit as u64,
         );
     }
 }
 
-async fn try_uncross(
+async fn try_limit_uncross(
     drift: DriftClient,
+    market_index: u16,
+    slot: u64,
     taker_order_metadata: OrderMetadata,
     maker_order_metadata: OrderMetadata,
     priority_fee: u64,
     cu_limit: u32,
-    market_index: u16,
     filler_subaccount: Pubkey,
     tx_worker_ref: TxSender,
-    oracle_price: u64,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
         .expect("filler account");
 
-    log::info!("try fill auction order: {taker_order_metadata:?}");
+    log::info!("try uncross order: {taker_order_metadata:?}");
     let taker_subaccount = taker_order_metadata.user;
 
     let taker_account_data = drift
@@ -707,17 +725,74 @@ async fn try_uncross(
             &taker_account_data,
             &taker_stats,
             Some(taker_order_metadata.order_id),
+            Some(maker_order_metadata.order_id),
             maker_accounts.as_slice(),
         )
         .build();
 
     tx_worker_ref.send_tx(
         tx,
-        TxIntent::AuctionFill {
+        TxIntent::LimitUncross {
+            slot,
             taker_order_id: taker_order_metadata.order_id,
-            maker_crosses: MakerCrosses::default(),
-            has_trigger: false,
-            oracle_price,
+            maker_order_id: maker_order_metadata.order_id,
+            market_index,
+        },
+        cu_limit as u64,
+    );
+}
+
+fn try_vamm_take(
+    drift: DriftClient,
+    market_index: u16,
+    maker: OrderMetadata,
+    slot: u64,
+    priority_fee: u64,
+    cu_limit: u32,
+    filler_subaccount: Pubkey,
+    tx_worker_ref: TxSender,
+) {
+    let filler_account_data = drift
+        .try_get_account::<User>(&filler_subaccount)
+        .expect("filler account");
+
+    log::info!("try fill vamm order: {maker:?}");
+    let taker_subaccount = maker.user;
+
+    let taker_account_data = drift
+        .try_get_account::<User>(&taker_subaccount)
+        .expect("taker account");
+
+    let taker_stats = drift
+        .try_get_account::<UserStats>(&Wallet::derive_stats_account(&taker_account_data.authority))
+        .expect("taker stats");
+
+    let tx_builder = TransactionBuilder::new(
+        drift.program_data(),
+        filler_subaccount,
+        std::borrow::Cow::Borrowed(&filler_account_data),
+        false,
+    );
+
+    let tx = tx_builder
+        .with_priority_fee(priority_fee, Some(cu_limit))
+        .fill_perp_order(
+            market_index,
+            taker_subaccount,
+            &taker_account_data,
+            &taker_stats,
+            None,
+            Some(maker.order_id),
+            &[],
+        )
+        .build();
+
+    tx_worker_ref.send_tx(
+        tx,
+        TxIntent::VAMMTakerFill {
+            slot,
+            market_index,
+            maker_order_id: maker.order_id,
         },
         cu_limit as u64,
     );
@@ -1039,11 +1114,10 @@ impl TxWorker {
                                 let sig = tx.to_string();
                                 let logs = meta.log_messages.unwrap();
                                 let tx_confirmed_slot = tx_log.slot;
-                                let mut amm_fill = false;
-                                let (mut expected_fills, sent_slot) = intent.crosses_and_slot();
+                                let mut amm_maker = false;
+                                let mut amm_taker = false;
+                                let (_, sent_slot) = intent.crosses_and_slot();
                                 let mut actual_fills = 0;
-                                let mut tx_market_index = 0;
-                                let mut fill_size = 0;
                                 for (tx_idx, log) in logs.iter().enumerate() {
                                     if let Some(event) = drift_rs::event_subscriber::try_parse_log(
                                         log.as_str(),
@@ -1052,23 +1126,15 @@ impl TxWorker {
                                     ) {
                                         if let DriftEvent::OrderFill {
                                             maker,
-                                            maker_order_id,
-                                            taker_order_id: _,
-                                            market_index,
-                                            quote_asset_amount_filled,
+                                            taker,
                                             ..
                                         } = event
                                         {
-                                            fill_size += quote_asset_amount_filled;
-                                            tx_market_index = market_index;
                                             if maker.is_none() {
-                                                amm_fill = true;
+                                                amm_maker = true;
                                             }
-                                            if let Some(idx) = expected_fills.iter().position(|o| {
-                                                o.0.order_id == maker_order_id
-                                                    && maker.is_some_and(|m| m == o.0.user)
-                                            }) {
-                                                expected_fills.swap_remove(idx);
+                                            if taker.is_none() {
+                                                amm_taker = true;
                                             }
                                             actual_fills += 1;
                                         } else if let DriftEvent::OrderTrigger { .. } = event {
@@ -1088,7 +1154,7 @@ impl TxWorker {
                                     .fill_actual
                                     .with_label_values(&[
                                         intent_label.as_str(),
-                                        if amm_fill { "amm" } else { "orderbook" },
+                                        if amm_maker { "vamm_maker" } else if amm_taker { "vamm_taker" } else { "match" },
                                     ])
                                     .inc_by(actual_fills);
                                 metrics
@@ -1101,14 +1167,6 @@ impl TxWorker {
                                     .cu_spent
                                     .with_label_values(&[intent_label.as_str()])
                                     .observe(cus_spent as f64);
-                                metrics.fill_size
-                                    .with_label_values(&[
-                                        intent_label.as_str(),
-                                        &tx_market_index.to_string()
-                                    ])
-                                    .observe(
-                                        fill_size as f64
-                                    );
 
                                 if actual_fills == 0 {
                                     metrics

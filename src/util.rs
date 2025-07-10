@@ -24,7 +24,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
             self.generations[idx] = g;
         }
 
-        // Check generations g - 1 and g - 6
+        // Check generations g - 1 and g - 4
         for i in 1..=4 {
             let past_g = g.saturating_sub(i);
             let past_idx = (past_g % N as u64) as usize;
@@ -54,13 +54,23 @@ pub enum TxIntent {
     None,
     AuctionFill {
         taker_order_id: u32,
-        maker_crosses: MakerCrosses,
         has_trigger: bool,
-        oracle_price: u64,
+        maker_crosses: MakerCrosses,
     },
     SwiftFill {
         maker_crosses: MakerCrosses,
-        oracle_price: u64,
+    },
+    VAMMTakerFill {
+        slot: u64,
+        market_index: u16,
+        maker_order_id: u32,
+    },
+    /// limit orders crossed
+    LimitUncross {
+        slot: u64,
+        market_index: u16,
+        taker_order_id: u32,
+        maker_order_id: u32,
     },
 }
 
@@ -70,6 +80,8 @@ impl TxIntent {
             TxIntent::None => "none".to_string(),
             TxIntent::AuctionFill { .. } => "auction_fill".to_string(),
             TxIntent::SwiftFill { .. } => "swift_fill".to_string(),
+            TxIntent::LimitUncross { .. } => "limit_uncross".to_string(),
+            TxIntent::VAMMTakerFill { .. } => "vamm_taker".to_string(),
         }
     }
 
@@ -78,6 +90,8 @@ impl TxIntent {
             TxIntent::None => 0,
             TxIntent::AuctionFill { maker_crosses, .. } => maker_crosses.orders.len(),
             TxIntent::SwiftFill { maker_crosses, .. } => maker_crosses.orders.len(),
+            TxIntent::VAMMTakerFill { .. } => 1,
+            TxIntent::LimitUncross { .. } => 1,
         }
     }
 
@@ -108,13 +122,8 @@ impl TxIntent {
                     .collect(),
                 maker_crosses.slot,
             ),
-        }
-    }
-    pub fn oracle_price(&self) -> u64 {
-        match self {
-            TxIntent::None => 0,
-            TxIntent::AuctionFill { oracle_price, .. } => *oracle_price,
-            TxIntent::SwiftFill { oracle_price, .. } => *oracle_price,
+            Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
+            Self::LimitUncross { slot, .. } => (vec![], *slot),
         }
     }
 }

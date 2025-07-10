@@ -18,7 +18,6 @@ pub struct Metrics {
     pub fill_expected: IntCounterVec,
     pub fill_actual: IntCounterVec,
     pub confirmation_slots: HistogramVec,
-    pub fill_size: HistogramVec,
     pub cu_spent: HistogramVec,
     pub registry: Registry,
 }
@@ -83,13 +82,6 @@ impl Metrics {
             .register(Box::new(confirmation_slots.clone()))
             .unwrap();
 
-        let fill_size = HistogramVec::new(
-            prometheus::HistogramOpts::new("rfb_fill_size", "order fill size"),
-            &["intent", "market"],
-        )
-        .unwrap();
-        registry.register(Box::new(fill_size.clone())).unwrap();
-
         let cu_spent = HistogramVec::new(
             prometheus::HistogramOpts::new("rfb_tx_cu_spent", "Compute units spent per tx"),
             &["intent"],
@@ -107,7 +99,6 @@ impl Metrics {
             cu_spent,
             registry,
             trigger_expected,
-            fill_size,
         }
     }
 }
