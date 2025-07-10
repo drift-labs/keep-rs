@@ -781,8 +781,8 @@ fn try_vamm_take(
             taker_subaccount,
             &taker_account_data,
             &taker_stats,
-            None,
             Some(maker.order_id),
+            None,
             &[],
         )
         .build();
