@@ -725,7 +725,7 @@ async fn try_limit_uncross(
             &taker_account_data,
             &taker_stats,
             Some(taker_order_metadata.order_id),
-            Some(maker_order_metadata.order_id),
+            None,
             maker_accounts.as_slice(),
         )
         .build();
@@ -1034,7 +1034,6 @@ impl TxWorker {
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
         let intent_label = intent.label();
-        let expected_fill_count = intent.expected_fill_count();
         metrics
             .tx_sent
             .with_label_values(&[intent_label.as_str()])
@@ -1042,7 +1041,10 @@ impl TxWorker {
         metrics
             .fill_expected
             .with_label_values(&[intent_label.as_str()])
-            .inc_by(expected_fill_count as u64);
+            .inc();
+        if intent.expected_trigger() {
+            metrics.trigger_expected.inc();
+        }
         rt.spawn(async move {
             match drift
                 .sign_and_send_with_config(
@@ -1114,8 +1116,6 @@ impl TxWorker {
                                 let sig = tx.to_string();
                                 let logs = meta.log_messages.unwrap();
                                 let tx_confirmed_slot = tx_log.slot;
-                                let mut amm_maker = false;
-                                let mut amm_taker = false;
                                 let (_, sent_slot) = intent.crosses_and_slot();
                                 let mut actual_fills = 0;
                                 for (tx_idx, log) in logs.iter().enumerate() {
@@ -1130,16 +1130,10 @@ impl TxWorker {
                                             ..
                                         } = event
                                         {
-                                            if maker.is_none() {
-                                                amm_maker = true;
-                                            }
-                                            if taker.is_none() {
-                                                amm_taker = true;
-                                            }
                                             actual_fills += 1;
                                         } else if let DriftEvent::OrderTrigger { .. } = event {
                                             if intent.expected_trigger() {
-                                                metrics.trigger_expected.inc();
+                                                metrics.trigger_actual.inc();
                                             }
                                         }
                                     }
@@ -1147,16 +1141,9 @@ impl TxWorker {
                                 let confirmation_slots = tx_confirmed_slot - sent_slot;
                                 log::debug!(target: "filler", "txworker: {tx:?} confirmed after {confirmation_slots} slots");
                                 metrics
-                                    .tx_confirmed
-                                    .with_label_values(&[intent_label.as_str(), "ok"])
-                                    .inc();
-                                metrics
                                     .fill_actual
-                                    .with_label_values(&[
-                                        intent_label.as_str(),
-                                        if amm_maker { "vamm_maker" } else if amm_taker { "vamm_taker" } else { "match" },
-                                    ])
-                                    .inc_by(actual_fills);
+                                    .with_label_values(&[intent_label.as_str()])
+                                    .inc();
                                 metrics
                                     .confirmation_slots
                                     .with_label_values(&[intent_label.as_str()])
@@ -1177,6 +1164,11 @@ impl TxWorker {
                                     metrics
                                         .tx_confirmed
                                         .with_label_values(&[intent_label.as_str(), "partial"])
+                                        .inc();
+                                } else {
+                                        metrics
+                                        .tx_confirmed
+                                        .with_label_values(&[intent_label.as_str(), "ok"])
                                         .inc();
                                 }
                             }

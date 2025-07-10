@@ -15,6 +15,7 @@ pub struct Metrics {
     pub tx_confirmed: IntCounterVec,
     pub tx_failed: IntCounterVec,
     pub trigger_expected: IntCounter,
+    pub trigger_actual: IntCounter,
     pub fill_expected: IntCounterVec,
     pub fill_actual: IntCounterVec,
     pub confirmation_slots: HistogramVec,
@@ -70,6 +71,13 @@ impl Metrics {
             .register(Box::new(trigger_expected.clone()))
             .unwrap();
 
+        let trigger_actual = IntCounter::new(
+            "rfb_trigger_actual_total",
+            "Number of actual triggered orders",
+        )
+        .unwrap();
+        registry.register(Box::new(trigger_actual.clone())).unwrap();
+
         let confirmation_slots = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "rfb_tx_confirmation_slots",
@@ -99,6 +107,7 @@ impl Metrics {
             cu_spent,
             registry,
             trigger_expected,
+            trigger_actual,
         }
     }
 }
