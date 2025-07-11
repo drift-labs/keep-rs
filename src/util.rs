@@ -24,14 +24,19 @@ impl<const N: usize> OrderSlotLimiter<N> {
             self.generations[idx] = g;
         }
 
-        // Check generations g - 1 and g - 4
+        // Count occurrences of id in generations g - 1 to g - 4
+        let mut count = 0;
         for i in 1..=4 {
             let past_g = g.saturating_sub(i);
             let past_idx = (past_g % N as u64) as usize;
 
             if self.generations[past_idx] == past_g {
                 if self.slots[past_idx].binary_search(&id).is_ok() {
-                    return false;
+                    count += 1;
+                    if count >= 1 {
+                        // Already appeared once, so this would be the second time
+                        return false;
+                    }
                 }
             }
         }
@@ -60,7 +65,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
             }
         }
 
-        return true
+        return true;
     }
 }
 
@@ -91,21 +96,37 @@ pub enum TxIntent {
 }
 
 impl TxIntent {
-    pub fn label(&self) -> String {
+    pub fn label(&self) -> &'static str {
         match self {
-            TxIntent::None => "none".to_string(),
-            TxIntent::AuctionFill { .. } => "auction_fill".to_string(),
-            TxIntent::SwiftFill { .. } => "swift_fill".to_string(),
-            TxIntent::LimitUncross { .. } => "limit_uncross".to_string(),
-            TxIntent::VAMMTakerFill { .. } => "vamm_taker".to_string(),
+            TxIntent::None => "none",
+            TxIntent::AuctionFill { maker_crosses, .. } => {
+                if maker_crosses.has_vamm_cross {
+                    "auction_fill_vamm"
+                } else {
+                    "auction_fill"
+                }
+            }
+            TxIntent::SwiftFill { maker_crosses, .. } => {
+                if maker_crosses.has_vamm_cross {
+                    "swift_fill"
+                } else {
+                    "swift_fill_vamm"
+                }
+            }
+            TxIntent::LimitUncross { .. } => "limit_uncross",
+            TxIntent::VAMMTakerFill { .. } => "vamm_taker",
         }
     }
 
     pub fn expected_fill_count(&self) -> usize {
         match self {
             TxIntent::None => 0,
-            TxIntent::AuctionFill { maker_crosses, .. } => maker_crosses.orders.len(),
-            TxIntent::SwiftFill { maker_crosses, .. } => maker_crosses.orders.len(),
+            TxIntent::AuctionFill { maker_crosses, .. } => {
+                maker_crosses.orders.len() + if maker_crosses.has_vamm_cross { 1 } else { 0 }
+            }
+            TxIntent::SwiftFill { maker_crosses, .. } => {
+                maker_crosses.orders.len() + if maker_crosses.has_vamm_cross { 1 } else { 0 }
+            }
             TxIntent::VAMMTakerFill { .. } => 1,
             TxIntent::LimitUncross { .. } => 1,
         }

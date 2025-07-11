@@ -276,7 +276,6 @@ impl FillerBot {
                                 ..Default::default()
                             };
 
-                            let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                             let lookahead = 1;
                             for offset in 0..=lookahead {
                                 let price = match order_params.order_type {
@@ -304,6 +303,7 @@ impl FillerBot {
                                     }
                                 };
                                 let taker_order = TakerOrder::from_order_params(order_params, price);
+                                let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                                 let vamm_price = if order_params.direction == PositionDirection::Long {
                                     perp_market.calculate_ask_price()
                                 } else {
@@ -343,7 +343,8 @@ impl FillerBot {
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
                         let oracle_price = oracle_price.data.price as u64;
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot, oracle_price, Some(&perp_market));
+                        // won't land in immediate slot so aim for next slot
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot + 1, oracle_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         // if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
@@ -1035,13 +1036,10 @@ impl TxWorker {
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
         let intent_label = intent.label();
-        metrics
-            .tx_sent
-            .with_label_values(&[intent_label.as_str()])
-            .inc();
+        metrics.tx_sent.with_label_values(&[intent_label]).inc();
         metrics
             .fill_expected
-            .with_label_values(&[intent_label.as_str()])
+            .with_label_values(&[intent_label])
             .inc();
         if intent.expected_trigger() {
             metrics.trigger_expected.inc();
@@ -1068,7 +1066,7 @@ impl TxWorker {
                     log::info!(target: "filler", "fill failed 🐢: {err}");
                     metrics
                         .tx_failed
-                        .with_label_values(&[intent_label.as_str(), "send_error"])
+                        .with_label_values(&[intent_label, "send_error"])
                         .inc();
                 }
             }
@@ -1137,33 +1135,33 @@ impl TxWorker {
                                 log::debug!(target: "filler", "txworker: {tx:?} confirmed after {confirmation_slots} slots");
                                 metrics
                                     .fill_actual
-                                    .with_label_values(&[intent_label.as_str()])
+                                    .with_label_values(&[intent_label])
                                     .inc();
                                 metrics
                                     .confirmation_slots
-                                    .with_label_values(&[intent_label.as_str()])
+                                    .with_label_values(&[intent_label])
                                     .observe(confirmation_slots as f64);
                                 let cus_spent =
                                     sent_cu_limit - meta.compute_units_consumed.unwrap();
                                 metrics
                                     .cu_spent
-                                    .with_label_values(&[intent_label.as_str()])
+                                    .with_label_values(&[intent_label])
                                     .observe(cus_spent as f64);
 
                                 if actual_fills == 0 {
                                     metrics
                                         .tx_confirmed
-                                        .with_label_values(&[intent_label.as_str(), "no_fills"])
+                                        .with_label_values(&[intent_label, "no_fills"])
                                         .inc();
                                 } else if actual_fills < expected_fill_count as u64 {
                                     metrics
                                         .tx_confirmed
-                                        .with_label_values(&[intent_label.as_str(), "partial"])
+                                        .with_label_values(&[intent_label, "partial"])
                                         .inc();
                                 } else {
                                         metrics
                                         .tx_confirmed
-                                        .with_label_values(&[intent_label.as_str(), "ok"])
+                                        .with_label_values(&[intent_label, "ok"])
                                         .inc();
                                 }
                             }
@@ -1175,7 +1173,7 @@ impl TxWorker {
                                 metrics
                                     .tx_failed
                                     .with_label_values(&[
-                                        intent_label.as_str(),
+                                        intent_label,
                                         "insufficient_funds",
                                     ])
                                     .inc();
@@ -1185,7 +1183,7 @@ impl TxWorker {
                                 metrics
                                     .tx_failed
                                     .with_label_values(&[
-                                        intent_label.as_str(),
+                                        intent_label,
                                         &format!("{:?}", err),
                                     ])
                                     .inc();
@@ -1195,7 +1193,7 @@ impl TxWorker {
                         log::warn!(target: "filler", "tx metadata missing");
                         metrics
                             .tx_failed
-                            .with_label_values(&[intent_label.as_str(), "metadata_missing"])
+                            .with_label_values(&[intent_label, "metadata_missing"])
                             .inc();
                     }
                 }
@@ -1203,7 +1201,7 @@ impl TxWorker {
                     log::info!(target: "filler", "tx confirmation failed 🐢: {err}");
                     metrics
                         .tx_failed
-                        .with_label_values(&[intent_label.as_str(), "confirmation_failed"])
+                        .with_label_values(&[intent_label, "confirmation_failed"])
                         .inc();
                 }
             }
