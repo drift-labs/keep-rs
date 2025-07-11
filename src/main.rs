@@ -343,7 +343,7 @@ impl FillerBot {
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
                         let oracle_price = oracle_price.data.price as u64;
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot + 1, oracle_price, Some(&perp_market));
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot, oracle_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
