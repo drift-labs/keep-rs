@@ -57,7 +57,7 @@ impl Metrics {
 
         let fill_actual = IntCounterVec::new(
             prometheus::Opts::new("rfb_fill_actual_total", "Number of actual fills"),
-            &["intent", "amm"],
+            &["intent"],
         )
         .unwrap();
         registry.register(Box::new(fill_actual.clone())).unwrap();
