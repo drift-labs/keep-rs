@@ -173,7 +173,9 @@ impl FillerBot {
                 .unwrap()
                 .to_ascii_lowercase();
 
-            !name.contains("bet") && market.status != MarketStatus::Initialized // pump-perp not live
+            !name.contains("bet")
+                && market.status != MarketStatus::Initialized
+                && !name.contains("pump-perp")
         });
 
         let market_pubkeys: Vec<Pubkey> = market_ids
