@@ -925,7 +925,7 @@ async fn subscribe_grpc(
             "https://api.rpcpool.com".into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
-                .commitment(solana_sdk::commitment_config::CommitmentLevel::Confirmed)
+                .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
                 .usermap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
