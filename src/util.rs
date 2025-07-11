@@ -46,6 +46,22 @@ impl<const N: usize> OrderSlotLimiter<N> {
             }
         }
     }
+
+    pub fn check_event(&self, g: u64, id: u32) -> bool {
+        // Check generations g - 1 and g - 4
+        for i in 1..=4 {
+            let past_g = g.saturating_sub(i);
+            let past_idx = (past_g % N as u64) as usize;
+
+            if self.generations[past_idx] == past_g {
+                if self.slots[past_idx].binary_search(&id).is_ok() {
+                    return false;
+                }
+            }
+        }
+
+        return true
+    }
 }
 
 #[derive(Clone, Debug, Default)]
