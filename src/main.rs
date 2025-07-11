@@ -19,8 +19,8 @@ use drift_rs::{
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
         accounts::{User, UserStats},
-        CommitmentConfig, MarketId, MarketType, Order, OrderStatus, OrderType, PositionDirection,
-        PostOnlyParam, RpcSendTransactionConfig, VersionedMessage,
+        CommitmentConfig, MarketId, MarketStatus, MarketType, Order, OrderStatus, OrderType,
+        PositionDirection, PostOnlyParam, RpcSendTransactionConfig, VersionedMessage,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, RpcClient, TransactionBuilder, Wallet,
 };
@@ -169,10 +169,11 @@ impl FillerBot {
                 .program_data()
                 .perp_market_config_by_index(x.index())
                 .unwrap();
-            !core::str::from_utf8(&market.name)
+            let name = core::str::from_utf8(&market.name)
                 .unwrap()
-                .to_ascii_lowercase()
-                .contains("bet")
+                .to_ascii_lowercase();
+
+            !name.contains("bet") && market.status != MarketStatus::Initialized // pump-perp not live
         });
 
         let market_pubkeys: Vec<Pubkey> = market_ids
@@ -1124,17 +1125,11 @@ impl TxWorker {
                                         &sig,
                                         tx_idx,
                                     ) {
-                                        if let DriftEvent::OrderFill {
-                                            maker,
-                                            taker,
-                                            ..
-                                        } = event
+                                        if let DriftEvent::OrderFill { ..} = event
                                         {
                                             actual_fills += 1;
                                         } else if let DriftEvent::OrderTrigger { .. } = event {
-                                            if intent.expected_trigger() {
-                                                metrics.trigger_actual.inc();
-                                            }
+                                            metrics.trigger_actual.inc();
                                         }
                                     }
                                 }
