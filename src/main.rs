@@ -12,7 +12,7 @@ use drift_rs::{
         util::OrderDelta, CrossesAndTopMakers, DLOBEvent, DLOBNotifier, MakerCrosses, OrderKind,
         OrderMetadata, TakerOrder, DLOB,
     },
-    event_subscriber::DriftEvent,
+    event_subscriber::{try_parse_log, DriftEvent},
     ffi::calculate_auction_price,
     grpc::{grpc_subscriber::AccountFilter, AccountUpdate, TransactionUpdate},
     priority_fee_subscriber::PriorityFeeSubscriber,
@@ -786,15 +786,30 @@ fn try_vamm_take(
         )
         .build();
 
-    tx_worker_ref.send_tx(
-        tx,
-        TxIntent::VAMMTakerFill {
-            slot,
-            market_index,
-            maker_order_id: maker.order_id,
-        },
-        cu_limit as u64,
-    );
+    tokio::spawn(async move {
+        let mut will_fill = false;
+        if let Ok(res) = drift.simulate_tx(tx.clone()).await {
+            if res.err.is_none() {
+                for log in res.logs.unwrap() {
+                    if let Some(DriftEvent::OrderFill { .. }) = try_parse_log(&log, "", 0) {
+                        will_fill = true;
+                        break;
+                    }
+                }
+                if will_fill {
+                    tx_worker_ref.send_tx(
+                        tx,
+                        TxIntent::VAMMTakerFill {
+                            slot,
+                            market_index,
+                            maker_order_id: maker.order_id,
+                        },
+                        cu_limit as u64,
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Setup gRPC subscriptions
