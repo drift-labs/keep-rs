@@ -347,19 +347,21 @@ impl FillerBot {
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot + 1, oracle_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
-                        if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
-                            if limiter.check_event(slot, maker.order_id) {
-                                log::info!(target: "filler", "found vamm taker ask. market: {market_index},{maker:?}");
-                                try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
-                            }
-                        }
+                        // if !perp_market.has_too_much_drawdown() {
+                        //     if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
+                        //         if limiter.check_event(slot, maker.order_id) {
+                        //             log::info!(target: "filler", "found vamm taker ask. market: {market_index},{maker:?}");
+                        //             try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
+                        //         }
+                        //     }
 
-                        if let Some(maker) = crosses_and_top_makers.vamm_taker_bid {
-                            if limiter.check_event(slot, maker.order_id) {
-                                log::info!(target: "filler", "found vamm taker bid. market: {market_index},{maker:?}");
-                                try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
-                            }
-                        }
+                        //     if let Some(maker) = crosses_and_top_makers.vamm_taker_bid {
+                        //         if limiter.check_event(slot, maker.order_id) {
+                        //             log::info!(target: "filler", "found vamm taker bid. market: {market_index},{maker:?}");
+                        //             try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
+                        //         }
+                        //     }
+                        // }
 
                         if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
                             if taker.user == maker.user {
