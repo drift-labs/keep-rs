@@ -280,7 +280,7 @@ impl FillerBot {
                             for offset in 0..=lookahead {
                                 let price = match order_params.order_type {
                                     OrderType::Market | OrderType::Oracle => {
-                                        match calculate_auction_price(&order, slot, tick_size, Some(oracle_price), false) {
+                                        match calculate_auction_price(&order, slot + offset, tick_size, Some(oracle_price), false) {
                                             Ok(p) => p,
                                             Err(err) => {
                                                 log::warn!(target: "dlob", "could not get auction price {err:?}, params: {order_params:?}, skipping...");
@@ -289,7 +289,7 @@ impl FillerBot {
                                         }
                                     }
                                     OrderType::Limit => {
-                                        match order.get_limit_price(Some(oracle_price), Some(oracle_price as u64), slot, tick_size, false, None) {
+                                        match order.get_limit_price(Some(oracle_price), Some(oracle_price as u64), slot + offset, tick_size, false, None) {
                                             Ok(Some(p)) => p,
                                             _ => {
                                                 log::warn!(target: "dlob", "could not get limit price: {order_params:?}, skipping...");
