@@ -26,7 +26,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
 
         // Count occurrences of id in generations g - 1 to g - 4
         let mut count = 0;
-        for i in 1..=4 {
+        for i in 2..=4 {
             let past_g = g.saturating_sub(i);
             let past_idx = (past_g % N as u64) as usize;
 
@@ -54,7 +54,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
 
     pub fn check_event(&self, g: u64, id: u32) -> bool {
         // Check generations g - 1 and g - 4
-        for i in 1..=4 {
+        for i in 2..=4 {
             let past_g = g.saturating_sub(i);
             let past_idx = (past_g % N as u64) as usize;
 
