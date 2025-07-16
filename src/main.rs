@@ -1,7 +1,6 @@
 //! Filler Bot
 use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::BTreeMap, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use anchor_lang::prelude::*;
@@ -25,6 +24,7 @@ use drift_rs::{
     DriftClient, GrpcSubscribeOpts, Pubkey, RpcClient, TransactionBuilder, Wallet,
 };
 use futures_util::StreamExt;
+use pyth_lazer_protocol::message::SolanaMessage;
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
@@ -37,7 +37,7 @@ mod http;
 mod util;
 use crate::{
     http::{health_handler, metrics_handler, Metrics},
-    util::{OrderSlotLimiter, PendingTxMeta, PendingTxs, TxIntent},
+    util::{OrderSlotLimiter, PendingTxMeta, PendingTxs, PythPriceUpdate, TxIntent},
 };
 
 /// Bot configuration loaded from command line
@@ -120,6 +120,7 @@ struct FillerBot {
     filler_subaccount: Pubkey,
     slot_rx: tokio::sync::mpsc::Receiver<u64>,
     swift_order_stream: SwiftOrderStream,
+    pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
     limiter: OrderSlotLimiter<40>,
     slot: u64,
     market_ids: Vec<MarketId>,
@@ -208,6 +209,13 @@ impl FillerBot {
             .await
             .expect("subscribed filler subaccount");
 
+        let pyth_access_token = match std::env::var("PTYH_ACCESS_TOKEN").expect("pyth access token");
+        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
+            "wss://pyth-lazer.dourolabs.app/v1/stream",
+            pyth_access_token,
+        ).expect("pyth price feed connects");
+        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
+
         FillerBot {
             drift,
             dlob,
@@ -219,6 +227,7 @@ impl FillerBot {
             market_ids,
             config,
             tx_worker_ref,
+            pyth_price_feed,
             priority_fee_subscriber,
         }
     }
@@ -235,6 +244,8 @@ impl FillerBot {
         let config = self.config.clone();
         let tx_worker_ref = self.tx_worker_ref.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
+        let mut pyth_price_feed = self.pyth_price_feed;
+        let mut live_oracle_prices = BTreeMap::<u16, u64>::new();
 
         loop {
             tokio::select! {
@@ -242,6 +253,55 @@ impl FillerBot {
                 _ = tokio::signal::ctrl_c() => {
                     log::warn!("filler shutting down...");
                     break;
+                }
+                price_update = pyth_price_feed.recv() => {
+                    if let Some(update) = price_update {
+                        let market_index = update.market_id;
+                        let market = MarketId::perp(market_index);
+                        live_oracle_prices.insert(market_index, update.price);
+
+                        let priority_fee = priority_fee_subscriber.priority_fee_nth(0.8);
+                        let cu_limit = config.fill_cu_limit;
+
+                        let oracle_price = update.price;
+                        log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", slot, market, oracle_price);
+                        let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
+
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot, oracle_price, Some(&perp_market));
+                        crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
+
+                        if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
+                            if taker.user == maker.user {
+                                log::info!(target: "filler", "book crossed by same user: {taker:?}");
+                            } else if limiter.check_event(slot, maker.order_id) || limiter.check_event(slot, taker.order_id) {
+                                log::info!(target: "filler", "found limit uncrosses. market: {},{taker:?}{maker:?}", market_index);
+                                try_limit_uncross(
+                                    drift.clone(),
+                                    market_index,
+                                    slot,
+                                    *taker,
+                                    *maker,
+                                    priority_fee,
+                                    cu_limit,
+                                    filler_subaccount,
+                                    tx_worker_ref.clone(),
+                                ).await;
+                            }
+                        }
+
+                        if !crosses_and_top_makers.crosses.is_empty() {
+                            log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market_index);
+                            try_auction_fill(
+                                drift.clone(),
+                                priority_fee,
+                                cu_limit,
+                                market_index,
+                                filler_subaccount,
+                                crosses_and_top_makers,
+                                tx_worker_ref.clone(),
+                            ).await;
+                        }
+                    }
                 }
                 swift_order = swift_order_stream.next() => {
                     log::debug!(target: "filler", "new swift order: {swift_order:?}");

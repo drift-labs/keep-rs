@@ -1,6 +1,17 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use drift_rs::dlob::MakerCrosses;
+use drift_rs::{dlob::MakerCrosses, types::MarketId};
+use futures_util::StreamExt;
+use pyth_lazer_client::AnyResponse;
+use pyth_lazer_protocol::{
+    message::Message,
+    payload::{PayloadData, PayloadPropertyValue},
+    router::{
+        Channel, DeliveryFormat, FixedRate, Format, JsonBinaryEncoding, PriceFeedId,
+        PriceFeedProperty, SubscriptionParams, SubscriptionParamsRepr,
+    },
+    subscription::{SubscribeRequest, SubscriptionId},
+};
 use solana_sdk::signature::Signature;
 
 pub struct OrderSlotLimiter<const N: usize> {
@@ -54,7 +65,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
 
     pub fn check_event(&self, g: u64, id: u32) -> bool {
         // Check generations g - 1 and g - 4
-        for i in 2..=4 {
+        for i in 1..=4 {
             let past_g = g.saturating_sub(i);
             let past_idx = (past_g % N as u64) as usize;
 
@@ -236,4 +247,94 @@ impl<const N: usize> PendingTxs<N> {
         }
         None
     }
+}
+
+pub struct PythPriceUpdate {
+    pub market_id: u16,
+    pub feed_id: u32,
+    pub price: u64,
+}
+
+pub fn subscribe_price_feeds(
+    mut cli: pyth_lazer_client::LazerClient,
+    market_ids: &[MarketId],
+) -> tokio::sync::mpsc::Receiver<PythPriceUpdate> {
+    let feed_ids: Vec<PriceFeedId> = market_ids
+        .iter()
+        .filter_map(|m| {
+            drift_rs::constants::perp_market_index_to_pyth_lazer_feed_id(m.index()).map(PriceFeedId)
+        })
+        .collect();
+
+    let (price_tx, price_rx) = tokio::sync::mpsc::channel(512);
+    tokio::spawn(async move {
+        loop {
+            let pyth_lazer_stream = match cli.start().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    log::error!(target: "filler", "pyth feed start failed: {err:?}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            let subscribe_request = SubscribeRequest {
+                subscription_id: SubscriptionId(23),
+                params: SubscriptionParams::new(SubscriptionParamsRepr {
+                    price_feed_ids: feed_ids.clone(),
+                    properties: vec![PriceFeedProperty::Price],
+                    delivery_format: DeliveryFormat::Binary,
+                    json_binary_encoding: JsonBinaryEncoding::Base64,
+                    parsed: false,
+                    channel: Channel::FixedRate(FixedRate::MIN),
+                    formats: vec![Format::Solana],
+                    ignore_invalid_feed_ids: false,
+                })
+                .expect("invalid subscription params"),
+            };
+            if let Err(err) = cli
+                .subscribe(pyth_lazer_protocol::subscription::Request::Subscribe(
+                    subscribe_request,
+                ))
+                .await
+            {
+                log::error!(target: "filler", "pyth feed subscribe failed: {err:?}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let mut stream = pyth_lazer_stream.boxed();
+            while let Some(Ok(update)) = stream.next().await {
+                match update {
+                    AnyResponse::Binary(outer) => {
+                        for message in outer.messages {
+                            match message {
+                                Message::Solana(message) => {
+                                    let data = PayloadData::deserialize_slice_le(&message.payload)
+                                        .unwrap();
+
+                                    for f in data.feeds {
+                                        for p in f.properties {
+                                            if let PayloadPropertyValue::Price(Some(price)) = p {
+                                                price_tx.try_send(PythPriceUpdate {
+                                                    market_id: drift_rs::constants::pyth_lazer_feed_id_to_perp_market_index(f.feed_id.0).expect("feed maps to market"),
+                                                    feed_id: f.feed_id.0,
+                                                    price: price.0.unsigned_abs().into(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => (),
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            log::error!(target: "filler", "pyth lazer feed finished");
+        }
+    });
+
+    price_rx
 }
