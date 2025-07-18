@@ -713,9 +713,9 @@ async fn try_auction_fill(
         }
 
         if crosses.taker_direction == PositionDirection::Long {
-            maker_accounts.extend(&top_maker_asks);
+            maker_accounts.extend_from_slice(&top_maker_asks);
         } else {
-            maker_accounts.extend(&top_maker_bids);
+            maker_accounts.extend_from_slice(&top_maker_bids);
         }
 
         let tx = tx_builder
