@@ -4,7 +4,7 @@ use drift_rs::{dlob::MakerCrosses, types::MarketId};
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
 use pyth_lazer_protocol::{
-    message::Message,
+    message::{Message, SolanaMessage},
     payload::{PayloadData, PayloadPropertyValue},
     router::{
         Channel, DeliveryFormat, FixedRate, Format, JsonBinaryEncoding, PriceFeedId,
@@ -253,6 +253,8 @@ pub struct PythPriceUpdate {
     pub market_id: u16,
     pub feed_id: u32,
     pub price: u64,
+    // original pyth message
+    pub message: SolanaMessage,
 }
 
 pub fn subscribe_price_feeds(
@@ -320,6 +322,7 @@ pub fn subscribe_price_feeds(
                                                     market_id: drift_rs::constants::pyth_lazer_feed_id_to_perp_market_index(f.feed_id.0).expect("feed maps to market"),
                                                     feed_id: f.feed_id.0,
                                                     price: price.0.unsigned_abs().into(),
+                                                    message: message.clone(),
                                                 });
                                             }
                                         }

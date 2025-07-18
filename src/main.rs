@@ -24,7 +24,6 @@ use drift_rs::{
     DriftClient, GrpcSubscribeOpts, Pubkey, RpcClient, TransactionBuilder, Wallet,
 };
 use futures_util::StreamExt;
-use pyth_lazer_protocol::message::SolanaMessage;
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
@@ -270,6 +269,8 @@ impl FillerBot {
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot, oracle_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
+                        // TODO: check if the pyth price update is warranted
+
                         if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
                             if taker.user == maker.user {
                                 log::info!(target: "filler", "book crossed by same user: {taker:?}");
@@ -394,67 +395,67 @@ impl FillerBot {
                 new_slot = slot_rx.recv() => {
                     slot = new_slot.expect("got slot update");
 
-                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5);
-                    let cu_limit = config.fill_cu_limit;
+                    // let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5);
+                    // let cu_limit = config.fill_cu_limit;
 
-                    for market in &market_ids {
-                        let market_index = market.index();
-                        let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
-                        log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
-                        let oracle_price = oracle_price.data.price as u64;
-                        let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
-                        // won't land in immediate slot so aim for next slot
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot + 1, oracle_price, Some(&perp_market));
-                        crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
+                    // for market in &market_ids {
+                    //     let market_index = market.index();
+                    //     let oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
+                    //     log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, market, oracle_price.data.price);
+                    //     let oracle_price = oracle_price.data.price as u64;
+                    //     let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
+                    //     // won't land in immediate slot so aim for next slot
+                    //     let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, market.kind(), slot + 1, oracle_price, Some(&perp_market));
+                    //     crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
-                        // if !perp_market.has_too_much_drawdown() {
-                        //     if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
-                        //         if limiter.check_event(slot, maker.order_id) {
-                        //             log::info!(target: "filler", "found vamm taker ask. market: {market_index},{maker:?}");
-                        //             try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
-                        //         }
-                        //     }
+                    //     // if !perp_market.has_too_much_drawdown() {
+                    //     //     if let Some(maker) = crosses_and_top_makers.vamm_taker_ask {
+                    //     //         if limiter.check_event(slot, maker.order_id) {
+                    //     //             log::info!(target: "filler", "found vamm taker ask. market: {market_index},{maker:?}");
+                    //     //             try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
+                    //     //         }
+                    //     //     }
 
-                        //     if let Some(maker) = crosses_and_top_makers.vamm_taker_bid {
-                        //         if limiter.check_event(slot, maker.order_id) {
-                        //             log::info!(target: "filler", "found vamm taker bid. market: {market_index},{maker:?}");
-                        //             try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
-                        //         }
-                        //     }
-                        // }
+                    //     //     if let Some(maker) = crosses_and_top_makers.vamm_taker_bid {
+                    //     //         if limiter.check_event(slot, maker.order_id) {
+                    //     //             log::info!(target: "filler", "found vamm taker bid. market: {market_index},{maker:?}");
+                    //     //             try_vamm_take(drift.clone(), market_index, maker, slot, priority_fee, cu_limit, filler_subaccount, tx_worker_ref.clone());
+                    //     //         }
+                    //     //     }
+                    //     // }
 
-                        if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
-                            if taker.user == maker.user {
-                                log::info!(target: "filler", "book crossed by same user: {taker:?}");
-                            } else if limiter.check_event(slot, maker.order_id) || limiter.check_event(slot, taker.order_id) {
-                                log::info!(target: "filler", "found limit uncrosses. market: {},{taker:?}{maker:?}", market_index);
-                                try_limit_uncross(
-                                    drift.clone(),
-                                    market_index,
-                                    slot,
-                                    *taker,
-                                    *maker,
-                                    priority_fee,
-                                    cu_limit,
-                                    filler_subaccount,
-                                    tx_worker_ref.clone(),
-                                ).await;
-                            }
-                        }
+                    //     if let Some((taker, maker)) = &crosses_and_top_makers.limit_crosses {
+                    //         if taker.user == maker.user {
+                    //             log::info!(target: "filler", "book crossed by same user: {taker:?}");
+                    //         } else if limiter.check_event(slot, maker.order_id) || limiter.check_event(slot, taker.order_id) {
+                    //             log::info!(target: "filler", "found limit uncrosses. market: {},{taker:?}{maker:?}", market_index);
+                    //             try_limit_uncross(
+                    //                 drift.clone(),
+                    //                 market_index,
+                    //                 slot,
+                    //                 *taker,
+                    //                 *maker,
+                    //                 priority_fee,
+                    //                 cu_limit,
+                    //                 filler_subaccount,
+                    //                 tx_worker_ref.clone(),
+                    //             ).await;
+                    //         }
+                    //     }
 
-                        if !crosses_and_top_makers.crosses.is_empty() {
-                            log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
-                            try_auction_fill(
-                                drift.clone(),
-                                priority_fee,
-                                cu_limit,
-                                market.index(),
-                                filler_subaccount,
-                                crosses_and_top_makers,
-                                tx_worker_ref.clone(),
-                            ).await;
-                        }
-                    }
+                    //     if !crosses_and_top_makers.crosses.is_empty() {
+                    //         log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
+                    //         try_auction_fill(
+                    //             drift.clone(),
+                    //             priority_fee,
+                    //             cu_limit,
+                    //             market.index(),
+                    //             filler_subaccount,
+                    //             crosses_and_top_makers,
+                    //             tx_worker_ref.clone(),
+                    //         ).await;
+                    //     }
+                    // }
                 }
             }
         }
@@ -712,9 +713,9 @@ async fn try_auction_fill(
         }
 
         if crosses.taker_direction == PositionDirection::Long {
-            maker_accounts.extend_from_slice(&top_maker_asks);
+            maker_accounts.extend(&top_maker_asks);
         } else {
-            maker_accounts.extend_from_slice(&top_maker_bids);
+            maker_accounts.extend(&top_maker_bids);
         }
 
         let tx = tx_builder
