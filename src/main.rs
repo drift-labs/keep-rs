@@ -312,9 +312,9 @@ impl FillerBot {
                                 let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, Some(vamm_price as u64));
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
-                                    try_swift_fill(
+                                    m(
                                         drift.clone(),
-                                        priority_fee_subscriber.priority_fee_nth(0.8),
+                                        priority_fee_subscriber.priority_fee_nth(0.6),
                                         config.swift_cu_limit,
                                         filler_subaccount,
                                         signed_order,
@@ -615,7 +615,6 @@ async fn try_auction_fill(
             std::borrow::Cow::Borrowed(&filler_account_data),
             false,
         );
-        tx_builder = tx_builder.with_priority_fee(priority_fee, Some(cu_limit));
 
         let taker_is_trigger = matches!(
             taker_order_metadata.kind,
@@ -657,15 +656,27 @@ async fn try_auction_fill(
             maker_accounts.extend_from_slice(&top_maker_bids);
         }
 
+        tx_builder = tx_builder.fill_perp_order(
+            market_index,
+            taker_subaccount,
+            &taker_account_data,
+            &taker_stats,
+            Some(taker_order_metadata.order_id),
+            maker_accounts.as_slice(),
+        );
+
+        // fill with many accounts needs more CUs
+        let adjusted_cu_limit = if tx_builder
+            .ixs()
+            .last()
+            .is_some_and(|ix| ix.accounts.len() >= 30)
+        {
+            cu_limit
+        } else {
+            cu_limit * 2
+        };
         let tx = tx_builder
-            .fill_perp_order(
-                market_index,
-                taker_subaccount,
-                &taker_account_data,
-                &taker_stats,
-                Some(taker_order_metadata.order_id),
-                maker_accounts.as_slice(),
-            )
+            .with_priority_fee(priority_fee, Some(adjusted_cu_limit))
             .build();
 
         tx_worker_ref.send_tx(
