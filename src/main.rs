@@ -312,7 +312,7 @@ impl FillerBot {
                                 let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, Some(vamm_price as u64));
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
-                                    m(
+                                    try_swift_fill(
                                         drift.clone(),
                                         priority_fee_subscriber.priority_fee_nth(0.6),
                                         config.swift_cu_limit,
@@ -334,7 +334,7 @@ impl FillerBot {
                 new_slot = slot_rx.recv() => {
                     slot = new_slot.expect("got slot update");
 
-                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5);
+                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.8);
                     let cu_limit = config.fill_cu_limit;
 
                     for market in &market_ids {
@@ -384,7 +384,7 @@ impl FillerBot {
 
                         if !crosses_and_top_makers.crosses.is_empty() {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
-                            try_auction_fill(
+                            tokio::spawn(try_auction_fill(
                                 drift.clone(),
                                 priority_fee,
                                 cu_limit,
@@ -392,7 +392,7 @@ impl FillerBot {
                                 filler_subaccount,
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
-                            ).await;
+                            ));
                         }
                     }
                 }
