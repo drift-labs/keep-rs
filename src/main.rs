@@ -253,6 +253,9 @@ impl FillerBot {
                             log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
                             let oracle_price = oracle_price.data.price;
 
+                            // TODO: this isn't accurate, it should needs to call: OrderParams::update_perp_auction_params
+                            // to get the auction params first
+                            // especially if will_sanitize
                             let order = Order {
                                 slot,
                                 price: order_params.price,
@@ -334,7 +337,7 @@ impl FillerBot {
                 new_slot = slot_rx.recv() => {
                     slot = new_slot.expect("got slot update");
 
-                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.8);
+                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.6);
                     let cu_limit = config.fill_cu_limit;
 
                     for market in &market_ids {
@@ -673,7 +676,7 @@ async fn try_auction_fill(
         {
             cu_limit
         } else {
-            cu_limit * 2
+            (cu_limit * 3) / 2
         };
         let tx = tx_builder
             .with_priority_fee(priority_fee, Some(adjusted_cu_limit))
