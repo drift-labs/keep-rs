@@ -63,7 +63,7 @@ pub struct Config {
     pub mainnet: bool,
     #[clap(long, default_value = "512")]
     pub priority_fee: u64,
-    #[clap(long, default_value = "320000")]
+    #[clap(long, default_value = "364000")]
     pub swift_cu_limit: u32,
     #[clap(long, default_value = "196000")]
     pub fill_cu_limit: u32,
@@ -263,9 +263,9 @@ impl FillerBot {
                 }
                 price_update = pyth_price_feed.recv() => {
                     if let Some(update) = price_update {
-                        // discard updates older than 50ms
+                        // discard updates older than 100ms
                         // during bot startup the channel fills with mostly stale messages
-                        if TimestampUs::now().saturating_us_since(update.ts) <= 50_000 {
+                        if TimestampUs::now().saturating_us_since(update.ts) <= 100_000 {
                             live_oracle_prices.insert(update.market_id, update.clone());
                         }
                     } else {
@@ -400,9 +400,9 @@ impl FillerBot {
                             let price = live_oracle_price.map(|x| x.price).unwrap();
                             log::debug!(target: "filler", "try live price 🔮: {market_index} | {price:?}");
                             // tx won't land in immediate slot so aim for next slot
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, price, Some(&perp_market)), live_oracle_price)
+                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, price, Some(&perp_market)), live_oracle_price)
                         } else {
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, chain_oracle_price, Some(&perp_market)), None)
+                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, chain_oracle_price, Some(&perp_market)), None)
                         };
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
@@ -425,7 +425,7 @@ impl FillerBot {
                             let price = maybe_oracle_update.map(|p| p.price).unwrap_or(chain_oracle_price);
                             if let Some(crosses) = dlob.find_crossing_region(slot, price, market_index, MarketType::Perp) {
                                 log::info!("found limit crosses (market: {market_index})");
-                                try_uncross(drift, &mut limiter, slot, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
+                                try_uncross(drift, &mut limiter, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
                         }
                     }
