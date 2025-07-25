@@ -265,7 +265,7 @@ impl FillerBot {
                     if let Some(update) = price_update {
                         // discard updates older than 50ms
                         // during bot startup the channel fills with mostly stale messages
-                        if TimestampUs::now().saturating_us_since(update.ts) < 50_000 {
+                        if TimestampUs::now().saturating_us_since(update.ts) <= 50_000 {
                             live_oracle_prices.insert(update.market_id, update.clone());
                         }
                     } else {
@@ -400,15 +400,15 @@ impl FillerBot {
                             let price = live_oracle_price.map(|x| x.price).unwrap();
                             log::debug!(target: "filler", "try live price 🔮: {market_index} | {price:?}");
                             // tx won't land in immediate slot so aim for next slot
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, price, Some(&perp_market)), live_oracle_price)
+                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, price, Some(&perp_market)), live_oracle_price)
                         } else {
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, chain_oracle_price, Some(&perp_market)), None)
+                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, chain_oracle_price, Some(&perp_market)), None)
                         };
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
-                        if !crosses_and_top_makers.crosses.is_empty() {
+                        if crosses_and_top_makers.crosses.len() > 0 {
                             log::info!(target: "filler", "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
-                            tokio::spawn(try_auction_fill(
+                            try_auction_fill(
                                 drift,
                                 priority_fee,
                                 config.fill_cu_limit,
@@ -418,12 +418,12 @@ impl FillerBot {
                                 tx_worker_ref.clone(),
                                 maybe_oracle_update.cloned(),
                                 perp_market.has_too_much_drawdown(),
-                            ));
+                            );
                         }
 
                         if slot % 2 == 0 {
                             let price = maybe_oracle_update.map(|p| p.price).unwrap_or(chain_oracle_price);
-                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, price, market_index, MarketType::Perp) {
+                            if let Some(crosses) = dlob.find_crossing_region(slot, price, market_index, MarketType::Perp) {
                                 log::info!("found limit crosses (market: {market_index})");
                                 try_uncross(drift, &mut limiter, slot, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
@@ -597,7 +597,7 @@ async fn try_swift_fill(
 /// Try to fill an auction order
 ///
 /// - `auction_crosses` list of one or more crosses to fill
-async fn try_auction_fill(
+fn try_auction_fill(
     drift: &'static DriftClient,
     priority_fee: u64,
     cu_limit: u32,
@@ -641,10 +641,9 @@ async fn try_auction_fill(
             .expect("taker account");
 
         let taker_stats = drift
-            .get_account_value::<UserStats>(&Wallet::derive_stats_account(
+            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
                 &taker_account_data.authority,
             ))
-            .await
             .expect("taker stats");
 
         let mut tx_builder = TransactionBuilder::new(
@@ -719,15 +718,10 @@ async fn try_auction_fill(
 
         // large accounts list, bump CU limit to compensate
         if let Some(ix) = tx_builder.ixs().last() {
-            if ix.accounts.len() >= 40 {
+            if ix.accounts.len() >= 20 {
                 tx_builder = tx_builder.set_ix(
                     1,
                     ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
-                );
-            } else if ix.accounts.len() >= 24 {
-                tx_builder = tx_builder.set_ix(
-                    1,
-                    ComputeBudgetInstruction::set_compute_unit_limit((cu_limit * 3) / 2),
                 );
             }
         }
@@ -833,12 +827,7 @@ fn try_uncross(
                 if ix.accounts.len() >= 40 {
                     tx_builder = tx_builder.set_ix(
                         1,
-                        ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
-                    );
-                } else if ix.accounts.len() >= 24 {
-                    tx_builder = tx_builder.set_ix(
-                        1,
-                        ComputeBudgetInstruction::set_compute_unit_limit((cu_limit * 3) / 2),
+                        ComputeBudgetInstruction::set_compute_unit_limit((cu_limit * 25) / 10),
                     );
                 }
             }
@@ -869,8 +858,10 @@ async fn setup_grpc(
 ) -> tokio::sync::mpsc::Receiver<u64> {
     let dlob_notifier = dlob.spawn_notifier();
 
-    sync_stats_accounts(&drift).await;
-    sync_user_accounts(&drift, &dlob_notifier).await;
+    let _ = tokio::try_join!(
+        sync_stats_accounts(&drift),
+        sync_user_accounts(&drift, &dlob_notifier),
+    );
 
     let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
 
@@ -879,7 +870,7 @@ async fn setup_grpc(
     slot_rx
 }
 
-async fn sync_stats_accounts(drift: &DriftClient) {
+async fn sync_stats_accounts(drift: &DriftClient) -> Result<()> {
     let stats_sync_result = drift
         .rpc()
         .get_program_accounts_with_config(
@@ -914,9 +905,10 @@ async fn sync_stats_accounts(drift: &DriftClient) {
         }
     }
     log::info!(target: "dlob", "sync stats accounts");
+    Ok(())
 }
 
-async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifier) {
+async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifier) -> Result<()> {
     let sync_result = drift
         .rpc()
         .get_program_accounts_with_config(
@@ -970,6 +962,7 @@ async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifier) {
         }
     }
     log::info!(target: "dlob", "synced initial orders");
+    Ok(())
 }
 
 async fn subscribe_grpc(
