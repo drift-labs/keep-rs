@@ -817,9 +817,8 @@ fn try_uncross(
                 std::borrow::Cow::Borrowed(&filler_account_data),
                 false,
             );
-            tx_builder = tx_builder.with_priority_fee(priority_fee, Some(cu_limit));
-
-            let tx = tx_builder
+            tx_builder = tx_builder
+                .with_priority_fee(priority_fee, Some(cu_limit))
                 .fill_perp_order(
                     market_index,
                     taker_subaccount,
@@ -827,8 +826,23 @@ fn try_uncross(
                     &taker_stats,
                     Some(taker_order_id),
                     makers.as_slice(),
-                )
-                .build();
+                );
+
+            // large accounts list, bump CU limit to compensate
+            if let Some(ix) = tx_builder.ixs().last() {
+                if ix.accounts.len() >= 40 {
+                    tx_builder = tx_builder.set_ix(
+                        1,
+                        ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
+                    );
+                } else if ix.accounts.len() >= 24 {
+                    tx_builder = tx_builder.set_ix(
+                        1,
+                        ComputeBudgetInstruction::set_compute_unit_limit((cu_limit * 3) / 2),
+                    );
+                }
+            }
+            let tx = tx_builder.build();
 
             tx_worker_ref.send_tx(
                 tx,
