@@ -400,9 +400,9 @@ impl FillerBot {
                             let price = live_oracle_price.map(|x| x.price).unwrap();
                             log::debug!(target: "filler", "try live price 🔮: {market_index} | {price:?}");
                             // tx won't land in immediate slot so aim for next slot
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, price, Some(&perp_market)), live_oracle_price)
+                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, price, Some(&perp_market)), live_oracle_price)
                         } else {
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, chain_oracle_price, Some(&perp_market)), None)
+                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, chain_oracle_price, Some(&perp_market)), None)
                         };
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
@@ -423,7 +423,7 @@ impl FillerBot {
 
                         if slot % 2 == 0 {
                             let price = maybe_oracle_update.map(|p| p.price).unwrap_or(chain_oracle_price);
-                            if let Some(crosses) = dlob.find_crossing_region(slot, price, market_index, MarketType::Perp) {
+                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, price, market_index, MarketType::Perp) {
                                 log::info!("found limit crosses (market: {market_index})");
                                 try_uncross(drift, &mut limiter, slot, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
