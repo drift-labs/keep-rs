@@ -654,6 +654,8 @@ async fn try_auction_fill(
             false,
         );
 
+        tx_builder = tx_builder.with_priority_fee(priority_fee, Some(cu_limit));
+
         if let Some(ref update_msg) = oracle_update {
             if !sent_oracle_update {
                 tx_builder = tx_builder
