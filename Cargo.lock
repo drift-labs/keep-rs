@@ -1421,6 +1421,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
+source = "git+https://github.com/drift-labs/drift-rs?rev=54d25351#54d25351e694b9225cee9f1f43cf40a21d0819f4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1433,6 +1434,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
+source = "git+https://github.com/drift-labs/drift-rs?rev=54d25351#54d25351e694b9225cee9f1f43cf40a21d0819f4"
 dependencies = [
  "futures-util",
  "gjson",
@@ -1452,6 +1454,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0-alpha.15"
+source = "git+https://github.com/drift-labs/drift-rs?rev=54d25351#54d25351e694b9225cee9f1f43cf40a21d0819f4"
 dependencies = [
  "abi_stable",
  "ahash 0.8.12",
@@ -1477,6 +1480,7 @@ dependencies = [
  "solana-sdk",
  "solana-transaction-status",
  "spl-associated-token-account",
+ "spl-token-2022",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2433,7 +2437,6 @@ name = "keeprs"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
- "anyhow",
  "axum",
  "clap",
  "crossbeam",
@@ -2442,6 +2445,7 @@ dependencies = [
  "env_logger 0.11.8",
  "futures-util",
  "log",
+ "mimalloc",
  "prometheus",
  "pyth-lazer-client",
  "pyth-lazer-protocol",
@@ -2474,6 +2478,16 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88cd67e9de251c1781dbe2f641a1a3ad66eaae831b8a2c38fbdc5ddae16d4d"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -2598,6 +2612,15 @@ dependencies = [
  "keccak",
  "rand_core 0.6.4",
  "zeroize",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1791cbe101e95af5764f06f20f6760521f7158f69dbf9d6baf941ee1bf6bc40"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
