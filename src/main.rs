@@ -65,7 +65,7 @@ pub struct Config {
     pub priority_fee: u64,
     #[clap(long, default_value = "364000")]
     pub swift_cu_limit: u32,
-    #[clap(long, default_value = "196000")]
+    #[clap(long, default_value = "256000")]
     pub fill_cu_limit: u32,
     #[clap(long, env = "DRY_RUN", default_value = "false")]
     pub dry: bool,
@@ -397,7 +397,7 @@ impl FillerBot {
                         let lower_bound = (chain_oracle_price * (10_000 - threshold_bps)) / 10_000;
 
                         let (mut crosses_and_top_makers, maybe_oracle_update) = if live_oracle_price.is_some_and(|x| x.price <= lower_bound || x.price >= upper_bound) {
-                            let price = live_oracle_price.map(|x| x.price).unwrap();
+                            let price = live_oracle_price.map(|x| x.price).expectunwrap();
                             log::debug!(target: "filler", "try live price 🔮: {market_index} | {price:?}");
                             // tx won't land in immediate slot so aim for next slot
                             (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, price, Some(&perp_market)), live_oracle_price)
@@ -669,6 +669,7 @@ fn try_auction_fill(
         );
         if taker_is_trigger {
             log::info!(
+                target: "filler",
                 "attempting trigger and fill: {:?}/{:?}",
                 taker_order_metadata.order_id,
                 taker_order_metadata.user
