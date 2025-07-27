@@ -276,9 +276,6 @@ impl FillerBot {
                     match swift_order {
                         Some(signed_order) => {
                             let order_params = signed_order.order_params();
-                            if !market_ids.contains(&MarketId::perp(order_params.market_index)) {
-                                continue;
-                            }
                             log::debug!(target: "filler", "new swift order: {signed_order:?}");
                             let tick_size = drift.program_data().perp_market_config_by_index(order_params.market_index).unwrap().amm.order_tick_size;
                             let oracle_price = drift.try_get_oracle_price_data_and_slot(MarketId::perp(order_params.market_index)).expect("got oracle price");
@@ -379,7 +376,7 @@ impl FillerBot {
                     // is there compounding lag here?
                     slot = new_slot.expect("got slot update");
 
-                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 3; // add entropy to produce unique tx hash on conseuctive tx resubmission
+                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // add entropy to produce unique tx hash on conseuctive tx resubmission
                     let threshold_bps = 2; // prefer live oracle price if different to onchain price by bps threshold
                     let t0 = std::time::SystemTime::now();
 
@@ -397,7 +394,7 @@ impl FillerBot {
                         let lower_bound = (chain_oracle_price * (10_000 - threshold_bps)) / 10_000;
 
                         let (mut crosses_and_top_makers, maybe_oracle_update) = if live_oracle_price.is_some_and(|x| x.price <= lower_bound || x.price >= upper_bound) {
-                            let price = live_oracle_price.map(|x| x.price).expectunwrap();
+                            let price = live_oracle_price.map(|x| x.price).unwrap();
                             log::debug!(target: "filler", "try live price 🔮: {market_index} | {price:?}");
                             // tx won't land in immediate slot so aim for next slot
                             (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, price, Some(&perp_market)), live_oracle_price)
