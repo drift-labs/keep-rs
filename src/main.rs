@@ -421,7 +421,7 @@ impl FillerBot {
                         if slot % 2 == 0 {
                             let price = maybe_oracle_update.map(|p| p.price).unwrap_or(chain_oracle_price);
                             if let Some(crosses) = dlob.find_crossing_region(slot + 1, price, market_index, MarketType::Perp) {
-                                log::info!("found limit crosses (market: {market_index})");
+                                log::info!(target: "filler", "found limit crosses (market: {market_index})");
                                 try_uncross(drift, &mut limiter, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
                         }

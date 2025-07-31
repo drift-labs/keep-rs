@@ -1421,7 +1421,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs?rev=99895b33#99895b331c2d5d52385527fcced4dbb4c6fc4d78"
+source = "git+https://github.com/drift-labs/drift-rs?tag=v1.0.0-alpha.16#3785554f055be6ac5bb9ea4a296899d49817b70c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1434,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs?rev=99895b33#99895b331c2d5d52385527fcced4dbb4c6fc4d78"
+source = "git+https://github.com/drift-labs/drift-rs?tag=v1.0.0-alpha.16#3785554f055be6ac5bb9ea4a296899d49817b70c"
 dependencies = [
  "futures-util",
  "gjson",
@@ -1453,8 +1453,8 @@ dependencies = [
 
 [[package]]
 name = "drift-rs"
-version = "1.0.0-alpha.15"
-source = "git+https://github.com/drift-labs/drift-rs?rev=99895b33#99895b331c2d5d52385527fcced4dbb4c6fc4d78"
+version = "1.0.0-alpha.16"
+source = "git+https://github.com/drift-labs/drift-rs?tag=v1.0.0-alpha.16#3785554f055be6ac5bb9ea4a296899d49817b70c"
 dependencies = [
  "abi_stable",
  "ahash 0.8.12",
@@ -2398,8 +2398,8 @@ dependencies = [
 
 [[package]]
 name = "jupiter-swap-api-client"
-version = "0.1.0"
-source = "git+https://github.com/drift-labs/jupiter-swap-api-client#b699edf30ff1f561460579ee2504622e28f9a797"
+version = "0.2.0"
+source = "git+https://github.com/jup-ag/jupiter-swap-api-client#70aaffd957d59c19588df86e92ce3b94f24f7d0b"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
