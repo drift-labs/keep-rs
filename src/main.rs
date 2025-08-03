@@ -26,7 +26,6 @@ use drift_rs::{
     DriftClient, GrpcSubscribeOpts, Pubkey, RpcClient, TransactionBuilder, Wallet,
 };
 use futures_util::StreamExt;
-use pyth_lazer_protocol::router::TimestampUs;
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
@@ -129,7 +128,6 @@ struct FillerBot {
     filler_subaccount: Pubkey,
     slot_rx: tokio::sync::mpsc::Receiver<u64>,
     swift_order_stream: SwiftOrderStream,
-    pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
     limiter: OrderSlotLimiter<40>,
     market_ids: Vec<MarketId>,
     config: Config,
@@ -214,14 +212,14 @@ impl FillerBot {
         let slot_rx = setup_grpc(drift.clone(), dlob, &market_ids, tx_worker_ref.clone()).await;
         log::info!(target: "filler", "subscribed gRPC");
 
-        let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
-        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
-            "wss://pyth-lazer.dourolabs.app/v1/stream",
-            pyth_access_token.as_str(),
-        )
-        .expect("pyth price feed connects");
-        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
-        log::info!(target: "filler", "subscribed pyth price feeds");
+        // let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
+        // let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
+        //     "wss://pyth-lazer.dourolabs.app/v1/stream",
+        //     pyth_access_token.as_str(),
+        // )
+        // .expect("pyth price feed connects");
+        // let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
+        // log::info!(target: "filler", "subscribed pyth price feeds");
 
         FillerBot {
             drift,
@@ -233,7 +231,6 @@ impl FillerBot {
             market_ids,
             config,
             tx_worker_ref,
-            pyth_price_feed,
             priority_fee_subscriber,
         }
     }
@@ -249,8 +246,6 @@ impl FillerBot {
         let config = self.config.clone();
         let tx_worker_ref = self.tx_worker_ref.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
-        let mut pyth_price_feed = self.pyth_price_feed;
-        let mut live_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
         let mut slot = 0;
         let min_perp_auction_duration = drift.state_account().unwrap().min_perp_auction_duration;
 
@@ -260,17 +255,6 @@ impl FillerBot {
                 _ = tokio::signal::ctrl_c() => {
                     log::warn!("filler shutting down...");
                     break;
-                }
-                price_update = pyth_price_feed.recv() => {
-                    if let Some(update) = price_update {
-                        // discard updates older than 100ms
-                        // during bot startup the channel fills with mostly stale messages
-                        if TimestampUs::now().saturating_us_since(update.ts) <= 100_000 {
-                            live_oracle_prices.insert(update.market_id, update.clone());
-                        }
-                    } else {
-                        log::warn!(target: "pyth", "empty pyth update");
-                    }
                 }
                 swift_order = swift_order_stream.next() => {
                     match swift_order {
@@ -377,7 +361,6 @@ impl FillerBot {
                     slot = new_slot.expect("got slot update");
 
                     let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // add entropy to produce unique tx hash on conseuctive tx resubmission
-                    let threshold_bps = 2; // prefer live oracle price if different to onchain price by bps threshold
                     let t0 = std::time::SystemTime::now();
 
                     for market in &market_ids {
@@ -387,20 +370,7 @@ impl FillerBot {
                         let chain_oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", chain_oracle_price.slot, market, chain_oracle_price.data.price);
                         let chain_oracle_price = chain_oracle_price.data.price as u64;
-                        let live_oracle_price = live_oracle_prices.get(&market_index);
-
-                        // only consider using live oracle price if it differs by this many bps
-                        let upper_bound = (chain_oracle_price * (10_000 + threshold_bps)) / 10_000;
-                        let lower_bound = (chain_oracle_price * (10_000 - threshold_bps)) / 10_000;
-
-                        let (mut crosses_and_top_makers, maybe_oracle_update) = if live_oracle_price.is_some_and(|x| x.price <= lower_bound || x.price >= upper_bound) {
-                            let price = live_oracle_price.map(|x| x.price).unwrap();
-                            log::debug!(target: "filler", "try live price 🔮: {market_index} | {price:?}");
-                            // tx won't land in immediate slot so aim for next slot
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, price, Some(&perp_market)), live_oracle_price)
-                        } else {
-                            (dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, chain_oracle_price, Some(&perp_market)), None)
-                        };
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, chain_oracle_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if crosses_and_top_makers.crosses.len() > 0 {
@@ -413,14 +383,13 @@ impl FillerBot {
                                 filler_subaccount,
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
-                                maybe_oracle_update.cloned(),
+                                None,
                                 perp_market.has_too_much_drawdown(),
                             );
                         }
 
                         if slot % 2 == 0 {
-                            let price = maybe_oracle_update.map(|p| p.price).unwrap_or(chain_oracle_price);
-                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, price, market_index, MarketType::Perp) {
+                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, chain_oracle_price, market_index, MarketType::Perp) {
                                 log::info!(target: "filler", "found limit crosses (market: {market_index})");
                                 try_uncross(drift, &mut limiter, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
