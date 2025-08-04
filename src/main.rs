@@ -385,7 +385,7 @@ impl FillerBot {
                                 tx_worker_ref.clone(),
                                 None,
                                 perp_market.has_too_much_drawdown(),
-                            );
+                            ).await;
                         }
 
                         if slot % 2 == 0 {
@@ -400,6 +400,8 @@ impl FillerBot {
                 }
             }
         }
+        drift.grpc_unsubscribe();
+        log::info!(target: "filler", "filler shutting down...");
     }
 }
 
@@ -563,7 +565,7 @@ async fn try_swift_fill(
 /// Try to fill an auction order
 ///
 /// - `auction_crosses` list of one or more crosses to fill
-fn try_auction_fill(
+async fn try_auction_fill(
     drift: &'static DriftClient,
     priority_fee: u64,
     cu_limit: u32,
@@ -607,9 +609,10 @@ fn try_auction_fill(
             .expect("taker account");
 
         let taker_stats = drift
-            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
+            .get_account_value::<UserStats>(&Wallet::derive_stats_account(
                 &taker_account_data.authority,
             ))
+            .await
             .expect("taker stats");
 
         let mut tx_builder = TransactionBuilder::new(
