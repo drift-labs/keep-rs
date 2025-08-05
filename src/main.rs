@@ -391,12 +391,12 @@ impl FillerBot {
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(slot + 1, chain_oracle_price, market_index, MarketType::Perp) {
                                 log::info!(target: "filler", "found limit crosses (market: {market_index})");
-                                try_uncross(drift, &mut limiter, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
+                                try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
                         }
                     }
                     let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
-                    log::info!(target: "filler", "⏱️ checked fills at {slot}: {:?}ms", duration);
+                    log::debug!(target: "filler", "⏱️ checked fills at {slot}: {:?}ms", duration);
                 }
             }
         }
@@ -715,7 +715,6 @@ async fn try_auction_fill(
 /// - `crosses` list of one or more crosses to fill
 fn try_uncross(
     drift: &DriftClient,
-    limiter: &mut OrderSlotLimiter<40>,
     slot: u64,
     priority_fee: u64,
     cu_limit: u32,
@@ -728,92 +727,96 @@ fn try_uncross(
         .try_get_account::<User>(&filler_subaccount)
         .expect("filler account");
 
+    let best_bid = &crosses.crossing_bids[0];
+    let best_ask = &crosses.crossing_asks[0];
+
     let maker_asks: Vec<User> = crosses
         .crossing_asks
         .iter()
-        .take(4)
-        .map(|x| {
-            let user = x.metadata.user;
-            drift
-                .try_get_account::<User>(&user)
-                .expect("maker account syncd")
+        .take(5)
+        .filter_map(|x| {
+            let maker = x.metadata.user;
+            if maker != best_bid.metadata.user {
+                drift.try_get_account::<User>(&maker).ok()
+            } else {
+                None
+            }
         })
         .collect();
 
     let maker_bids: Vec<User> = crosses
         .crossing_bids
         .iter()
-        .take(4)
-        .map(|x| {
-            let user = x.metadata.user;
-            drift
-                .try_get_account::<User>(&user)
-                .expect("maker account syncd")
+        .take(5)
+        .filter_map(|x| {
+            let maker = x.metadata.user;
+            if maker != best_ask.metadata.user {
+                drift.try_get_account::<User>(&maker).ok()
+            } else {
+                None
+            }
         })
         .collect();
 
+    log::info!("try uncross book={market_index},slot={slot}");
+    log::info!(
+        "X asks: {:?}, X bids: {:?}",
+        crosses.crossing_asks,
+        crosses.crossing_bids
+    );
+
     // try valid combinations of taker/maker with all crossing asks/bids
-    for (takers, makers) in [
-        (crosses.crossing_asks, maker_bids),
-        (crosses.crossing_bids, maker_asks),
-    ] {
-        for taker_cross in takers {
-            let taker_order_id = taker_cross.metadata.order_id;
-            if taker_cross.order_view.post_only || !limiter.allow_event(slot, taker_order_id) {
-                continue;
-            }
-            log::info!("try fill crossed order: {taker_cross:?}");
-            let taker_subaccount = taker_cross.metadata.user;
+    for (taker_order, makers) in [(best_ask, maker_bids), (best_bid, maker_asks)] {
+        let taker_order_id = taker_order.metadata.order_id;
+        let taker_subaccount = taker_order.metadata.user;
+        let taker_account_data = drift
+            .try_get_account::<User>(&taker_subaccount)
+            .expect("taker account");
 
-            let taker_account_data = drift
-                .try_get_account::<User>(&taker_subaccount)
-                .expect("taker account");
+        let taker_stats = drift
+            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
+                &taker_account_data.authority,
+            ))
+            .expect("taker stats");
 
-            let taker_stats = drift
-                .try_get_account::<UserStats>(&Wallet::derive_stats_account(
-                    &taker_account_data.authority,
-                ))
-                .expect("taker stats");
-
-            let mut tx_builder = TransactionBuilder::new(
-                drift.program_data(),
-                filler_subaccount,
-                std::borrow::Cow::Borrowed(&filler_account_data),
-                false,
+        let mut tx_builder = TransactionBuilder::new(
+            drift.program_data(),
+            filler_subaccount,
+            std::borrow::Cow::Borrowed(&filler_account_data),
+            false,
+        );
+        tx_builder = tx_builder
+            .with_priority_fee(priority_fee, Some(cu_limit))
+            .fill_perp_order(
+                market_index,
+                taker_subaccount,
+                &taker_account_data,
+                &taker_stats,
+                Some(taker_order_id),
+                makers.as_slice(),
             );
-            tx_builder = tx_builder
-                .with_priority_fee(priority_fee, Some(cu_limit))
-                .fill_perp_order(
-                    market_index,
-                    taker_subaccount,
-                    &taker_account_data,
-                    &taker_stats,
-                    Some(taker_order_id),
-                    makers.as_slice(),
+
+        // large accounts list, bump CU limit to compensate
+        if let Some(ix) = tx_builder.ixs().last() {
+            if ix.accounts.len() >= 40 {
+                tx_builder = tx_builder.set_ix(
+                    1,
+                    ComputeBudgetInstruction::set_compute_unit_limit((cu_limit * 25) / 10),
                 );
-
-            // large accounts list, bump CU limit to compensate
-            if let Some(ix) = tx_builder.ixs().last() {
-                if ix.accounts.len() >= 40 {
-                    tx_builder = tx_builder.set_ix(
-                        1,
-                        ComputeBudgetInstruction::set_compute_unit_limit((cu_limit * 25) / 10),
-                    );
-                }
             }
-            let tx = tx_builder.build();
-
-            tx_worker_ref.send_tx(
-                tx,
-                TxIntent::LimitUncross {
-                    slot,
-                    market_index,
-                    taker_order_id,
-                    maker_order_id: 0,
-                },
-                cu_limit as u64,
-            );
         }
+        let tx = tx_builder.build();
+
+        tx_worker_ref.send_tx(
+            tx,
+            TxIntent::LimitUncross {
+                slot,
+                market_index,
+                taker_order_id,
+                maker_order_id: 0,
+            },
+            cu_limit as u64,
+        );
     }
 }
 
