@@ -198,6 +198,7 @@ impl FillerBot {
             PriorityFeeSubscriber::new(drift.rpc().url(), &market_pubkeys);
         let priority_fee_subscriber = priority_fee_subscriber.subscribe();
 
+        log::info!(target: "filler", "subsribing swift orders");
         let swift_order_stream = drift
             .subscribe_swift_orders(&market_ids, Some(true))
             .await
@@ -727,8 +728,15 @@ fn try_uncross(
         .try_get_account::<User>(&filler_subaccount)
         .expect("filler account");
 
-    let best_bid = &crosses.crossing_bids[0];
-    let best_ask = &crosses.crossing_asks[0];
+    let best_bid = &crosses.crossing_bids.first();
+    let best_ask = &crosses.crossing_asks.first();
+
+    if best_bid.is_none() || best_ask.is_none() {
+        return;
+    }
+
+    let best_bid = best_bid.unwrap();
+    let best_ask = best_ask.unwrap();
 
     let maker_asks: Vec<User> = crosses
         .crossing_asks
