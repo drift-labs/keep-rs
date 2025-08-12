@@ -1174,6 +1174,14 @@ impl TxWorker {
                                             actual_fills += 1;
                                         } else if let DriftEvent::OrderTrigger { .. } = event {
                                             metrics.trigger_actual.inc();
+                                        } else if log.as_str().contains("exceeded CUs meter") {
+                                            metrics
+                                            .tx_failed
+                                            .with_label_values(&[
+                                                intent_label,
+                                                "insufficient_cus",
+                                            ])
+                                            .inc();
                                         }
                                     }
                                 }
@@ -1225,6 +1233,7 @@ impl TxWorker {
                                     .inc();
                             }
                             Some(err) => {
+                            log::warn!(target: "filler", "tx failed: {err:?}");
                                 // tx failed with error
                                 metrics
                                     .tx_failed
