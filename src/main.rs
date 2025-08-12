@@ -1,6 +1,5 @@
 //! Filler Bot
 use std::{
-    collections::BTreeMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -249,6 +248,10 @@ impl FillerBot {
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
         let mut slot = 0;
         let min_perp_auction_duration = drift.state_account().unwrap().min_perp_auction_duration;
+        let mut use_median_trigger_price = drift
+            .state_account()
+            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
+            .unwrap_or(false);
 
         loop {
             tokio::select! {
@@ -358,11 +361,11 @@ impl FillerBot {
                     }
                 }
                 new_slot = slot_rx.recv() => {
-                    // is there compounding lag here?
                     slot = new_slot.expect("got slot update");
 
                     let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // add entropy to produce unique tx hash on conseuctive tx resubmission
                     let t0 = std::time::SystemTime::now();
+                    let unix_now = t0.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
 
                     for market in &market_ids {
                         let market_index = market.index();
@@ -370,8 +373,10 @@ impl FillerBot {
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
                         let chain_oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
                         log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", chain_oracle_price.slot, market, chain_oracle_price.data.price);
-                        let chain_oracle_price = chain_oracle_price.data.price as u64;
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, chain_oracle_price, Some(&perp_market));
+                        let oracle_price = chain_oracle_price.data.price as u64;
+                        let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
+
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, oracle_price, trigger_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if crosses_and_top_makers.crosses.len() > 0 {
@@ -389,11 +394,20 @@ impl FillerBot {
                             ).await;
                         }
 
+                        // ghetto rate limit
                         if slot % 2 == 0 {
-                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, chain_oracle_price, market_index, MarketType::Perp) {
+                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, oracle_price, market_index, MarketType::Perp) {
                                 log::info!(target: "filler", "found limit crosses (market: {market_index})");
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
+                        }
+
+                        // check state config ~every minute
+                        if slot % 150 == 0 {
+                            use_median_trigger_price = drift
+                            .state_account()
+                            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
+                            .unwrap_or(false);
                         }
                     }
                     let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
