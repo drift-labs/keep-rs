@@ -789,6 +789,10 @@ fn try_uncross(
 
     // try valid combinations of taker/maker with all crossing asks/bids
     for (taker_order, makers) in [(best_ask, maker_bids), (best_bid, maker_asks)] {
+        if taker_order.order_view.post_only {
+            continue;
+        }
+
         let taker_order_id = taker_order.metadata.order_id;
         let taker_subaccount = taker_order.metadata.user;
         let taker_account_data = drift
