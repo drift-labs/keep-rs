@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use drift_rs::{dlob::MakerCrosses, types::MarketId, DriftClient};
+use drift_rs::{dlob::MakerCrosses, types::MarketId};
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
 use pyth_lazer_protocol::{

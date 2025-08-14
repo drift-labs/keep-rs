@@ -10,7 +10,7 @@ use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
         util::OrderDelta, CrossesAndTopMakers, CrossingRegion, DLOBEvent, DLOBNotifier,
-        MakerCrosses, OrderKind, TakerOrder, DLOB,
+        MakerCrosses, OrderKind, OrderMetadata, TakerOrder, DLOB,
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
@@ -278,9 +278,8 @@ impl FillerBot {
                             };
                             let oracle_price = oracle_price.data.price;
 
-                            // TODO: this isn't accurate, it should needs to call: OrderParams::update_perp_auction_params
-                            // to get the auction params first
-                            // especially if will_sanitize
+                            // TODO: should call: OrderParams::update_perp_auction_params to get the auction params first
+                            // especially for will_sanitize=true
                             let order = Order {
                                 slot,
                                 price: order_params.price,
@@ -306,6 +305,13 @@ impl FillerBot {
 
                             let lookahead = 1;
                             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
+                            let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
+                            let vamm_price = if order_params.direction == PositionDirection::Long {
+                                perp_market.ask_price()
+                            } else {
+                                perp_market.bid_price()
+                            };
+
                             for offset in 0..=lookahead {
                                 let price = match order_params.order_type {
                                     OrderType::Market | OrderType::Oracle => {
@@ -332,12 +338,6 @@ impl FillerBot {
                                     }
                                 };
                                 let taker_order = TakerOrder::from_order_params(order_params, price);
-                                let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
-                                let vamm_price = if order_params.direction == PositionDirection::Long {
-                                    perp_market.calculate_ask_price()
-                                } else {
-                                    perp_market.calculate_bid_price()
-                                };
                                 let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, Some(vamm_price as u64));
                                 if !crosses.is_empty() {
                                     log::info!(target: "filler", "found resting cross|offset={offset}|crosses={crosses:?}");
