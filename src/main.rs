@@ -10,7 +10,7 @@ use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
         util::OrderDelta, CrossesAndTopMakers, CrossingRegion, DLOBEvent, DLOBNotifier,
-        MakerCrosses, OrderKind, OrderMetadata, TakerOrder, DLOB,
+        MakerCrosses, OrderKind, TakerOrder, DLOB,
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
@@ -307,9 +307,9 @@ impl FillerBot {
                             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
                             let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                             let vamm_price = if order_params.direction == PositionDirection::Long {
-                                perp_market.ask_price()
+                                perp_market.ask_price(None)
                             } else {
-                                perp_market.bid_price()
+                                perp_market.bid_price(None)
                             };
 
                             for offset in 0..=lookahead {
@@ -371,9 +371,9 @@ impl FillerBot {
                         let market_index = market.index();
 
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
-                        let chain_oracle_price = drift.try_get_oracle_price_data_and_slot(*market).expect("got oracle price");
-                        log::trace!(target: "filler", "oracle price: slot:{:?},market:{:?},price:{:?}", chain_oracle_price.slot, market, chain_oracle_price.data.price);
-                        let oracle_price = chain_oracle_price.data.price as u64;
+                        let chain_oracle_data = drift.try_get_mmoracle_for_perp_market(market_index, slot).expect("got oracle price");
+                        log::debug!(target: "oracle", "oracle price: delay:{:?},market:{:?},oracle:{:?},amm:{:?}", chain_oracle_data.delay, market, chain_oracle_data.price, perp_market.amm.mm_oracle_price);
+                        let oracle_price = chain_oracle_data.price as u64;
                         let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
 
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, oracle_price, trigger_price, Some(&perp_market));
@@ -616,7 +616,7 @@ async fn try_auction_fill(
         .collect();
     let mut sent_oracle_update = false;
     for (taker_order_metadata, crosses) in auction_crosses.crosses {
-        log::info!("try fill auction order: {taker_order_metadata:?}");
+        log::info!(target: "filler", "try fill auction order: {taker_order_metadata:?}");
         let taker_subaccount = taker_order_metadata.user;
 
         let taker_account_data = drift
@@ -780,8 +780,9 @@ fn try_uncross(
         })
         .collect();
 
-    log::info!("try uncross book={market_index},slot={slot}");
+    log::info!(target: "filler", "try uncross book={market_index},slot={slot}");
     log::info!(
+        target: "filler",
         "X asks: {:?}, X bids: {:?}",
         crosses.crossing_asks,
         crosses.crossing_bids
