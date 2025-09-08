@@ -199,7 +199,7 @@ impl FillerBot {
 
         log::info!(target: "filler", "subsribing swift orders");
         let swift_order_stream = drift
-            .subscribe_swift_orders(&market_ids, Some(true))
+            .subscribe_swift_orders(&market_ids, Some(true), None)
             .await
             .expect("subscribed swift orders");
         log::info!(target: "filler", "subscribed swift orders");
