@@ -199,7 +199,7 @@ impl FillerBot {
 
         log::info!(target: "filler", "subsribing swift orders");
         let swift_order_stream = drift
-            .subscribe_swift_orders(&market_ids, Some(true), None)
+            .subscribe_swift_orders(&market_ids, Some(true), None, None)
             .await
             .expect("subscribed swift orders");
         log::info!(target: "filler", "subscribed swift orders");
@@ -565,6 +565,7 @@ async fn try_swift_fill(
             &taker_stats,
             None, // Some(taker_order_id), // assuming we're fast enough that its the taker_order_id, should be ok for retail
             maker_accounts.as_slice(),
+            Some(swift_order.has_builder()),
         )
         .build();
 
@@ -699,6 +700,7 @@ async fn try_auction_fill(
             &taker_stats,
             Some(taker_order_metadata.order_id),
             maker_accounts.as_slice(),
+            None,
         );
 
         // large accounts list, bump CU limit to compensate
@@ -821,6 +823,7 @@ fn try_uncross(
                 &taker_stats,
                 Some(taker_order_id),
                 makers.as_slice(),
+                None,
             );
 
         // large accounts list, bump CU limit to compensate
