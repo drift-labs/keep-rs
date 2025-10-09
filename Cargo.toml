@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anchor-lang = "*"
-axum = "0.7.9" # pinned due to tonic 0.12.3
+axum = "0.8"
 clap = { version = "4.5.40", "features" = ["env", "derive"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 dotenv = "0.15.0"
