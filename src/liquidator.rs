@@ -123,6 +123,7 @@ pub struct LiquidatorBot {
     tx_worker_ref: TxSender,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     market_state: MarketState,
+    rate_limit: HashMap<(Pubkey, u16), u64>, // (liquidatee, market_index) -> last_liquidation_slot
 }
 
 impl LiquidatorBot {
@@ -217,6 +218,7 @@ impl LiquidatorBot {
             tx_worker_ref,
             priority_fee_subscriber,
             market_state,
+            rate_limit: HashMap::new(),
         }
     }
 
@@ -238,6 +240,7 @@ impl LiquidatorBot {
         let mut margin_records = MarginRecords::default();
         let mut users = BTreeMap::<Pubkey, User>::new();
         let dlob_notifier = self.dlob_notifier;
+        let mut rate_limit = self.rate_limit;
 
         /*
             TODO:
@@ -396,7 +399,6 @@ impl LiquidatorBot {
         let pf = priority_fee_subscriber.priority_fee_nth(0.6);
         for (liquidatee, _) in margin_records.liquidation_queue {
             // TODO: sort by margin shortage
-            // TODO: rate limit
             // TODO: small position skip at first?
             if let Some(user_account) = users.get(&liquidatee) {
                 for pos in user_account
@@ -404,6 +406,16 @@ impl LiquidatorBot {
                     .iter()
                     .filter(|p| !p.is_available())
                 {
+                    // Rate limiting: only liquidate every 3 slots per (liquidatee, market_index)
+                    let rate_limit_key = (liquidatee, pos.market_index);
+                    if let Some(last_liquidation_slot) = rate_limit.get(&rate_limit_key) {
+                        if slot - last_liquidation_slot < 3 {
+                            log::debug!(target: TARGET, "rate limited liquidation for {:?} market {} (last: {}, current: {})", 
+                                liquidatee, pos.market_index, last_liquidation_slot, slot);
+                            continue;
+                        }
+                    }
+
                     // TODO: cache this top maker lookup
                     let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
                     let top_3_makers = if pos.base_asset_amount > 0 {
@@ -432,6 +444,9 @@ impl LiquidatorBot {
                         config.fill_cu_limit,
                         slot,
                     );
+
+                    // Update rate limit tracking
+                    rate_limit.insert(rate_limit_key, slot);
                 }
             }
         }
