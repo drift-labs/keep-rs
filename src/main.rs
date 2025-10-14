@@ -22,6 +22,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 /// Bot configuration loaded from command line
 #[derive(Debug, Clone, Parser)]
 pub struct Config {
+    /// minimum collateral threshold for liquidatable accounts
+    #[clap(long, default_value = "1000000")]
+    pub min_collateral: u64,
     /// Run perp liquidator bot
     #[clap(long, default_value = "false")]
     pub liquidator: bool,

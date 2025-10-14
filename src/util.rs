@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use drift_rs::{dlob::MakerCrosses, types::MarketId};
+use drift_rs::{dlob::MakerCrosses, types::MarketId, Pubkey};
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
 use pyth_lazer_protocol::{
@@ -104,6 +104,11 @@ pub enum TxIntent {
         taker_order_id: u32,
         maker_order_id: u32,
     },
+    LiquidateWithFill {
+        market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
 }
 
 impl TxIntent {
@@ -126,6 +131,7 @@ impl TxIntent {
             }
             TxIntent::LimitUncross { .. } => "limit_uncross",
             TxIntent::VAMMTakerFill { .. } => "vamm_taker",
+            TxIntent::LiquidateWithFill { .. } => "liq_with_fill",
         }
     }
 
@@ -140,6 +146,7 @@ impl TxIntent {
             }
             TxIntent::VAMMTakerFill { .. } => 1,
             TxIntent::LimitUncross { .. } => 1,
+            TxIntent::LiquidateWithFill { .. } => 1,
         }
     }
 
@@ -172,6 +179,7 @@ impl TxIntent {
             ),
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),
+            Self::LiquidateWithFill { slot, .. } => (vec![], *slot),
         }
     }
 }
