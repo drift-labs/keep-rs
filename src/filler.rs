@@ -96,7 +96,7 @@ impl FillerBot {
 
         let filler_subaccount = drift.wallet.sub_account(config.sub_account_id);
 
-        log::info!(target: TARGET, "subsribing swift orders");
+        log::info!(target: TARGET, "subscribing swift orders");
         let swift_order_stream = drift
             .subscribe_swift_orders(&market_ids, Some(true), None, None)
             .await
@@ -539,11 +539,12 @@ async fn try_auction_fill(
             return;
         }
 
-        // TODO: this is duplicating accounts
-        if crosses.taker_direction == PositionDirection::Long {
-            maker_accounts.extend_from_slice(&top_maker_asks);
-        } else {
-            maker_accounts.extend_from_slice(&top_maker_bids);
+        if maker_accounts.len() < 3 {
+            if crosses.taker_direction == PositionDirection::Long {
+                maker_accounts = top_maker_asks.clone();
+            } else {
+                maker_accounts = top_maker_bids.clone();
+            }
         }
 
         tx_builder = tx_builder.fill_perp_order(
