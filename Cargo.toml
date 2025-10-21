@@ -5,15 +5,16 @@ edition = "2021"
 
 [dependencies]
 anchor-lang = "*"
-axum = "0.7.9" # pinned due to tonic 0.12.3
+axum = "0.8"
 clap = { version = "4.5.40", "features" = ["env", "derive"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "54d25351", features = ["unsafe_pub"] }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "107f48", features = ["unsafe_pub"] }
 env_logger = "0.11"
 # DLOB 'trace' logs are expensive so compile them out
 log = { version = "0.4", features = ["max_level_trace"] }
 futures-util = "0.3.31"
+mimalloc = "0.1.47"
 prometheus = "*"
 pyth-lazer-client = "0.1.3"
 pyth-lazer-protocol = "0.7.3"
@@ -24,7 +25,6 @@ solana-sdk = "2.3"
 solana-transaction-status = "2.3"
 solana-transaction-status-client-types = "2.3"
 tokio = "*"
-mimalloc = "0.1.47"
 
 [[bin]]
 name = "tx_history"
