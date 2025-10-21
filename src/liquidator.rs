@@ -2,13 +2,13 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anchor_lang::prelude::*;
-use crossbeam::channel::Receiver;
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
-    ffi::{CachedMarginCalculation, OraclePriceData, SimplifiedMarginCalculation},
+    ffi::{IncrementalMarginCalculation, OraclePriceData, SimplifiedMarginCalculation},
     grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
     priority_fee_subscriber::PriorityFeeSubscriber,
     types::{
@@ -49,38 +49,12 @@ pub enum GrpcEvent {
     },
 }
 
-#[derive(Default)]
-pub struct MarginRecords {
-    liquidation_queue: BTreeMap<Pubkey, SimplifiedMarginCalculation>,
-    user_margin: BTreeMap<Pubkey, SimplifiedMarginCalculation>,
-}
-
-impl MarginRecords {
-    pub fn remove(&mut self, pubkey: &Pubkey) {
-        self.liquidation_queue.remove(pubkey);
-        self.user_margin.remove(pubkey);
-    }
-    pub fn set_margin(&mut self, pubkey: &Pubkey, margin_info: &SimplifiedMarginCalculation) {
-        // Always keep in user_margin
-        self.user_margin.insert(*pubkey, margin_info.clone());
-
-        // Only manage liquidation queue based on status
-        let is_liquidating = margin_info.total_collateral < margin_info.margin_requirement as i128;
-
-        if is_liquidating {
-            self.liquidation_queue.insert(*pubkey, *margin_info);
-        } else {
-            self.liquidation_queue.remove(pubkey);
-        }
-    }
-}
-
 pub struct LiquidatorBot {
     drift: DriftClient,
     dlob: &'static DLOB,
     dlob_notifier: DLOBNotifier,
     keeper_subaccount: Pubkey,
-    events_rx: crossbeam::channel::Receiver<GrpcEvent>,
+    events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
     market_ids: Vec<MarketId>,
     config: Config,
     tx_worker_ref: TxSender,
@@ -186,7 +160,7 @@ impl LiquidatorBot {
     }
 
     pub async fn run(self) {
-        let events_rx = self.events_rx;
+        let mut events_rx = self.events_rx;
         let drift: &'static DriftClient = Box::leak(Box::new(self.drift));
         let dlob = self.dlob;
         let market_ids = self.market_ids;
@@ -216,11 +190,11 @@ impl LiquidatorBot {
             .iter_accounts_with::<User>(|pubkey, user, _slot| {
                 let margin_info = self
                     .market_state
-                    .calculate_simplified_margin_requirement(
+                    .calculate_incremental_margin_requirement(
                         user,
                         MarginRequirementType::Maintenance,
                         Some(liquidation_margin_buffer_ratio),
-                    ).unwrap();
+                    );
 
                 if margin_info.total_collateral < config.min_collateral as i128
                     && margin_info.margin_requirement < config.min_collateral as u128
@@ -228,17 +202,19 @@ impl LiquidatorBot {
                     exclude_count+=1;
                     log::debug!(target: TARGET, "excluding user: {:?}. insignificant collateral: {}/{}", user.authority, margin_info.total_collateral, margin_info.margin_requirement);
                 } else {
-                    margin_records.set_margin(pubkey, &margin_info);
+                    margin_records.set_margin(pubkey, &margin_info, 0);
                     users.insert(*pubkey, *user);
                 }
             });
 
         log::info!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
 
+        let mut oracle_update: Option<MarketId> = None;
+
         // main loop
         loop {
-            match events_rx.recv() {
-                Ok(GrpcEvent::UserUpdate {
+            match events_rx.recv().await {
+                Some(GrpcEvent::UserUpdate {
                     pubkey,
                     user,
                     slot: update_slot,
@@ -246,27 +222,24 @@ impl LiquidatorBot {
                     current_slot = current_slot.max(update_slot);
                     // TOOD: update dlob here, builder should be easier to use
                     dlob_notifier.user_update(pubkey, users.get(&pubkey), &user, update_slot);
-
+                    users.insert(pubkey, user);
                     // calculate user margin after upate
-                    let margin_info = self
-                        .market_state
-                        .calculate_simplified_margin_requirement(
-                            &user,
-                            MarginRequirementType::Maintenance,
-                            Some(liquidation_margin_buffer_ratio),
-                        )
-                        .unwrap();
+                    let margin_info = self.market_state.calculate_incremental_margin_requirement(
+                        &user,
+                        MarginRequirementType::Maintenance,
+                        Some(liquidation_margin_buffer_ratio),
+                    );
                     if margin_info.total_collateral < config.min_collateral as i128
                         && margin_info.margin_requirement < config.min_collateral as u128
                     {
                         log::trace!(target: TARGET, "filtered account with dust collateral: {pubkey:?}");
+                        margin_records.remove(&pubkey);
                     } else {
-                        margin_records.set_margin(&pubkey, &margin_info);
+                        margin_records.set_margin(&pubkey, &margin_info, update_slot);
                     }
-                    // TODO: check if individual user needs liquidating
                     continue;
                 }
-                Ok(GrpcEvent::OracleUpdate {
+                Some(GrpcEvent::OracleUpdate {
                     oracle_price_data,
                     market,
                     slot,
@@ -276,103 +249,118 @@ impl LiquidatorBot {
                     if is_perp_update {
                         self.market_state
                             .set_perp_oracle_price(market.index(), oracle_price_data);
+                        oracle_update = Some(market);
                     } else {
                         self.market_state
                             .set_spot_oracle_price(market.index(), oracle_price_data);
+                        oracle_update = Some(market);
                     }
-
-                    let t0 = std::time::SystemTime::now();
-                    let mut count = 0;
-                    let market_index = market.index();
-                    for (pubkey, user) in users.iter() {
-                        let margin_info = self
-                            .market_state
-                            .calculate_simplified_margin_requirement(
-                                &user,
-                                MarginRequirementType::Maintenance,
-                                Some(liquidation_margin_buffer_ratio),
-                            )
-                            .unwrap();
-                        if is_perp_update {
-                            if let Some(pos) = user
-                                .perp_positions
-                                .iter()
-                                .find(|x| x.market_index == market_index && !x.is_available())
-                            {
-                                count += 1;
-                                margin_records.set_margin(pubkey, &margin_info);
-                            }
-                        } else if !is_perp_update {
-                            if let Some(pos) = user
-                                .spot_positions
-                                .iter()
-                                .find(|x| x.market_index == market_index && !x.is_available())
-                            {
-                                count += 1;
-                                margin_records.set_margin(pubkey, &margin_info);
-                            }
-                        }
-                    }
-
-                    log::debug!(
-                        "processed #{count} margin updates (market={}): {:?}ms",
-                        market.index(),
-                        std::time::SystemTime::now()
-                            .duration_since(t0)
-                            .unwrap()
-                            .as_millis(),
-                    );
                 }
-                Ok(GrpcEvent::PerpMarketUpdate { market, slot }) => {
+                Some(GrpcEvent::PerpMarketUpdate { market, slot }) => {
+                    current_slot = current_slot.max(slot);
                     self.market_state.set_perp_market(market);
-                    current_slot = current_slot.max(slot);
                     continue;
                 }
-                Ok(GrpcEvent::SpotMarketUpdate { market, slot }) => {
+                Some(GrpcEvent::SpotMarketUpdate { market, slot }) => {
+                    current_slot = current_slot.max(slot);
                     self.market_state.set_spot_market(market);
-                    current_slot = current_slot.max(slot);
                     continue;
                 }
-                Err(err) => {
-                    log::error!("grpc err: {err:?}");
+                None => {
+                    log::error!("grpc err");
                     break;
                 }
+            }
+
+            // update all affected users' margin info on oracle price update
+            if let Some(market) = oracle_update.take() {
+                let t0 = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let mut count = 0;
+                let market_index = market.index();
+                let is_perp_update = market.is_perp();
+                for (pubkey, user) in users.iter() {
+                    if is_perp_update {
+                        if let Some(pos) = user
+                            .perp_positions
+                            .iter()
+                            .find(|x| x.market_index == market_index && !x.is_available())
+                        {
+                            margin_records.update_margin(
+                                pubkey,
+                                |m| {
+                                    m.update_perp_position(pos, &self.market_state, t0);
+                                },
+                                current_slot,
+                            );
+                            count += 1;
+                        }
+                    } else {
+                        if let Some(pos) = user
+                            .spot_positions
+                            .iter()
+                            .find(|x| x.market_index == market_index && !x.is_available())
+                        {
+                            margin_records.update_margin(
+                                pubkey,
+                                |m| {
+                                    m.update_spot_position(pos, &self.market_state, t0);
+                                },
+                                current_slot,
+                            );
+                            count += 1;
+                        }
+                    }
+                }
+
+                log::debug!(
+                    "processed #{count} margin updates (market={market_index}): {:?}ms",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64
+                        - t0
+                );
             }
 
             // try to liquidate users
             let t0 = std::time::SystemTime::now();
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
             let mut count = 0;
-            // let mut to_remove = vec![];
-            for (liquidatee, margin_info) in &margin_records.liquidation_queue {
-                // TODO: sort by margin shortage
-                // TODO: small position skip at first?
+            'inner: for (liquidatee, margin_info) in &margin_records.liquidation_queue {
                 if (margin_info.margin_requirement as i128) < margin_info.total_collateral {
                     dbg!("can't liq", liquidatee);
-                    // to_remove.push(liquidatee);
+                    continue 'inner;
                 }
                 if let Some(user_account) = users.get(&liquidatee) {
                     for pos in user_account
                         .perp_positions
                         .iter()
-                        .filter(|p| !p.is_available())
+                        // TODO: currently only trying to fill perp positions that are open
+                        .filter(|p| p.base_asset_amount != 0)
                     {
                         // Rate limiting: only liquidate every 3 slots per (liquidatee, market_index)
                         let rate_limit_key = (*liquidatee, pos.market_index);
                         if let Some(last_liquidation_slot) = rate_limit.get(&rate_limit_key) {
                             if current_slot - last_liquidation_slot < 10 {
-                                log::debug!(target: TARGET, "rate limited liquidation for {:?} market {} (last: {}, current: {})", 
+                                log::debug!(target: TARGET, "rate limited liquidation for {:?} market {} (last: {}, current: {})",
                                 liquidatee, pos.market_index, last_liquidation_slot, current_slot);
-                                continue;
+                                continue 'inner;
                             }
                         }
 
-                        log::info!(target: TARGET, "try liquidate: {liquidatee:?}, market={}, margin={:?}", pos.market_index, margin_info);
+                        log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}, margin={:?}", pos.market_index, margin_info);
 
                         // TODO: cache top maker lookup
                         let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
+                        if l3_book.is_none() {
+                            continue 'inner;
+                        }
+                        let l3_book = l3_book.unwrap();
                         dbg!(l3_book.bbo());
-                        let top_makers = if pos.base_asset_amount > 0 {
+                        let top_makers = if pos.base_asset_amount >= 0 {
                             l3_book.top_asks()
                         } else {
                             l3_book.top_bids()
@@ -381,11 +369,10 @@ impl LiquidatorBot {
                         let maker_accounts: Vec<User> = top_makers
                             .iter()
                             .take(3)
-                            .map(|m| users.get(&m.maker).expect("maker account loaded").clone())
+                            .map(|m| users.get(&m.user).expect("maker account loaded").clone())
                             .collect();
 
                         // TODO: check liquidation limit price
-
                         count += 1;
                         try_liquidate_with_match(
                             &drift,
@@ -404,12 +391,7 @@ impl LiquidatorBot {
                     }
                 }
             }
-
-            // for user in to_remove.drain(..) {
-            //     margin_records.liquidation_queue.remove(user);
-            // }
-
-            log::debug!(
+            log::trace!(
                 target: TARGET,
                 "processed liquidation queue: #{count}: {:?}ms",
                 std::time::SystemTime::now()
@@ -453,8 +435,8 @@ async fn setup_grpc(
     dlob_notifier: DLOBNotifier,
     transaction_tx: TxSender,
     market_ids: &[MarketId],
-) -> Receiver<GrpcEvent> {
-    let (tx, rx) = crossbeam::channel::bounded(1024);
+) -> tokio::sync::mpsc::Receiver<GrpcEvent> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
 
     let _ = tokio::try_join!(
         crate::filler::sync_stats_accounts(&drift),
@@ -491,7 +473,7 @@ async fn setup_grpc(
                         let tx = tx.clone();
                         move |acc| {
                             let user: &User = drift_rs::utils::deser_zero_copy(&acc.data);
-                            if let Err(err) = tx.send(GrpcEvent::UserUpdate {
+                            if let Err(err) = tx.try_send(GrpcEvent::UserUpdate {
                                 pubkey: acc.pubkey,
                                 user: user.clone(),
                                 slot: acc.slot,
@@ -507,7 +489,7 @@ async fn setup_grpc(
                         let tx = tx.clone();
                         move |acc| {
                             let market: &PerpMarket = drift_rs::utils::deser_zero_copy(&acc.data);
-                            if let Err(err) = tx.send(GrpcEvent::PerpMarketUpdate {
+                            if let Err(err) = tx.try_send(GrpcEvent::PerpMarketUpdate {
                                 market: market.clone(),
                                 slot: acc.slot,
                             }) {
@@ -522,7 +504,7 @@ async fn setup_grpc(
                         let tx = tx.clone();
                         move |acc| {
                             let market: &SpotMarket = drift_rs::utils::deser_zero_copy(&acc.data);
-                            if let Err(err) = tx.send(GrpcEvent::SpotMarketUpdate {
+                            if let Err(err) = tx.try_send(GrpcEvent::SpotMarketUpdate {
                                 market: market.clone(),
                                 slot: acc.slot,
                             }) {
@@ -555,7 +537,7 @@ async fn setup_grpc(
                                 slot,
                             )
                             .unwrap();
-                            if let Err(err) = tx.send(GrpcEvent::OracleUpdate {
+                            if let Err(err) = tx.try_send(GrpcEvent::OracleUpdate {
                                 oracle_price_data,
                                 market: *market,
                                 slot: acc.slot,
@@ -629,4 +611,74 @@ fn try_liquidate_with_match(
         },
         cu_limit as u64,
     );
+}
+
+/// Tracks user margin info
+#[derive(Default)]
+pub struct MarginRecords {
+    liquidation_queue: BTreeMap<Pubkey, SimplifiedMarginCalculation>,
+    user_margin: BTreeMap<Pubkey, IncrementalMarginCalculation>,
+}
+
+impl MarginRecords {
+    pub fn remove(&mut self, pubkey: &Pubkey) {
+        self.liquidation_queue.remove(pubkey);
+        self.user_margin.remove(pubkey);
+    }
+    pub fn update_margin(
+        &mut self,
+        pubkey: &Pubkey,
+        mut f: impl FnMut(&mut IncrementalMarginCalculation),
+        slot: u64,
+    ) {
+        // Always keep in user_margin
+        self.user_margin.get_mut(pubkey).map(|u| f(u));
+        if let Some(margin_info) = self.user_margin.get(pubkey) {
+            // Only manage liquidation queue based on status
+            let is_liquidating =
+                margin_info.total_collateral < margin_info.margin_requirement as i128;
+
+            if is_liquidating {
+                log::info!(target: TARGET, "found liquidatable account: {pubkey:?}, slot={slot}, {margin_info:?}");
+                self.liquidation_queue.insert(
+                    *pubkey,
+                    SimplifiedMarginCalculation {
+                        total_collateral: margin_info.total_collateral,
+                        total_collateral_buffer: margin_info.total_collateral_buffer,
+                        margin_requirement: margin_info.margin_requirement,
+                        margin_requirement_plus_buffer: margin_info.margin_requirement_plus_buffer,
+                    },
+                );
+            } else {
+                self.liquidation_queue.remove(pubkey);
+            }
+        }
+    }
+    pub fn set_margin(
+        &mut self,
+        pubkey: &Pubkey,
+        margin_info: &IncrementalMarginCalculation,
+        slot: u64,
+    ) {
+        // Always keep in user_margin
+        self.user_margin.insert(*pubkey, margin_info.clone());
+
+        // Only manage liquidation queue based on status
+        let is_liquidating = margin_info.total_collateral < margin_info.margin_requirement as i128;
+
+        if is_liquidating {
+            log::info!(target: TARGET, "found liquidatable account: {pubkey:?}, slot={slot}, {margin_info:?}");
+            self.liquidation_queue.insert(
+                *pubkey,
+                SimplifiedMarginCalculation {
+                    total_collateral: margin_info.total_collateral,
+                    total_collateral_buffer: margin_info.total_collateral_buffer,
+                    margin_requirement: margin_info.margin_requirement,
+                    margin_requirement_plus_buffer: margin_info.margin_requirement_plus_buffer,
+                },
+            );
+        } else {
+            self.liquidation_queue.remove(pubkey);
+        }
+    }
 }
