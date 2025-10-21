@@ -454,7 +454,7 @@ async fn setup_grpc(
 
     let _res = drift
         .grpc_subscribe(
-            std::env::var("GRPC_URL")
+            std::env::var("GRPC_ENDPOINT")
                 .unwrap_or_else(|_| "https://api.rpcpool.com".to_string())
                 .into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
