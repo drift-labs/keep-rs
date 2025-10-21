@@ -360,17 +360,17 @@ impl LiquidatorBot {
                         }
                         let l3_book = l3_book.unwrap();
                         dbg!(l3_book.bbo());
-                        let top_makers = if pos.base_asset_amount >= 0 {
-                            l3_book.top_asks()
+                        let maker_accounts: Vec<User> = if pos.base_asset_amount >= 0 {
+                            l3_book
+                                .top_asks(3)
+                                .map(|m| users.get(&m.user).expect("maker account loaded").clone())
+                                .collect()
                         } else {
-                            l3_book.top_bids()
+                            l3_book
+                                .top_bids(3)
+                                .map(|m| users.get(&m.user).expect("maker account loaded").clone())
+                                .collect()
                         };
-
-                        let maker_accounts: Vec<User> = top_makers
-                            .iter()
-                            .take(3)
-                            .map(|m| users.get(&m.user).expect("maker account loaded").clone())
-                            .collect();
 
                         // TODO: check liquidation limit price
                         count += 1;
