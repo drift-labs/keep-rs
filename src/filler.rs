@@ -350,12 +350,28 @@ fn on_account_update_fn(
 ) -> impl Fn(&AccountUpdate) + Send + Sync + 'static {
     move |update| {
         let new_user = drift_rs::utils::deser_zero_copy(update.data);
-        let old_user = drift
+        if let Some(ref existing) = drift
             .backend()
             .account_map()
             .account_data_and_slot::<User>(&update.pubkey)
-            .map(|x| x.data);
-        dlob_notifier.user_update(update.pubkey, old_user.as_ref(), new_user, update.slot);
+        {
+            if existing.slot > update.slot {
+                dlob_notifier.user_update(
+                    update.pubkey,
+                    Some(&existing.data),
+                    new_user,
+                    update.slot,
+                );
+            } else {
+                log::warn!(
+                    "out of order user update: {} < {}",
+                    existing.slot,
+                    update.slot
+                );
+            }
+        } else {
+            dlob_notifier.user_update(update.pubkey, None, new_user, update.slot);
+        }
     }
 }
 
@@ -817,7 +833,9 @@ async fn subscribe_grpc(
 ) {
     let _res = drift
         .grpc_subscribe(
-            "https://api.rpcpool.com".into(),
+            std::env::var("GRPC_ENDPOINT")
+                .unwrap_or_else(|_| "https://api.rpcpool.com".to_string())
+                .into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
