@@ -60,7 +60,7 @@ pub struct LiquidatorBot {
     tx_worker_ref: TxSender,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     market_state: MarketState,
-    rate_limit: HashMap<(Pubkey, u16), u64>, // (liquidatee, market_index) -> last_liquidation_slot
+    rate_limit: HashMap<Pubkey, u64>, // liquidatee -> last_liquidation_slot (attempt)
 }
 
 impl LiquidatorBot {
@@ -258,8 +258,30 @@ impl LiquidatorBot {
                 }
                 Some(GrpcEvent::PerpMarketUpdate { market, slot }) => {
                     current_slot = current_slot.max(slot);
-                    self.market_state.set_perp_market(market);
-                    continue;
+                    if let Some(existing) = self
+                        .market_state
+                        .load()
+                        .perp_oracle_prices
+                        .get(&market.market_index)
+                    {
+                        if existing
+                            .sequence_id
+                            .is_some_and(|s| s < market.amm.mm_oracle_sequence_id)
+                            && market.amm.mm_oracle_price > 0
+                        {
+                            self.market_state.set_perp_oracle_price(
+                                market.market_index,
+                                OraclePriceData {
+                                    price: market.amm.mm_oracle_price,
+                                    confidence: 1,
+                                    delay: 0,
+                                    has_sufficient_number_of_data_points: true,
+                                    sequence_id: Some(market.amm.mm_oracle_sequence_id),
+                                },
+                            );
+                            oracle_update = Some(MarketId::perp(market.market_index));
+                        }
+                    }
                 }
                 Some(GrpcEvent::SpotMarketUpdate { market, slot }) => {
                     current_slot = current_slot.max(slot);
@@ -330,10 +352,16 @@ impl LiquidatorBot {
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
             let mut count = 0;
             'inner: for (liquidatee, margin_info) in &margin_records.liquidation_queue {
-                if (margin_info.margin_requirement as i128) < margin_info.total_collateral {
-                    dbg!("can't liq", liquidatee);
-                    continue 'inner;
+                // Rate limiting: only liquidate every N slots per (liquidatee, market_index)
+                if let Some(last_liquidation_slot) = rate_limit.get(liquidatee) {
+                    if current_slot - last_liquidation_slot < 10 {
+                        log::trace!(target: TARGET, "rate limited liquidation for {:?} (last: {}, current: {})",
+                                liquidatee, last_liquidation_slot, current_slot);
+                        continue 'inner;
+                    }
                 }
+
+                let mut tx_sent = false;
                 if let Some(user_account) = users.get(&liquidatee) {
                     for pos in user_account
                         .perp_positions
@@ -341,24 +369,19 @@ impl LiquidatorBot {
                         // TODO: currently only trying to fill perp positions that are open
                         .filter(|p| p.base_asset_amount != 0)
                     {
-                        // Rate limiting: only liquidate every 3 slots per (liquidatee, market_index)
-                        let rate_limit_key = (*liquidatee, pos.market_index);
-                        if let Some(last_liquidation_slot) = rate_limit.get(&rate_limit_key) {
-                            if current_slot - last_liquidation_slot < 10 {
-                                log::debug!(target: TARGET, "rate limited liquidation for {:?} market {} (last: {}, current: {})",
-                                liquidatee, pos.market_index, last_liquidation_slot, current_slot);
-                                continue 'inner;
-                            }
-                        }
-
                         log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}, margin={:?}", pos.market_index, margin_info);
 
                         // TODO: cache top maker lookup
-                        let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
-                        if l3_book.is_none() {
-                            continue 'inner;
-                        }
-                        let l3_book = l3_book.unwrap();
+                        let l3_book = dlob.get_l3_book(
+                            pos.market_index,
+                            MarketType::Perp,
+                            self.market_state
+                                .load()
+                                .perp_oracle_prices
+                                .get(&pos.market_index)
+                                .unwrap()
+                                .price as u64,
+                        );
                         dbg!(l3_book.bbo());
                         let maker_accounts: Vec<User> = if pos.base_asset_amount >= 0 {
                             l3_book
@@ -371,6 +394,9 @@ impl LiquidatorBot {
                                 .map(|m| users.get(&m.user).expect("maker account loaded").clone())
                                 .collect()
                         };
+                        if maker_accounts.is_empty() {
+                            continue;
+                        }
 
                         // TODO: check liquidation limit price
                         count += 1;
@@ -385,9 +411,10 @@ impl LiquidatorBot {
                             config.fill_cu_limit,
                             current_slot,
                         );
-
-                        // Update rate limit tracking
-                        rate_limit.insert(rate_limit_key, current_slot);
+                        tx_sent = true;
+                    }
+                    if tx_sent {
+                        rate_limit.insert(*liquidatee, current_slot);
                     }
                 }
             }
@@ -422,11 +449,7 @@ fn on_slot_update_fn(
 ) -> impl Fn(u64) + Send + Sync + 'static {
     let market_ids: Vec<MarketId> = market_ids.to_vec();
     move |new_slot| {
-        for market in &market_ids {
-            if let Some(oracle_price) = drift.try_get_oracle_price_data_and_slot(*market) {
-                dlob_notifier.slot_update(*market, oracle_price.data.price as u64, new_slot);
-            }
-        }
+        dlob_notifier.slot_update(new_slot);
     }
 }
 
@@ -454,7 +477,7 @@ async fn setup_grpc(
 
     let _res = drift
         .grpc_subscribe(
-            std::env::var("GRPC_URL")
+            std::env::var("GRPC_ENDPOINT")
                 .unwrap_or_else(|_| "https://api.rpcpool.com".to_string())
                 .into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
