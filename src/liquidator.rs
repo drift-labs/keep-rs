@@ -372,7 +372,16 @@ impl LiquidatorBot {
                         log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}, margin={:?}", pos.market_index, margin_info);
 
                         // TODO: cache top maker lookup
-                        let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
+                        let l3_book = dlob.get_l3_book(
+                            pos.market_index,
+                            MarketType::Perp,
+                            self.market_state
+                                .load()
+                                .perp_oracle_prices
+                                .get(&pos.market_index)
+                                .unwrap()
+                                .price as u64,
+                        );
                         dbg!(l3_book.bbo());
                         let maker_accounts: Vec<User> = if pos.base_asset_amount >= 0 {
                             l3_book
@@ -440,11 +449,7 @@ fn on_slot_update_fn(
 ) -> impl Fn(u64) + Send + Sync + 'static {
     let market_ids: Vec<MarketId> = market_ids.to_vec();
     move |new_slot| {
-        for market in &market_ids {
-            if let Some(oracle_price) = drift.try_get_oracle_price_data_and_slot(*market) {
-                dlob_notifier.slot_update(*market, oracle_price.data.price as u64, new_slot);
-            }
-        }
+        dlob_notifier.slot_update(new_slot);
     }
 }
 

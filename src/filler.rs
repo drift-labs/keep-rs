@@ -18,8 +18,8 @@ use drift_rs::{
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
         accounts::{User, UserStats},
-        CommitmentConfig, MarketId, MarketStatus, MarketType, Order, OrderType, PositionDirection,
-        PostOnlyParam, RpcSendTransactionConfig, VersionedMessage,
+        CommitmentConfig, MarketId, MarketPrecision, MarketStatus, MarketType, Order, OrderType,
+        PositionDirection, PostOnlyParam, RpcSendTransactionConfig, VersionedMessage,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, TransactionBuilder, Wallet,
 };
@@ -108,7 +108,7 @@ impl FillerBot {
             drift.subscribe_account(&filler_subaccount)
         )
         .expect("subscribed");
-        let slot_rx = setup_grpc(drift.clone(), dlob, &market_ids, tx_worker_ref.clone()).await;
+        let slot_rx = setup_grpc(drift.clone(), dlob, tx_worker_ref.clone()).await;
         log::info!(target: TARGET, "subscribed gRPC");
 
         // let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
@@ -158,37 +158,32 @@ impl FillerBot {
                 swift_order = swift_order_stream.next() => {
                     match swift_order {
                         Some(signed_order) => {
-                            let order_params = signed_order.order_params();
-                            log::debug!(target: TARGET, "new swift order: {signed_order:?}");
-                            let tick_size = drift.program_data().perp_market_config_by_index(order_params.market_index).unwrap().amm.order_tick_size;
-                            let oracle_price = drift.try_get_oracle_price_data_and_slot(MarketId::perp(order_params.market_index)).expect("got oracle price");
-                            log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
-
-                            let (auction_start_price, auction_end_price, auction_duration) = match order_params.get_auction_params(&oracle_price.data, tick_size, min_perp_auction_duration) {
-                                Some(params) => {
-                                    log::debug!(target: "swift", "updated auction params: {params:?}");
-                                    params
-                                },
-                                None => (order_params.auction_start_price.unwrap_or_default(), order_params.auction_end_price.unwrap_or_default(), order_params.auction_duration.unwrap_or_default())
-                            };
-                            let oracle_price = oracle_price.data.price;
-
-                            // TODO: should call: OrderParams::update_perp_auction_params to get the auction params first
-                            // especially for will_sanitize=true
+                            let mut order_params = signed_order.order_params();
+                            log::info!(target: TARGET, "new swift order. uuid={}, market={}", signed_order.order_uuid_str(), order_params.market_index);
+                            log::debug!(target: TARGET, "details: {signed_order:?}");
+                            let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
+                            let oracle_price_data = drift.try_get_mmoracle_for_perp_market(order_params.market_index, slot).expect("got oracle price");
+                            let oracle_price = oracle_price_data.price;
+                            // log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
+                            order_params.update_perp_auction_params(
+                                &perp_market,
+                                oracle_price,
+                                true,
+                            );
+                            let (start_price, end_price, duration) = (order_params.auction_start_price.unwrap_or_default(), order_params.auction_end_price.unwrap_or_default(), order_params.auction_duration.unwrap_or_default());
                             let order = Order {
-                                slot,
+                                slot: slot + 1,
                                 price: order_params.price,
                                 base_asset_amount: order_params.base_asset_amount,
                                 trigger_price: order_params.trigger_price.unwrap_or_default(),
-                                auction_duration,
-                                auction_start_price,
-                                auction_end_price,
+                                auction_duration: duration,
+                                auction_start_price: start_price,
+                                auction_end_price: end_price,
                                 max_ts: order_params.max_ts.unwrap_or_default(),
                                 oracle_price_offset: order_params.oracle_price_offset.unwrap_or_default(),
                                 market_index: order_params.market_index,
                                 order_type: order_params.order_type,
                                 market_type: order_params.market_type,
-                                user_order_id: order_params.user_order_id,
                                 direction: order_params.direction,
                                 reduce_only: order_params.reduce_only,
                                 post_only: order_params.post_only != PostOnlyParam::None,
@@ -198,55 +193,50 @@ impl FillerBot {
                                 ..Default::default()
                             };
 
-                            let lookahead = 1;
-                            let pf = priority_fee_subscriber.priority_fee_nth(0.6);
-                            let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                             let vamm_price = if order_params.direction == PositionDirection::Long {
                                 perp_market.ask_price(None)
                             } else {
                                 perp_market.bid_price(None)
                             };
 
-                            for offset in 0..=lookahead {
-                                let price = match order_params.order_type {
-                                    OrderType::Market | OrderType::Oracle => {
-                                        match calculate_auction_price(&order, slot + offset, tick_size, Some(oracle_price), false) {
-                                            Ok(p) => p,
-                                            Err(err) => {
-                                                log::warn!(target: "dlob", "could not get auction price {err:?}, params: {order_params:?}, skipping...");
-                                                continue;
-                                            }
+                            let price = match order_params.order_type {
+                                OrderType::Market | OrderType::Oracle => {
+                                    match calculate_auction_price(&order, slot + 1, perp_market.price_tick(), Some(oracle_price), false) {
+                                        Ok(p) => p,
+                                        Err(err) => {
+                                            log::warn!(target: TARGET, "could not get auction price {err:?}, params: {order_params:?}, skipping...");
+                                            continue;
                                         }
                                     }
-                                    OrderType::Limit => {
-                                        match order.get_limit_price(Some(oracle_price), Some(oracle_price as u64), slot + offset, tick_size, false, None) {
-                                            Ok(Some(p)) => p,
-                                            _ => {
-                                                log::warn!(target: "dlob", "could not get limit price: {order_params:?}, skipping...");
-                                                continue;
-                                            },
-                                        }
-                                    }
-                                    _ => {
-                                        log::warn!("invalid swift order type");
-                                        unreachable!();
-                                    }
-                                };
-                                let taker_order = TakerOrder::from_order_params(order_params, price);
-                                let crosses = dlob.find_crosses_for_taker_order(slot + offset, oracle_price as u64, taker_order, Some(vamm_price as u64));
-                                if !crosses.is_empty() {
-                                    log::info!(target: TARGET, "found resting cross|offset={offset}|crosses={crosses:?}");
-                                    try_swift_fill(
-                                        drift,
-                                        pf,
-                                        config.swift_cu_limit,
-                                        filler_subaccount,
-                                        signed_order,
-                                        crosses,
-                                        tx_worker_ref.clone(),
-                                    ).await;
-                                    break;
                                 }
+                                OrderType::Limit => {
+                                    match order.get_limit_price(Some(oracle_price), Some(vamm_price), slot + 1, perp_market.price_tick(), false, None) {
+                                        Ok(Some(p)) => p,
+                                        _ => {
+                                            log::warn!(target: TARGET, "could not get limit price: {order_params:?}, skipping...");
+                                            continue;
+                                        },
+                                    }
+                                }
+                                _ => {
+                                    log::warn!("invalid swift order type");
+                                    unreachable!();
+                                }
+                            };
+                            let taker_order = TakerOrder::from_order_params(order_params, price);
+                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(vamm_price as u64));
+                            if !crosses.is_empty() {
+                                log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
+                                let pf = priority_fee_subscriber.priority_fee_nth(0.6);
+                                try_swift_fill(
+                                    drift,
+                                    pf,
+                                    config.swift_cu_limit,
+                                    filler_subaccount,
+                                    signed_order,
+                                    crosses,
+                                    tx_worker_ref.clone(),
+                                ).await;
                             }
                         }
                         None => {
@@ -298,7 +288,7 @@ impl FillerBot {
                         }
 
                         // check state config ~every minute
-                        if slot % 150 == 0 {
+                        if slot % 300 == 0 {
                             use_median_trigger_price = drift
                             .state_account()
                             .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
@@ -329,17 +319,10 @@ fn on_transaction_update_fn(
 
 fn on_slot_update_fn(
     dlob_notifier: DLOBNotifier,
-    drift: DriftClient,
     slot_tx: tokio::sync::mpsc::Sender<u64>,
-    market_ids: &[MarketId],
 ) -> impl Fn(u64) + Send + Sync + 'static {
-    let market_ids: Vec<MarketId> = market_ids.to_vec();
     move |new_slot| {
-        for market in &market_ids {
-            if let Some(oracle_price) = drift.try_get_oracle_price_data_and_slot(*market) {
-                dlob_notifier.slot_update(*market, oracle_price.data.price as u64, new_slot);
-            }
-        }
+        dlob_notifier.slot_update(new_slot);
         slot_tx.try_send(new_slot).expect("sent");
     }
 }
@@ -355,7 +338,7 @@ fn on_account_update_fn(
             .account_map()
             .account_data_and_slot::<User>(&update.pubkey)
         {
-            if existing.slot > update.slot {
+            if existing.slot <= update.slot {
                 dlob_notifier.user_update(
                     update.pubkey,
                     Some(&existing.data),
@@ -364,7 +347,7 @@ fn on_account_update_fn(
                 );
             } else {
                 log::warn!(
-                    "out of order user update: {} < {}",
+                    "out of order user update: {} > {}",
                     existing.slot,
                     update.slot
                 );
@@ -726,7 +709,6 @@ fn try_uncross(
 pub async fn setup_grpc(
     drift: DriftClient,
     dlob: &'static DLOB,
-    market_ids: &[MarketId],
     tx_worker_ref: TxSender,
 ) -> tokio::sync::mpsc::Receiver<u64> {
     let dlob_notifier = dlob.spawn_notifier();
@@ -738,7 +720,7 @@ pub async fn setup_grpc(
 
     let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
 
-    subscribe_grpc(drift, dlob_notifier, slot_tx, tx_worker_ref, market_ids).await;
+    subscribe_grpc(drift, dlob_notifier, slot_tx, tx_worker_ref).await;
 
     slot_rx
 }
@@ -829,7 +811,6 @@ async fn subscribe_grpc(
     dlob_notifier: DLOBNotifier,
     slot_tx: tokio::sync::mpsc::Sender<u64>,
     transaction_tx: TxSender,
-    market_ids: &[MarketId],
 ) {
     let _res = drift
         .grpc_subscribe(
@@ -842,12 +823,7 @@ async fn subscribe_grpc(
                 .usermap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
-                .on_slot(on_slot_update_fn(
-                    dlob_notifier.clone(),
-                    drift.clone(),
-                    slot_tx.clone(),
-                    market_ids,
-                ))
+                .on_slot(on_slot_update_fn(dlob_notifier.clone(), slot_tx.clone()))
                 .on_account(
                     AccountFilter::partial().with_discriminator(User::DISCRIMINATOR),
                     on_account_update_fn(dlob_notifier.clone(), drift.clone()),
