@@ -476,10 +476,9 @@ async fn try_auction_fill(
             .expect("taker account");
 
         let taker_stats = drift
-            .get_account_value::<UserStats>(&Wallet::derive_stats_account(
+            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
                 &taker_account_data.authority,
             ))
-            .await
             .expect("taker stats");
 
         let mut tx_builder = TransactionBuilder::new(
@@ -821,6 +820,7 @@ async fn subscribe_grpc(
             GrpcSubscribeOpts::default()
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
                 .usermap_on()
+                .statsmap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
                 .on_slot(on_slot_update_fn(dlob_notifier.clone(), slot_tx.clone()))
