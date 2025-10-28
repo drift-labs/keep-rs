@@ -1,11 +1,34 @@
-## Run Filler
+# Rust Keeper Bots
+Example rust keeper bots
+
+## Configuration
+
+Copy `.env.example` to `.env` and substitute valid RPC credentials:
+
+Required environment variables:
+- `BOT_PRIVATE_KEY` - Base58 encoded private key
+- `RPC_URL` - Solana RPC endpoint
+- `GRPC_ENDPOINT` - Drift gRPC endpoint
+- `GRPC_X_TOKEN` - Authentication token for gRPC
+~- `PYTH_LAZER_TOKEN` - Pyth price feed access token~
+
+## Run Perp Filler
+The perp filler matches swift orders and onchain auction orders against resting liquidity.
+It also attempts to uncross resting limit orders.
 
 ```shell
-BOT_PRIVATE_KEY="...." \
-GRPC_X_TOKEN="aabbccddeeff0011223344" \
-RPC_URL="https://api.rpcpool.com/...." \
 RUST_LOG=filler=info,dlob=info,swift=info \
-cargo run --release -- --mainnet
+    cargo run --release -- --mainnet --filler
+```
+
+- use `--dry` flag for simulate only
+
+## Run 'Perp With Fill' Liquidator
+perp liquidator tries to fill liquidatable positions against resting limit orders.
+
+```shell
+RUST_LOG=liquidator=info,dlob=info,swift=info \
+    cargo run --release -- --mainnet --liquidator
 ```
 
 ## Event Flow Diagram
@@ -142,18 +165,8 @@ flowchart TD
     class A1,A2,A3,A4,B1,B2,B3,B4,C1,C2,C3,C4,C5 process
 ```
 
-## TODO:
-- [ ] use internal endpoint for swift order stream
-- [ ] improve success rate on VAMM fills
-    - [ ] fill as taker when crosses limit orders (too many failed fills for small size, need fix preflight price checks)
-    - [ ] VAMM order size consider during fill
-- [ ] swift tx retry on error
-ger orders
-- [ ] check PMM orders (MT filler)
-- [ ] add swift orders to auctions immediately? (MT filler)
-
 ## Tx Summary
 print some recent tx stats
 ```bash
- RUST_LOG=info cargo run --release --bin=tx_history F1RsRqBjuLdGeKtQK2LEjVJHJqVbhBYtfUzaUCi8PcFv --rpc-url <RPC_URL>
+ RUST_LOG=info cargo run --release --bin=tx_history <PUBKEY> --rpc-url <RPC_URL>
  ```

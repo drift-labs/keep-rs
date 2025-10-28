@@ -161,22 +161,17 @@ impl LiquidatorBot {
         let keeper_subaccount = self.keeper_subaccount;
         let config = self.config.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
+        let dlob_notifier = self.dlob_notifier;
         let mut current_slot = 0;
-        let mut use_median_trigger_price = drift
-            .state_account()
-            .map(|s| s.has_median_trigger_price_feature())
-            .unwrap_or(false);
-
         let mut margin_records = MarginRecords::default();
         let mut users = BTreeMap::<Pubkey, User>::new();
-        let dlob_notifier = self.dlob_notifier;
         let mut rate_limit = self.rate_limit;
         let liquidation_margin_buffer_ratio = drift
             .state_account()
             .map(|x| x.liquidation_margin_buffer_ratio)
             .expect("State has liquidation_margin_buffer_ratio");
 
-        // initialize local user storage
+        // initialize local User storage
         let mut exclude_count = 0;
         drift
             .backend()
@@ -389,10 +384,15 @@ impl LiquidatorBot {
                                 .collect()
                         };
                         if maker_accounts.is_empty() {
+                            log::info!(
+                                target: TARGET,
+                                "no makers found. market={}",
+                                pos.market_index,
+                            );
                             continue;
                         }
 
-                        // TODO: check liquidation limit price
+                        // TODO: check liquidator limit price cross i.e oracle_price +/- liquidation_fee
                         count += 1;
                         try_liquidate_with_match(
                             &drift,

@@ -111,6 +111,7 @@ impl FillerBot {
         let slot_rx = setup_grpc(drift.clone(), dlob, tx_worker_ref.clone()).await;
         log::info!(target: TARGET, "subscribed gRPC");
 
+        // pyth disabled for now
         // let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
         // let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
         //     "wss://pyth-lazer.dourolabs.app/v1/stream",
@@ -158,13 +159,14 @@ impl FillerBot {
                 swift_order = swift_order_stream.next() => {
                     match swift_order {
                         Some(signed_order) => {
+                            // try swift fill against resting liquidity
                             let mut order_params = signed_order.order_params();
                             log::info!(target: TARGET, "new swift order. uuid={}, market={}", signed_order.order_uuid_str(), order_params.market_index);
                             log::debug!(target: TARGET, "details: {signed_order:?}");
                             let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                             let oracle_price_data = drift.try_get_mmoracle_for_perp_market(order_params.market_index, slot).expect("got oracle price");
                             let oracle_price = oracle_price_data.price;
-                            // log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
+                            log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
                             order_params.update_perp_auction_params(
                                 &perp_market,
                                 oracle_price,
@@ -252,6 +254,7 @@ impl FillerBot {
                     let t0 = std::time::SystemTime::now();
                     let unix_now = t0.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
 
+                    // check for auction and limit crosses in all markets
                     for market in &market_ids {
                         let market_index = market.index();
 
@@ -296,7 +299,7 @@ impl FillerBot {
                         }
                     }
                     let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
-                    log::debug!(target: TARGET, "⏱️ checked fills at {slot}: {:?}ms", duration);
+                    log::trace!(target: TARGET, "⏱️ checked fills at {slot}: {:?}ms", duration);
                 }
             }
         }
