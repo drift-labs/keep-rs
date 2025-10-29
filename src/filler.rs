@@ -166,7 +166,7 @@ impl FillerBot {
                             let perp_market = drift.try_get_perp_market_account(order_params.market_index).unwrap();
                             let oracle_price_data = drift.try_get_mmoracle_for_perp_market(order_params.market_index, slot).expect("got oracle price");
                             let oracle_price = oracle_price_data.price;
-                            log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", oracle_price.slot, order_params.market_index, oracle_price.data.price);
+                            log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", slot, order_params.market_index, oracle_price);
                             order_params.update_perp_auction_params(
                                 &perp_market,
                                 oracle_price,

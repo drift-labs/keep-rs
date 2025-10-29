@@ -6,14 +6,16 @@ use std::{
 };
 
 use anchor_lang::prelude::*;
+use drift_rs::jupiter::JupiterSwapApi;
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
     ffi::{IncrementalMarginCalculation, OraclePriceData, SimplifiedMarginCalculation},
     grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
+    jupiter::SwapMode,
     priority_fee_subscriber::PriorityFeeSubscriber,
     types::{
         accounts::{PerpMarket, SpotMarket, User},
-        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource,
+        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, SpotBalanceType,
     },
     DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
 };
@@ -352,6 +354,7 @@ impl LiquidatorBot {
 
                 let mut tx_sent = false;
                 if let Some(user_account) = users.get(&liquidatee) {
+                    // Perp Liquidation
                     for pos in user_account
                         .perp_positions
                         .iter()
@@ -406,6 +409,156 @@ impl LiquidatorBot {
                             current_slot,
                         );
                         tx_sent = true;
+                    }
+
+                    // Spot Liquidation
+                    for pos in user_account.spot_positions.iter().filter(|p| {
+                        matches!(p.balance_type, SpotBalanceType::Borrow) && !p.is_available()
+                    }) {
+                        let market_state = self.market_state.load();
+                        let spot_market = market_state.spot_markets.get(&pos.market_index);
+
+                        if let Some(market) = spot_market {
+                            let token_amount =
+                                pos.get_token_amount(market).expect("valid token amount") as u64;
+
+                            // Filter dust positions
+                            if token_amount < market.min_order_size * 2 {
+                                log::trace!(
+                                    target: TARGET,
+                                    "skip dust spot position. market={}, amount={}",
+                                    pos.market_index,
+                                    token_amount
+                                );
+                                continue;
+                            }
+
+                            // Find their largest deposit to use as collateral
+                            let asset_market_index = user_account
+                                .spot_positions
+                                .iter()
+                                .filter(|p| {
+                                    matches!(p.balance_type, SpotBalanceType::Deposit)
+                                        && !p.is_available()
+                                })
+                                .max_by_key(|p| p.scaled_balance)
+                                .map(|p| p.market_index);
+
+                            if asset_market_index.is_none() {
+                                log::warn!(
+                                    target: TARGET,
+                                    "no asset found for user {:?}, skipping spot liquidation",
+                                    liquidatee
+                                );
+                                continue;
+                            }
+
+                            let asset_market_index = asset_market_index.unwrap();
+
+                            log::info!(
+                                target: TARGET,
+                                "attempting spot liquidation: user={:?}, asset_market={}, liability_market={}, amount={}",
+                                liquidatee,
+                                asset_market_index,
+                                pos.market_index,
+                                token_amount
+                            );
+
+                            let keeper_account_data = drift
+                                .try_get_account::<User>(&keeper_subaccount)
+                                .expect("keeper account");
+                            let liquidatee_subaccount_data = drift
+                                .try_get_account::<User>(&liquidatee)
+                                .expect("liquidatee account");
+
+                            let jupiter_swap_info = match drift
+                                .jupiter_swap_query(
+                                    &drift.wallet.authority(),
+                                    token_amount,
+                                    SwapMode::ExactIn,
+                                    asset_market_index,
+                                    pos.market_index,
+                                    100,
+                                    Some(true),
+                                    None,
+                                    None,
+                                )
+                                .await
+                            {
+                                Ok(info) => info,
+                                Err(e) => {
+                                    log::warn!(
+                                        target: TARGET,
+                                        "failed to get jupiter quote for user {:?}, market {}: {:?}",
+                                        liquidatee,
+                                        pos.market_index,
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let asset_spot_market = drift
+                                .try_get_spot_market_account(asset_market_index)
+                                .expect("asset spot market");
+                            let liability_spot_market = drift
+                                .try_get_spot_market_account(pos.market_index)
+                                .expect("liability spot market");
+
+                            let in_token_account =
+                                drift_rs::Wallet::derive_associated_token_address(
+                                    &drift.wallet.authority(),
+                                    &asset_spot_market,
+                                );
+                            let out_token_account =
+                                drift_rs::Wallet::derive_associated_token_address(
+                                    &drift.wallet.authority(),
+                                    &liability_spot_market,
+                                );
+
+                            let tx = TransactionBuilder::new(
+                                drift.program_data(),
+                                keeper_subaccount,
+                                std::borrow::Cow::Borrowed(&keeper_account_data),
+                                false,
+                            )
+                            .with_priority_fee(pf, Some(config.fill_cu_limit))
+                            .liquidate_spot_with_swap_begin(
+                                asset_market_index,
+                                pos.market_index,
+                                token_amount,
+                                &liquidatee_subaccount_data,
+                            )
+                            .jupiter_swap(
+                                jupiter_swap_info,
+                                &asset_spot_market,
+                                &liability_spot_market,
+                                &in_token_account,
+                                &out_token_account,
+                                None,
+                                None,
+                            )
+                            .liquidate_spot_with_swap_end(
+                                asset_market_index,
+                                pos.market_index,
+                                &liquidatee_subaccount_data,
+                            )
+                            .build();
+
+                            self.tx_worker_ref.send_tx(
+                                tx,
+                                TxIntent::LiquidateSpot {
+                                    asset_market_index,
+                                    liability_market_index: pos.market_index,
+                                    liquidatee: *liquidatee,
+                                    slot: current_slot,
+                                },
+                                config.fill_cu_limit as u64,
+                            );
+
+                            tx_sent = true;
+                            count += 1;
+                        }
                     }
                     if tx_sent {
                         rate_limit.insert(*liquidatee, current_slot);
