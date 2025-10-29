@@ -372,25 +372,22 @@ impl LiquidatorBot {
                         log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}, margin={:?}", pos.market_index, margin_info);
 
                         // TODO: cache top maker lookup
-                        let l3_book = dlob.get_l3_book(
-                            pos.market_index,
-                            MarketType::Perp,
-                            self.market_state
-                                .load()
-                                .perp_oracle_prices
-                                .get(&pos.market_index)
-                                .unwrap()
-                                .price as u64,
-                        );
-                        dbg!(l3_book.bbo());
+                        let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
+                        let oracle_price = self
+                            .market_state
+                            .load()
+                            .perp_oracle_prices
+                            .get(&pos.market_index)
+                            .unwrap()
+                            .price as u64;
                         let maker_accounts: Vec<User> = if pos.base_asset_amount >= 0 {
                             l3_book
-                                .top_asks(3)
+                                .top_asks(3, oracle_price)
                                 .map(|m| users.get(&m.user).expect("maker account loaded").clone())
                                 .collect()
                         } else {
                             l3_book
-                                .top_bids(3)
+                                .top_bids(3, oracle_price)
                                 .map(|m| users.get(&m.user).expect("maker account loaded").clone())
                                 .collect()
                         };
@@ -449,7 +446,12 @@ fn on_slot_update_fn(
 ) -> impl Fn(u64) + Send + Sync + 'static {
     let market_ids: Vec<MarketId> = market_ids.to_vec();
     move |new_slot| {
-        dlob_notifier.slot_update(new_slot);
+        for market in market_ids.iter() {
+            let oracle_price_data = drift
+                .try_get_mmoracle_for_perp_market(market.index(), new_slot)
+                .unwrap();
+            dlob_notifier.slot_and_oracle_update(*market, new_slot, oracle_price_data.price as u64);
+        }
     }
 }
 
