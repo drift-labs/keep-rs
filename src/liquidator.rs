@@ -112,8 +112,13 @@ impl LiquidatorBot {
         )
         .expect("subscribed");
         let dlob_notifier = dlob.spawn_notifier();
-        let events_rx =
-            setup_grpc(drift.clone(), dlob_notifier.clone(), tx_worker_ref.clone()).await;
+        let events_rx = setup_grpc(
+            drift.clone(),
+            dlob_notifier.clone(),
+            tx_worker_ref.clone(),
+            market_ids.clone(),
+        )
+        .await;
         log::info!(target: TARGET, "subscribed gRPC");
 
         // populate market data
@@ -226,7 +231,6 @@ impl LiquidatorBot {
                     } else {
                         margin_records.set_margin(&pubkey, &margin_info, update_slot);
                     }
-                    continue;
                 }
                 Some(GrpcEvent::OracleUpdate {
                     oracle_price_data,
@@ -369,17 +373,22 @@ impl LiquidatorBot {
                             .price as u64;
 
                         // TODO: cache top maker lookup
-                        let l3_book =
-                            dlob.get_l3_book(pos.market_index, MarketType::Perp, oracle_price);
-                        dbg!(l3_book.bbo());
+                        let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
+                        let oracle_price = self
+                            .market_state
+                            .load()
+                            .perp_oracle_prices
+                            .get(&pos.market_index)
+                            .unwrap()
+                            .price as u64;
                         let maker_accounts: Vec<User> = if pos.base_asset_amount >= 0 {
                             l3_book
-                                .top_asks(3)
+                                .top_asks(3, oracle_price)
                                 .map(|m| users.get(&m.user).expect("maker account loaded").clone())
                                 .collect()
                         } else {
                             l3_book
-                                .top_bids(3)
+                                .top_bids(3, oracle_price)
                                 .map(|m| users.get(&m.user).expect("maker account loaded").clone())
                                 .collect()
                         };
@@ -436,10 +445,27 @@ fn on_transaction_update_fn(
     }
 }
 
+fn on_slot_update_fn(
+    dlob_notifier: DLOBNotifier,
+    drift: DriftClient,
+    market_ids: &[MarketId],
+) -> impl Fn(u64) + Send + Sync + 'static {
+    let market_ids: Vec<MarketId> = market_ids.to_vec();
+    move |new_slot| {
+        for market in market_ids.iter() {
+            let oracle_price_data = drift
+                .try_get_mmoracle_for_perp_market(market.index(), new_slot)
+                .unwrap();
+            dlob_notifier.slot_and_oracle_update(*market, new_slot, oracle_price_data.price as u64);
+        }
+    }
+}
+
 async fn setup_grpc(
     drift: DriftClient,
     dlob_notifier: DLOBNotifier,
     transaction_tx: TxSender,
+    market_ids: Vec<MarketId>,
 ) -> tokio::sync::mpsc::Receiver<GrpcEvent> {
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
 
@@ -467,9 +493,11 @@ async fn setup_grpc(
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
-                .on_slot(move |new_slot| {
-                    dlob_notifier.slot_update(new_slot);
-                })
+                .on_slot(on_slot_update_fn(
+                    dlob_notifier,
+                    drift.clone(),
+                    market_ids.as_ref(),
+                ))
                 .on_account(
                     AccountFilter::partial().with_discriminator(User::DISCRIMINATOR),
                     {
