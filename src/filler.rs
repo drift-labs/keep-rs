@@ -108,7 +108,13 @@ impl FillerBot {
             drift.subscribe_account(&filler_subaccount)
         )
         .expect("subscribed");
-        let slot_rx = setup_grpc(drift.clone(), dlob, tx_worker_ref.clone()).await;
+        let slot_rx = setup_grpc(
+            drift.clone(),
+            dlob,
+            tx_worker_ref.clone(),
+            market_ids.clone(),
+        )
+        .await;
         log::info!(target: TARGET, "subscribed gRPC");
 
         // pyth disabled for now
@@ -147,10 +153,9 @@ impl FillerBot {
         let tx_worker_ref = self.tx_worker_ref.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
         let mut slot = 0;
-        let min_perp_auction_duration = drift.state_account().unwrap().min_perp_auction_duration;
         let mut use_median_trigger_price = drift
             .state_account()
-            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
+            .map(|s| s.has_median_trigger_price_feature())
             .unwrap_or(false);
 
         loop {
@@ -321,11 +326,18 @@ fn on_transaction_update_fn(
 }
 
 fn on_slot_update_fn(
+    drift: DriftClient,
+    market_ids: Vec<MarketId>,
     dlob_notifier: DLOBNotifier,
     slot_tx: tokio::sync::mpsc::Sender<u64>,
 ) -> impl Fn(u64) + Send + Sync + 'static {
     move |new_slot| {
-        dlob_notifier.slot_update(new_slot);
+        for market in market_ids.iter() {
+            let oracle_price_data = drift
+                .try_get_mmoracle_for_perp_market(market.index(), new_slot)
+                .unwrap();
+            dlob_notifier.slot_and_oracle_update(*market, new_slot, oracle_price_data.price as u64);
+        }
         slot_tx.try_send(new_slot).expect("sent");
     }
 }
@@ -409,7 +421,7 @@ async fn try_swift_fill(
     }
 
     // let taker_order_id = taker_account_data.next_order_id;
-    let tx = tx_builder
+    let mut tx_builder = tx_builder
         .with_priority_fee(priority_fee, Some(cu_limit))
         .place_swift_order(&swift_order, &taker_account_data)
         .fill_perp_order(
@@ -420,8 +432,18 @@ async fn try_swift_fill(
             None, // Some(taker_order_id), // assuming we're fast enough that its the taker_order_id, should be ok for retail
             maker_accounts.as_slice(),
             Some(swift_order.has_builder()),
-        )
-        .build();
+        );
+
+    // large accounts list, bump CU limit to compensate
+    if let Some(ix) = tx_builder.ixs().last() {
+        if ix.accounts.len() >= 30 {
+            tx_builder = tx_builder.set_ix(
+                1,
+                ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
+            );
+        }
+    }
+    let tx = tx_builder.build();
 
     tx_worker_ref.send_tx(
         tx,
@@ -478,11 +500,14 @@ async fn try_auction_fill(
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");
 
-        let taker_stats = drift
-            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
-                &taker_account_data.authority,
-            ))
-            .expect("taker stats");
+        let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
+            &taker_account_data.authority,
+        ));
+
+        if taker_stats.is_err() {
+            log::warn!(target: TARGET, "failed to fetch taker stats: {:?}", taker_account_data.authority);
+            continue;
+        }
 
         let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
@@ -552,7 +577,7 @@ async fn try_auction_fill(
             market_index,
             taker_subaccount,
             &taker_account_data,
-            &taker_stats,
+            &taker_stats.unwrap(),
             Some(taker_order_metadata.order_id),
             maker_accounts.as_slice(),
             None,
@@ -657,11 +682,13 @@ fn try_uncross(
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");
 
-        let taker_stats = drift
-            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
-                &taker_account_data.authority,
-            ))
-            .expect("taker stats");
+        let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
+            &taker_account_data.authority,
+        ));
+        if taker_stats.is_err() {
+            log::warn!(target: TARGET, "failed to fetch taker stats: {:?}", taker_account_data.authority);
+            continue;
+        }
 
         let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
@@ -675,7 +702,7 @@ fn try_uncross(
                 market_index,
                 taker_subaccount,
                 &taker_account_data,
-                &taker_stats,
+                &taker_stats.unwrap(),
                 Some(taker_order_id),
                 makers.as_slice(),
                 None,
@@ -712,6 +739,7 @@ pub async fn setup_grpc(
     drift: DriftClient,
     dlob: &'static DLOB,
     tx_worker_ref: TxSender,
+    market_ids: Vec<MarketId>,
 ) -> tokio::sync::mpsc::Receiver<u64> {
     let dlob_notifier = dlob.spawn_notifier();
 
@@ -722,7 +750,7 @@ pub async fn setup_grpc(
 
     let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
 
-    subscribe_grpc(drift, dlob_notifier, slot_tx, tx_worker_ref).await;
+    subscribe_grpc(drift, dlob_notifier, slot_tx, tx_worker_ref, market_ids).await;
 
     slot_rx
 }
@@ -813,6 +841,7 @@ async fn subscribe_grpc(
     dlob_notifier: DLOBNotifier,
     slot_tx: tokio::sync::mpsc::Sender<u64>,
     transaction_tx: TxSender,
+    market_ids: Vec<MarketId>,
 ) {
     let _res = drift
         .grpc_subscribe(
@@ -826,7 +855,12 @@ async fn subscribe_grpc(
                 .statsmap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
-                .on_slot(on_slot_update_fn(dlob_notifier.clone(), slot_tx.clone()))
+                .on_slot(on_slot_update_fn(
+                    drift.clone(),
+                    market_ids,
+                    dlob_notifier.clone(),
+                    slot_tx.clone(),
+                ))
                 .on_account(
                     AccountFilter::partial().with_discriminator(User::DISCRIMINATOR),
                     on_account_update_fn(dlob_notifier.clone(), drift.clone()),
