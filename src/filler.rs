@@ -155,7 +155,7 @@ impl FillerBot {
         let mut slot = 0;
         let mut use_median_trigger_price = drift
             .state_account()
-            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
+            .map(|s| s.has_median_trigger_price_feature())
             .unwrap_or(false);
 
         loop {
@@ -421,7 +421,7 @@ async fn try_swift_fill(
     }
 
     // let taker_order_id = taker_account_data.next_order_id;
-    let tx = tx_builder
+    let mut tx_builder = tx_builder
         .with_priority_fee(priority_fee, Some(cu_limit))
         .place_swift_order(&swift_order, &taker_account_data)
         .fill_perp_order(
@@ -432,8 +432,18 @@ async fn try_swift_fill(
             None, // Some(taker_order_id), // assuming we're fast enough that its the taker_order_id, should be ok for retail
             maker_accounts.as_slice(),
             Some(swift_order.has_builder()),
-        )
-        .build();
+        );
+
+    // large accounts list, bump CU limit to compensate
+    if let Some(ix) = tx_builder.ixs().last() {
+        if ix.accounts.len() >= 30 {
+            tx_builder = tx_builder.set_ix(
+                1,
+                ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
+            );
+        }
+    }
+    let tx = tx_builder.build();
 
     tx_worker_ref.send_tx(
         tx,

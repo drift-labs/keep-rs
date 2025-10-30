@@ -109,11 +109,11 @@ async fn main() {
     .expect("loaded BOT_PRIVATE_KEY")
     .into();
 
-    let filler_subaccount = wallet.default_sub_account();
+    let keeper_subaccount = wallet.default_sub_account();
     log::info!(
         "bot started: authority={:?}, subaccount={:?}",
         wallet.authority(),
-        filler_subaccount
+        keeper_subaccount
     );
     log::info!("mainnet={}, markets={}", config.mainnet, config.all_markets);
 
