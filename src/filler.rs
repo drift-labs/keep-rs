@@ -487,12 +487,14 @@ async fn try_auction_fill(
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");
 
-        let taker_stats = drift
-            .get_account_value::<UserStats>(&Wallet::derive_stats_account(
-                &taker_account_data.authority,
-            ))
-            .await
-            .expect("taker stats");
+        let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
+            &taker_account_data.authority,
+        ));
+
+        if taker_stats.is_err() {
+            log::warn!(target: TARGET, "failed to fetch taker stats: {:?}", taker_account_data.authority);
+            continue;
+        }
 
         let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
@@ -562,7 +564,7 @@ async fn try_auction_fill(
             market_index,
             taker_subaccount,
             &taker_account_data,
-            &taker_stats,
+            &taker_stats.unwrap(),
             Some(taker_order_metadata.order_id),
             maker_accounts.as_slice(),
             None,
@@ -667,11 +669,13 @@ fn try_uncross(
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");
 
-        let taker_stats = drift
-            .try_get_account::<UserStats>(&Wallet::derive_stats_account(
-                &taker_account_data.authority,
-            ))
-            .expect("taker stats");
+        let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
+            &taker_account_data.authority,
+        ));
+        if taker_stats.is_err() {
+            log::warn!(target: TARGET, "failed to fetch taker stats: {:?}", taker_account_data.authority);
+            continue;
+        }
 
         let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
@@ -685,7 +689,7 @@ fn try_uncross(
                 market_index,
                 taker_subaccount,
                 &taker_account_data,
-                &taker_stats,
+                &taker_stats.unwrap(),
                 Some(taker_order_id),
                 makers.as_slice(),
                 None,
