@@ -33,6 +33,9 @@ use crate::{
     Config, UseMarkets,
 };
 
+/// min slots between successive liquidation attempts on same user
+const LIQUIDATION_SLOT_RATE_LIMIT: u64 = 5;
+
 const TARGET: &str = "liquidator";
 
 /// Trait for pluggable liquidation strategies
@@ -607,7 +610,7 @@ fn spawn_liquidation_worker(
         while let Ok((liquidatee, user_account, slot)) = liq_rx.recv() {
             if rate_limit
                 .get(&liquidatee)
-                .is_some_and(|last| slot.saturating_sub(*last) < 10)
+                .is_some_and(|last| slot.saturating_sub(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
             {
                 log::trace!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
                 continue;
@@ -640,10 +643,11 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         cu_limit: u32,
         slot: u64,
     ) {
-        for pos in user_account
+        if let Some(pos) = user_account
             .perp_positions
             .iter()
             .filter(|p| p.base_asset_amount != 0)
+            .max_by_key(|p| p.quote_asset_amount)
         {
             log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}", pos.market_index);
 
@@ -657,14 +661,24 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                 .unwrap_or(0) as u64;
 
             let maker_pubkeys: Vec<Pubkey> = if pos.base_asset_amount >= 0 {
-                l3_book.top_asks(3, oracle_price).map(|m| m.user).collect()
+                l3_book
+                    .asks(oracle_price)
+                    .filter(|o| o.is_maker())
+                    .map(|m| m.user)
+                    .take(3)
+                    .collect()
             } else {
-                l3_book.top_bids(3, oracle_price).map(|m| m.user).collect()
+                l3_book
+                    .bids(oracle_price)
+                    .filter(|o| o.is_maker())
+                    .map(|m| m.user)
+                    .take(3)
+                    .collect()
             };
 
             if maker_pubkeys.is_empty() {
-                log::info!(target: TARGET, "no makers found. market={}", pos.market_index);
-                continue;
+                log::warn!(target: TARGET, "no makers found. market={}", pos.market_index);
+                return;
             }
 
             let makers: Vec<User> = maker_pubkeys
@@ -673,7 +687,8 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                 .collect();
 
             if makers.is_empty() {
-                continue;
+                log::warn!(target: TARGET, "no maker accounts. market={}", pos.market_index);
+                return;
             }
 
             try_liquidate_with_match(
