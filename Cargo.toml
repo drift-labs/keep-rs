@@ -1,0 +1,36 @@
+[package]
+name = "keeprs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust keeper bots for Drift protocol"
+license = "MIT"
+repository = "https://github.com/drift-labs/keep-rs"
+keywords = ["drift", "defi", "solana", "trading-bot", "liquidity"]
+categories = ["financial", "network-programming"]
+
+[dependencies]
+anchor-lang = "*"
+axum = "0.8"
+clap = { version = "4.5.40", "features" = ["env", "derive"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+dotenv = "0.15.0"
+drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "a4a85a0", features = ["unsafe_pub"] }
+env_logger = "0.11"
+# DLOB 'trace' logs are expensive so compile them out
+log = { version = "0.4", features = ["max_level_trace"] }
+futures-util = "0.3.31"
+mimalloc = "0.1.47"
+prometheus = "*"
+pyth-lazer-client = "0.1.3"
+pyth-lazer-protocol = "0.7.3"
+solana-account-decoder-client-types = "2.3"
+solana-rpc-client = "2.3"
+solana-rpc-client-api = "2.3"
+solana-sdk = "2.3"
+solana-transaction-status = "2.3"
+solana-transaction-status-client-types = "2.3"
+tokio = "*"
+
+[[bin]]
+name = "tx_history"
+path = "src/tx_history.rs"
