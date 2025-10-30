@@ -103,11 +103,7 @@ impl FillerBot {
             .expect("subscribed swift orders");
         log::info!(target: TARGET, "subscribed swift orders");
 
-        tokio::try_join!(
-            drift.subscribe_blockhashes(),
-            drift.subscribe_account(&filler_subaccount)
-        )
-        .expect("subscribed");
+        drift.subscribe_blockhashes().await.expect("subscribed");
         let slot_rx = setup_grpc(
             drift.clone(),
             dlob,

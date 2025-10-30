@@ -45,6 +45,7 @@ pub trait LiquidationStrategy {
     /// Execute liquidation logic a user, including selecting makers and sending txs.
     fn liquidate_user(
         &self,
+        rt: &tokio::runtime::Runtime,
         liquidatee: &Pubkey,
         user_account: &User,
         tx_sender: &TxSender,
@@ -130,11 +131,7 @@ impl LiquidatorBot {
         let keeper_subaccount = drift.wallet.sub_account(config.sub_account_id);
         log::info!(target: TARGET, "liquidator 🫠 bot started: authority={:?}, subaccount={:?}", drift.wallet.authority(), keeper_subaccount);
 
-        tokio::try_join!(
-            drift.subscribe_blockhashes(),
-            drift.subscribe_account(&keeper_subaccount)
-        )
-        .expect("subscribed");
+        drift.subscribe_blockhashes().await.expect("subscribed");
         let dlob_notifier = dlob.spawn_notifier();
         let events_rx = setup_grpc(
             drift.clone(),
@@ -543,21 +540,6 @@ async fn setup_grpc(
     rx
 }
 
-fn block_on_maybe_new_rt<F, T>(fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(fut)
-    } else {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build Tokio runtime");
-        rt.block_on(fut)
-    }
-}
-
 /// Try to fill liquidation with order match
 fn try_liquidate_with_match(
     drift: &DriftClient,
@@ -623,6 +605,11 @@ fn spawn_liquidation_worker(
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
 ) {
     std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build Tokio runtime");
+
         let mut rate_limit: HashMap<Pubkey, u64> = HashMap::new();
         while let Ok((liquidatee, user_account, slot)) = liq_rx.recv() {
             if rate_limit
@@ -636,7 +623,15 @@ fn spawn_liquidation_worker(
             }
 
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
-            strategy.liquidate_user(&liquidatee, &user_account, &tx_sender, pf, cu_limit, slot);
+            strategy.liquidate_user(
+                &rt,
+                &liquidatee,
+                &user_account,
+                &tx_sender,
+                pf,
+                cu_limit,
+                slot,
+            );
         }
     });
 }
@@ -653,6 +648,7 @@ pub struct LiquidateWithMatchStrategy {
 impl LiquidationStrategy for LiquidateWithMatchStrategy {
     fn liquidate_user(
         &self,
+        rt: &tokio::runtime::Runtime,
         liquidatee: &Pubkey,
         user_account: &User,
         tx_sender: &TxSender,
@@ -803,7 +799,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     &liability_spot_market,
                 );
 
-                let jupiter_swap_info = match block_on_maybe_new_rt(self.drift.jupiter_swap_query(
+                let jupiter_swap_info = match rt.block_on(self.drift.jupiter_swap_query(
                     &authority,
                     token_amount,
                     SwapMode::ExactIn,
