@@ -7,7 +7,7 @@
 //! The default strategy tries to liquidate perp positions against resting orders
 //!
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -201,13 +201,40 @@ impl LiquidatorBot {
         let dlob_notifier = self.dlob_notifier;
         let mut current_slot = 0;
         let mut users = BTreeMap::<Pubkey, User>::new();
+        let mut high_risk = HashSet::<Pubkey>::new();
         let liquidation_margin_buffer_ratio = drift
             .state_account()
             .map(|x| x.liquidation_margin_buffer_ratio)
             .expect("State has liquidation_margin_buffer_ratio");
 
+        // Threshold for considering a user high-risk: free margin < 20% of margin requirement
+        const HIGH_RISK_FREE_MARGIN_RATIO: f64 = 0.2;
+        const RECHECK_CYCLE_INTERVAL: u32 = 64;
+
+        // Helper closure to check if a user is high-risk (close to liquidation)
+        let check_is_high_risk = |total_collateral: i128, margin_requirement: u128| -> bool {
+            if total_collateral < margin_requirement as i128 {
+                // Already liquidatable, definitely high-risk
+                return true;
+            }
+
+            // Calculate free margin
+            let free_margin = total_collateral - margin_requirement as i128;
+
+            // User is high-risk if free margin < 20% of margin requirement
+            if margin_requirement > 0 && free_margin > 0 {
+                let free_margin_ratio = free_margin as f64 / margin_requirement as f64;
+                free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO
+            } else {
+                false
+            }
+        };
+
+        let mut cycle_count = 0u32;
+
         // initialize local User storage
         let mut exclude_count = 0;
+        let mut initial_high_risk_count = 0;
         drift
             .backend()
             .account_map()
@@ -227,162 +254,238 @@ impl LiquidatorBot {
                     log::debug!(target: TARGET, "excluding user: {:?}. insignificant collateral: {}/{}", user.authority, margin_info.total_collateral, margin_info.margin_requirement);
                 } else {
                     users.insert(*pubkey, *user);
+                    // Check if user is high-risk and add to set
+                    if check_is_high_risk(margin_info.total_collateral, margin_info.margin_requirement) {
+                        high_risk.insert(*pubkey);
+                        initial_high_risk_count += 1;
+                    }
                 }
             });
 
         log::info!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
+        log::info!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
 
-        let mut oracle_update: Option<MarketId> = None;
+        let mut oracle_update = false;
 
         // main loop
+        let mut event_buffer = Vec::<GrpcEvent>::with_capacity(32);
         loop {
-            match events_rx.recv().await {
-                Some(GrpcEvent::UserUpdate {
-                    pubkey,
-                    user,
-                    slot: update_slot,
-                }) => {
-                    current_slot = current_slot.max(update_slot);
-                    dlob_notifier.user_update(pubkey, users.get(&pubkey), &user, update_slot);
-                    users.insert(pubkey, user);
-                    // calculate user margin after update
-                    let margin_info = self
-                        .market_state
-                        .calculate_simplified_margin_requirement(
-                            &user,
-                            MarginRequirementType::Maintenance,
-                            Some(liquidation_margin_buffer_ratio),
-                        )
-                        .unwrap();
-                    if margin_info.total_collateral < config.min_collateral as i128
-                        && margin_info.margin_requirement < config.min_collateral as u128
-                    {
-                        log::trace!(target: TARGET, "filtered account with dust collateral: {pubkey:?}");
-                        // no-op
-                    } else {
-                        let is_liq =
-                            margin_info.total_collateral < margin_info.margin_requirement as i128;
-                        if is_liq {
-                            let _ = self.liq_tx.send((pubkey, user.clone(), current_slot));
-                        }
-                    }
-                }
-                Some(GrpcEvent::OracleUpdate {
-                    oracle_price_data,
-                    market,
-                    slot,
-                }) => {
-                    current_slot = current_slot.max(slot);
-                    let is_perp_update = market.is_perp();
-                    if is_perp_update {
-                        self.market_state
-                            .set_perp_oracle_price(market.index(), oracle_price_data);
-                        oracle_update = Some(market);
-                    } else {
-                        self.market_state
-                            .set_spot_oracle_price(market.index(), oracle_price_data);
-                        oracle_update = Some(market);
-                    }
-                }
-                Some(GrpcEvent::PerpMarketUpdate { market, slot }) => {
-                    current_slot = current_slot.max(slot);
-                    if let Some(existing) = self
-                        .market_state
-                        .load()
-                        .perp_oracle_prices
-                        .get(&market.market_index)
-                    {
-                        if existing
-                            .sequence_id
-                            .is_some_and(|s| s < market.amm.mm_oracle_sequence_id)
-                            && market.amm.mm_oracle_price > 0
+            let n_read = events_rx.recv_many(&mut event_buffer, 32).await;
+            log::debug!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
+            for event in event_buffer.drain(..) {
+                match event {
+                    GrpcEvent::UserUpdate {
+                        pubkey,
+                        user,
+                        slot: update_slot,
+                    } => {
+                        current_slot = current_slot.max(update_slot);
+                        dlob_notifier.user_update(pubkey, users.get(&pubkey), &user, update_slot);
+                        users.insert(pubkey, user.clone());
+                        // calculate user margin after update
+                        let margin_info = self
+                            .market_state
+                            .calculate_simplified_margin_requirement(
+                                &user,
+                                MarginRequirementType::Maintenance,
+                                Some(liquidation_margin_buffer_ratio),
+                            )
+                            .unwrap();
+                        if margin_info.total_collateral < config.min_collateral as i128
+                            && margin_info.margin_requirement < config.min_collateral as u128
                         {
-                            self.market_state.set_perp_oracle_price(
-                                market.market_index,
-                                OraclePriceData {
-                                    price: market.amm.mm_oracle_price,
-                                    confidence: 1,
-                                    delay: 0,
-                                    has_sufficient_number_of_data_points: true,
-                                    sequence_id: Some(market.amm.mm_oracle_sequence_id),
-                                },
-                            );
-                            oracle_update = Some(MarketId::perp(market.market_index));
+                            log::trace!(target: TARGET, "filtered account with dust collateral: {pubkey:?}");
+                            // Remove from high_risk if present (user is now excluded)
+                            high_risk.remove(&pubkey);
+                        } else {
+                            let is_liq = margin_info.total_collateral
+                                < margin_info.margin_requirement as i128;
+                            if is_liq {
+                                // User is liquidatable, add to high_risk if not already there
+                                high_risk.insert(pubkey);
+                                self.liq_tx
+                                    .send((pubkey, user.clone(), current_slot))
+                                    .expect("liq sent");
+                            } else {
+                                // Update high_risk set based on current margin status
+                                let is_high_risk = check_is_high_risk(
+                                    margin_info.total_collateral,
+                                    margin_info.margin_requirement,
+                                );
+                                if is_high_risk {
+                                    high_risk.insert(pubkey);
+                                } else {
+                                    high_risk.remove(&pubkey);
+                                }
+                            }
                         }
                     }
-                }
-                Some(GrpcEvent::SpotMarketUpdate { market, slot }) => {
-                    current_slot = current_slot.max(slot);
-                    self.market_state.set_spot_market(market);
-                    continue;
-                }
-                None => {
-                    log::error!("grpc err");
-                    break;
+                    GrpcEvent::OracleUpdate {
+                        oracle_price_data,
+                        market,
+                        slot,
+                    } => {
+                        current_slot = current_slot.max(slot);
+                        let is_perp_update = market.is_perp();
+                        if is_perp_update {
+                            self.market_state
+                                .set_perp_oracle_price(market.index(), oracle_price_data);
+                            oracle_update = true;
+                        } else {
+                            self.market_state
+                                .set_spot_oracle_price(market.index(), oracle_price_data);
+                            oracle_update = true;
+                        }
+                    }
+                    GrpcEvent::PerpMarketUpdate { market, slot } => {
+                        current_slot = current_slot.max(slot);
+                        if let Some(existing) = self
+                            .market_state
+                            .load()
+                            .perp_oracle_prices
+                            .get(&market.market_index)
+                        {
+                            if existing
+                                .sequence_id
+                                .is_some_and(|s| s < market.amm.mm_oracle_sequence_id)
+                                && market.amm.mm_oracle_price > 0
+                            {
+                                self.market_state.set_perp_oracle_price(
+                                    market.market_index,
+                                    OraclePriceData {
+                                        price: market.amm.mm_oracle_price,
+                                        confidence: 1,
+                                        delay: 0,
+                                        has_sufficient_number_of_data_points: true,
+                                        sequence_id: Some(market.amm.mm_oracle_sequence_id),
+                                    },
+                                );
+                                oracle_update = true;
+                            }
+                        }
+                    }
+                    GrpcEvent::SpotMarketUpdate { market, slot } => {
+                        current_slot = current_slot.max(slot);
+                        self.market_state.set_spot_market(market);
+                    }
                 }
             }
 
-            // update all affected users' margin info on oracle price update
-            if let Some(market) = oracle_update.take() {
+            // Only recheck margin for high-risk users on oracle price update
+            if oracle_update {
                 let t0 = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
                 let mut count = 0;
-                let market_index = market.index();
-                let is_perp_update = market.is_perp();
-                for (pubkey, user) in users.iter() {
-                    if is_perp_update {
-                        if user
-                            .perp_positions
-                            .iter()
-                            .any(|x| x.market_index == market_index && !x.is_available())
-                        {
-                            let m = self
-                                .market_state
-                                .calculate_simplified_margin_requirement(
-                                    user,
-                                    MarginRequirementType::Maintenance,
-                                    Some(liquidation_margin_buffer_ratio),
-                                )
-                                .unwrap();
-                            let should_liq = m.total_collateral < m.margin_requirement as i128;
-                            if should_liq {
-                                let _ = self.liq_tx.send((*pubkey, user.clone(), current_slot));
+                let mut new_high_risk = HashSet::<Pubkey>::new();
+
+                for pubkey in &high_risk {
+                    if let Some(user) = users.get(pubkey) {
+                        let m = self
+                            .market_state
+                            .calculate_simplified_margin_requirement(
+                                user,
+                                MarginRequirementType::Maintenance,
+                                Some(liquidation_margin_buffer_ratio),
+                            )
+                            .unwrap();
+
+                        let should_liq = m.total_collateral < m.margin_requirement as i128;
+                        if should_liq {
+                            self.liq_tx
+                                .send((*pubkey, user.clone(), current_slot))
+                                .expect("liq sent");
+                            // Keep in high_risk if liquidatable
+                            new_high_risk.insert(*pubkey);
+                        } else {
+                            // Update high_risk set based on current margin status
+                            let is_high_risk =
+                                check_is_high_risk(m.total_collateral, m.margin_requirement);
+                            if is_high_risk {
+                                new_high_risk.insert(*pubkey);
                             }
-                            count += 1;
+                            // If not high-risk anymore, remove from set (by not adding to new_high_risk)
                         }
-                    } else {
-                        if user
-                            .spot_positions
-                            .iter()
-                            .any(|x| x.market_index == market_index && !x.is_available())
-                        {
-                            let m = self
-                                .market_state
-                                .calculate_simplified_margin_requirement(
-                                    user,
-                                    MarginRequirementType::Maintenance,
-                                    Some(liquidation_margin_buffer_ratio),
-                                )
-                                .unwrap();
-                            let should_liq = m.total_collateral < m.margin_requirement as i128;
-                            if should_liq {
-                                let _ = self.liq_tx.send((*pubkey, user.clone(), current_slot));
-                            }
-                            count += 1;
+                        count += 1;
+                    }
+                }
+
+                // Update high_risk set with current state
+                high_risk = new_high_risk;
+
+                if count > 0 {
+                    log::debug!(
+                        target: TARGET,
+                        "processed #{count} high-risk margin updates in {:?}ms",
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64
+                            - t0
+                    );
+                }
+            }
+            oracle_update = false;
+
+            // Every 10th cycle, recheck all users to find new high-risk users
+            cycle_count += 1;
+            if cycle_count % RECHECK_CYCLE_INTERVAL == 0 {
+                let t0 = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let mut checked = 0;
+                let mut newly_high_risk = 0;
+
+                // Recheck all users not already in high_risk to see if they've become high-risk
+                for (pubkey, user) in users.iter() {
+                    // Skip users already in high_risk set
+                    if high_risk.contains(pubkey) {
+                        continue;
+                    }
+
+                    checked += 1;
+                    let margin_info = self
+                        .market_state
+                        .calculate_simplified_margin_requirement(
+                            user,
+                            MarginRequirementType::Maintenance,
+                            Some(liquidation_margin_buffer_ratio),
+                        )
+                        .unwrap();
+
+                    // Check if user should now be considered high-risk
+                    let is_high_risk = check_is_high_risk(
+                        margin_info.total_collateral,
+                        margin_info.margin_requirement,
+                    );
+                    if is_high_risk {
+                        high_risk.insert(*pubkey);
+                        newly_high_risk += 1;
+
+                        // Also check if they're liquidatable
+                        let should_liq =
+                            margin_info.total_collateral < margin_info.margin_requirement as i128;
+                        if should_liq {
+                            self.liq_tx
+                                .send((*pubkey, user.clone(), current_slot))
+                                .expect("liq sent");
                         }
                     }
                 }
 
-                log::debug!(
-                    "processed #{count} margin updates (market={market_index}): {:?}ms",
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64
-                        - t0
-                );
+                if checked > 0 {
+                    log::debug!(
+                        target: TARGET,
+                        "cycle #{cycle_count} recheck: checked {checked} users, {newly_high_risk} newly high-risk, took {}ms",
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64
+                            - t0
+                    );
+                }
             }
         }
     }
@@ -464,7 +567,7 @@ async fn setup_grpc(
                                 user: user.clone(),
                                 slot: acc.slot,
                             }) {
-                                log::error!("failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward event: {err:?}");
                             }
                         }
                     },
@@ -479,7 +582,7 @@ async fn setup_grpc(
                                 market: market.clone(),
                                 slot: acc.slot,
                             }) {
-                                log::error!("failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward event: {err:?}");
                             }
                         }
                     },
@@ -494,7 +597,7 @@ async fn setup_grpc(
                                 market: market.clone(),
                                 slot: acc.slot,
                             }) {
-                                log::error!("failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward event: {err:?}");
                             }
                         }
                     },
@@ -528,7 +631,7 @@ async fn setup_grpc(
                                 market: *market,
                                 slot: acc.slot,
                             }) {
-                                log::error!("failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward event: {err:?}");
                             }
                         }
                     }
