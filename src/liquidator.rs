@@ -16,7 +16,7 @@ use anchor_lang::prelude::*;
 use drift_rs::jupiter::JupiterSwapApi;
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
-    ffi::OraclePriceData,
+    ffi::{OraclePriceData, SimplifiedMarginCalculation},
     grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
     jupiter::SwapMode,
     priority_fee_subscriber::PriorityFeeSubscriber,
@@ -39,6 +39,47 @@ use crate::{
 const LIQUIDATION_SLOT_RATE_LIMIT: u64 = 5;
 
 const TARGET: &str = "liquidator";
+
+/// Threshold for considering a user high-risk: free margin < 20% of margin requirement
+const HIGH_RISK_FREE_MARGIN_RATIO: f64 = 0.2;
+
+/// Margin status indicating liquidation risk level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarginStatus {
+    /// User is liquidatable (total_collateral < margin_requirement)
+    Liquidatable,
+    /// User is high-risk but not yet liquidatable (free margin < 20% of margin requirement)
+    HighRisk,
+    /// User is safe (not liquidatable and not high-risk)
+    Safe,
+}
+
+/// Helper to get current time in milliseconds since epoch
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Check margin status (liquidatable, high-risk, or safe)
+fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatus {
+    if margin_info.total_collateral < margin_info.margin_requirement as i128 {
+        return MarginStatus::Liquidatable;
+    }
+
+    // Calculate free margin
+    let free_margin = margin_info.total_collateral - margin_info.margin_requirement as i128;
+
+    // User is high-risk if free margin < 20% of margin requirement
+    if margin_info.margin_requirement > 0 && free_margin > 0 {
+        let free_margin_ratio = free_margin as f64 / margin_info.margin_requirement as f64;
+        if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
+            return MarginStatus::HighRisk;
+        }
+    }
+    MarginStatus::Safe
+}
 
 /// Trait for pluggable liquidation strategies
 pub trait LiquidationStrategy {
@@ -85,7 +126,7 @@ pub struct LiquidatorBot {
     /// receives new updates from grpc
     events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
     /// sends liquidatable accounts to work thread
-    liq_tx: std::sync::mpsc::Sender<(Pubkey, User, u64)>,
+    liq_tx: crossbeam::channel::Sender<(Pubkey, User, u64)>,
 }
 
 impl LiquidatorBot {
@@ -166,7 +207,7 @@ impl LiquidatorBot {
         }
 
         // start liquidation worker
-        let (liq_tx, liq_rx) = std::sync::mpsc::channel::<(Pubkey, User, u64)>();
+        let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64)>(256);
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
@@ -207,28 +248,7 @@ impl LiquidatorBot {
             .map(|x| x.liquidation_margin_buffer_ratio)
             .expect("State has liquidation_margin_buffer_ratio");
 
-        // Threshold for considering a user high-risk: free margin < 20% of margin requirement
-        const HIGH_RISK_FREE_MARGIN_RATIO: f64 = 0.2;
         const RECHECK_CYCLE_INTERVAL: u32 = 64;
-
-        // Helper closure to check if a user is high-risk (close to liquidation)
-        let check_is_high_risk = |total_collateral: i128, margin_requirement: u128| -> bool {
-            if total_collateral < margin_requirement as i128 {
-                // Already liquidatable, definitely high-risk
-                return true;
-            }
-
-            // Calculate free margin
-            let free_margin = total_collateral - margin_requirement as i128;
-
-            // User is high-risk if free margin < 20% of margin requirement
-            if margin_requirement > 0 && free_margin > 0 {
-                let free_margin_ratio = free_margin as f64 / margin_requirement as f64;
-                free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO
-            } else {
-                false
-            }
-        };
 
         let mut cycle_count = 0u32;
 
@@ -254,10 +274,13 @@ impl LiquidatorBot {
                     log::debug!(target: TARGET, "excluding user: {:?}. insignificant collateral: {}/{}", user.authority, margin_info.total_collateral, margin_info.margin_requirement);
                 } else {
                     users.insert(*pubkey, *user);
-                    // Check if user is high-risk and add to set
-                    if check_is_high_risk(margin_info.total_collateral, margin_info.margin_requirement) {
-                        high_risk.insert(*pubkey);
-                        initial_high_risk_count += 1;
+                    // Check margin status and add to high-risk set if needed
+                    match check_margin_status(&margin_info) {
+                        MarginStatus::Liquidatable | MarginStatus::HighRisk => {
+                            high_risk.insert(*pubkey);
+                            initial_high_risk_count += 1;
+                        }
+                        MarginStatus::Safe => {}
                     }
                 }
             });
@@ -265,11 +288,12 @@ impl LiquidatorBot {
         log::info!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
         log::info!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
 
-        let mut oracle_update = false;
-
         // main loop
         let mut event_buffer = Vec::<GrpcEvent>::with_capacity(32);
+        let mut oracle_update;
+
         loop {
+            oracle_update = false;
             let n_read = events_rx.recv_many(&mut event_buffer, 32).await;
             log::trace!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
             for event in event_buffer.drain(..) {
@@ -298,23 +322,17 @@ impl LiquidatorBot {
                             // Remove from high_risk if present (user is now excluded)
                             high_risk.remove(&pubkey);
                         } else {
-                            let is_liq = margin_info.total_collateral
-                                < margin_info.margin_requirement as i128;
-                            if is_liq {
-                                // User is liquidatable, add to high_risk if not already there
-                                high_risk.insert(pubkey);
-                                self.liq_tx
-                                    .send((pubkey, user.clone(), current_slot))
-                                    .expect("liq sent");
-                            } else {
-                                // Update high_risk set based on current margin status
-                                let is_high_risk = check_is_high_risk(
-                                    margin_info.total_collateral,
-                                    margin_info.margin_requirement,
-                                );
-                                if is_high_risk {
+                            match check_margin_status(&margin_info) {
+                                MarginStatus::Liquidatable => {
                                     high_risk.insert(pubkey);
-                                } else {
+                                    self.liq_tx
+                                        .send((pubkey, user.clone(), current_slot))
+                                        .expect("liq sent");
+                                }
+                                MarginStatus::HighRisk => {
+                                    high_risk.insert(pubkey);
+                                }
+                                MarginStatus::Safe => {
                                     high_risk.remove(&pubkey);
                                 }
                             }
@@ -330,12 +348,11 @@ impl LiquidatorBot {
                         if is_perp_update {
                             self.market_state
                                 .set_perp_oracle_price(market.index(), oracle_price_data);
-                            oracle_update = true;
                         } else {
                             self.market_state
                                 .set_spot_oracle_price(market.index(), oracle_price_data);
-                            oracle_update = true;
                         }
+                        oracle_update = true;
                     }
                     GrpcEvent::PerpMarketUpdate { market, slot } => {
                         current_slot = current_slot.max(slot);
@@ -371,18 +388,12 @@ impl LiquidatorBot {
                 }
             }
 
-            // Only recheck margin for high-risk users on oracle price update
+            // Only recheck margin for high-risk users on oracle price updates
             if oracle_update {
-                let t0 = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let mut count = 0;
-                let mut new_high_risk = HashSet::<Pubkey>::new();
-
-                for pubkey in &high_risk {
+                let t0 = current_time_millis();
+                high_risk.retain(|pubkey| {
                     if let Some(user) = users.get(pubkey) {
-                        let m = self
+                        let margin_info = self
                             .market_state
                             .calculate_simplified_margin_requirement(
                                 user,
@@ -391,61 +402,40 @@ impl LiquidatorBot {
                             )
                             .unwrap();
 
-                        let should_liq = m.total_collateral < m.margin_requirement as i128;
-                        if should_liq {
-                            self.liq_tx
-                                .send((*pubkey, user.clone(), current_slot))
-                                .expect("liq sent");
-                            // Keep in high_risk if liquidatable
-                            new_high_risk.insert(*pubkey);
-                        } else {
-                            // Update high_risk set based on current margin status
-                            let is_high_risk =
-                                check_is_high_risk(m.total_collateral, m.margin_requirement);
-                            if is_high_risk {
-                                new_high_risk.insert(*pubkey);
+                        match check_margin_status(&margin_info) {
+                            MarginStatus::Liquidatable => {
+                                self.liq_tx
+                                    .send((*pubkey, user.clone(), current_slot))
+                                    .expect("liq sent");
+                                true
                             }
-                            // If not high-risk anymore, remove from set (by not adding to new_high_risk)
+                            MarginStatus::HighRisk => true,
+                            MarginStatus::Safe => false,
                         }
-                        count += 1;
+                    } else {
+                        false
                     }
-                }
+                });
 
-                // Update high_risk set with current state
-                high_risk = new_high_risk;
-
-                if count > 0 {
-                    log::debug!(
-                        target: TARGET,
-                        "processed #{count} high-risk margin updates in {:?}ms",
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64
-                            - t0
-                    );
-                }
+                log::debug!(
+                    target: TARGET,
+                    "processed {} high-risk margin updates in {}ms",
+                    high_risk.len(),
+                    current_time_millis() - t0,
+                );
             }
-            oracle_update = false;
 
-            // Every 10th cycle, recheck all users to find new high-risk users
+            // Every RECHECK_CYCLE_INTERVAL cycles, recheck all users to find new high-risk users
             cycle_count += 1;
             if cycle_count % RECHECK_CYCLE_INTERVAL == 0 {
-                let t0 = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let mut checked = 0;
+                let t0 = current_time_millis();
                 let mut newly_high_risk = 0;
 
-                // Recheck all users not already in high_risk to see if they've become high-risk
                 for (pubkey, user) in users.iter() {
-                    // Skip users already in high_risk set
                     if high_risk.contains(pubkey) {
                         continue;
                     }
 
-                    checked += 1;
                     let margin_info = self
                         .market_state
                         .calculate_simplified_margin_requirement(
@@ -455,37 +445,28 @@ impl LiquidatorBot {
                         )
                         .unwrap();
 
-                    // Check if user should now be considered high-risk
-                    let is_high_risk = check_is_high_risk(
-                        margin_info.total_collateral,
-                        margin_info.margin_requirement,
-                    );
-                    if is_high_risk {
-                        high_risk.insert(*pubkey);
-                        newly_high_risk += 1;
-
-                        // Also check if they're liquidatable
-                        let should_liq =
-                            margin_info.total_collateral < margin_info.margin_requirement as i128;
-                        if should_liq {
+                    match check_margin_status(&margin_info) {
+                        MarginStatus::Liquidatable => {
+                            high_risk.insert(*pubkey);
+                            newly_high_risk += 1;
                             self.liq_tx
                                 .send((*pubkey, user.clone(), current_slot))
                                 .expect("liq sent");
                         }
+                        MarginStatus::HighRisk => {
+                            high_risk.insert(*pubkey);
+                            newly_high_risk += 1;
+                        }
+                        MarginStatus::Safe => {}
                     }
                 }
 
-                if checked > 0 {
-                    log::debug!(
-                        target: TARGET,
-                        "cycle #{cycle_count} recheck: checked {checked} users, {newly_high_risk} newly high-risk, took {}ms",
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64
-                            - t0
-                    );
-                }
+                log::debug!(
+                    target: TARGET,
+                    "cycle #{cycle_count} recheck: checked {} users, {newly_high_risk} newly high-risk, took {}ms",
+                    users.len(),
+                    current_time_millis() - t0
+                );
             }
         }
     }
@@ -592,7 +573,7 @@ async fn setup_grpc(
                     {
                         let tx = tx.clone();
                         move |acc| {
-                            let market: &SpotMarket = drift_rs::utils::deser_zero_copy(&acc.data);
+                            let market: &SpotMarket = drift_rs::utils::deser_zero_copy(acc.data);
                             if let Err(err) = tx.try_send(GrpcEvent::SpotMarketUpdate {
                                 market: market.clone(),
                                 slot: acc.slot,
@@ -703,7 +684,7 @@ fn try_liquidate_with_match(
 fn spawn_liquidation_worker(
     tx_sender: TxSender,
     strategy: Arc<dyn LiquidationStrategy + Send + Sync>,
-    liq_rx: std::sync::mpsc::Receiver<(Pubkey, User, u64)>,
+    liq_rx: crossbeam::channel::Receiver<(Pubkey, User, u64)>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
 ) {
@@ -881,7 +862,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     .expect("keeper account");
                 let liquidatee_subaccount_data = self
                     .drift
-                    .try_get_account::<User>(&liquidatee)
+                    .try_get_account::<User>(liquidatee)
                     .expect("liquidatee account");
 
                 let asset_spot_market = self
@@ -894,16 +875,16 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     .expect("liability spot market");
 
                 let in_token_account = drift_rs::Wallet::derive_associated_token_address(
-                    &authority,
+                    authority,
                     &asset_spot_market,
                 );
                 let out_token_account = drift_rs::Wallet::derive_associated_token_address(
-                    &authority,
+                    authority,
                     &liability_spot_market,
                 );
 
                 let jupiter_swap_info = match rt.block_on(self.drift.jupiter_swap_query(
-                    &authority,
+                    authority,
                     token_amount,
                     SwapMode::ExactIn,
                     asset_market_index,

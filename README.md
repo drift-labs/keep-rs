@@ -31,7 +31,7 @@ RUST_LOG=liquidator=info,dlob=info,swift=info \
     cargo run --release -- --mainnet --liquidator
 ```
 
-## Event Flow Diagram
+## Event Flow Diagram (Filler)
 
 The following diagram illustrates the flow of events in the Filler Bot, from receiving gRPC and websocket events, updating the orderbook (DLOB), to sending and confirming transactions:
 
@@ -164,6 +164,52 @@ flowchart TD
     class F1,F2,F3,F4 competition
     class A1,A2,A3,A4,B1,B2,B3,B4,C1,C2,C3,C4,C5 process
 ```
+
+## Liquidator Overview
+
+### 1. Initialization (`LiquidatorBot::new`)
+- **DLOB**: Decentralized Limit Order Book for finding makers to match against
+- **TxWorker**: Dedicated thread for sending and confirming transactions
+- **MarketState**: Caches market metadata and oracle prices
+- **gRPC Subscriptions**: Real-time updates for users, oracles, markets
+- **Liquidation Worker**: Background thread that processes liquidatable users
+
+### 2. Main Event Loop (`LiquidatorBot::run`)
+- Processes gRPC events in batches (up to 32 events)
+- Maintains user account state in memory
+- Tracks high-risk users (free margin < 20% of requirement)
+- Rechecks high-risk users on oracle price updates
+- Periodically rechecks all users (every 64 cycles)
+
+### 3. Margin Status Checking
+Three states are tracked:
+- **Liquidatable**: `total_collateral < margin_requirement`
+- **High Risk**: `free_margin < 20% of margin_requirement`
+- **Safe**: All others
+
+### 4. Liquidation Worker Thread
+- Receives liquidatable users via channel
+- Implements rate limiting (5 slots minimum between attempts)
+- Gets dynamic priority fees (60th percentile)
+- Executes liquidation strategy
+
+### 5. Liquidation Strategy (`LiquidateWithMatchStrategy`)
+- **Perp Liquidations**: 
+  - Finds largest perp position
+  - Queries DLOB for top makers (asks for longs, bids for shorts)
+  - Builds `liquidate_perp_with_fill` transaction
+  
+- **Spot Liquidations**:
+  - Finds borrow positions (skip dust)
+  - Uses largest deposit as collateral
+  - Queries Jupiter for swap route
+  - Builds `liquidate_spot_with_swap` transaction
+
+### 6. Transaction Lifecycle
+- Transactions are built with priority fees and compute limits
+- Sent to blockchain via TxSender channel
+- TxWorker handles signing and sending
+- Transaction confirmations update metrics and remove from pending set
 
 ## Tx Summary
 print some recent tx stats

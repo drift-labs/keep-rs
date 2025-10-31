@@ -168,11 +168,12 @@ impl FillerBot {
                             let oracle_price_data = drift.try_get_mmoracle_for_perp_market(order_params.market_index, slot).expect("got oracle price");
                             let oracle_price = oracle_price_data.price;
                             log::trace!(target: TARGET, "oracle price: slot:{:?},market:{:?},price:{:?}", slot, order_params.market_index, oracle_price);
-                            // order_params.update_perp_auction_params(
-                            //     &perp_market,
-                            //     oracle_price,
-                            //     true,
-                            // );
+                            order_params.update_perp_auction_params(
+                                &perp_market,
+                                oracle_price,
+                                true,
+                            );
+                            log::debug!("updated order params");
                             let (start_price, end_price, duration) = (order_params.auction_start_price.unwrap_or_default(), order_params.auction_end_price.unwrap_or_default(), order_params.auction_duration.unwrap_or_default());
                             let order = Order {
                                 slot: slot + 1,
@@ -227,7 +228,7 @@ impl FillerBot {
                                 }
                             };
                             let taker_order = TakerOrder::from_order_params(order_params, price);
-                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(vamm_price as u64));
+                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(vamm_price));
                             if !crosses.is_empty() {
                                 log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
                                 let pf = priority_fee_subscriber.priority_fee_nth(0.6);
