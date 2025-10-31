@@ -9,6 +9,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+    thread::JoinHandle,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -405,7 +406,7 @@ impl LiquidatorBot {
                         match check_margin_status(&margin_info) {
                             MarginStatus::Liquidatable => {
                                 self.liq_tx
-                                    .send((*pubkey, user.clone(), current_slot))
+                                    .try_send((*pubkey, user.clone(), current_slot))
                                     .expect("liq sent");
                                 true
                             }
@@ -417,7 +418,7 @@ impl LiquidatorBot {
                     }
                 });
 
-                log::debug!(
+                log::trace!(
                     target: TARGET,
                     "processed {} high-risk margin updates in {}ms",
                     high_risk.len(),
@@ -450,7 +451,7 @@ impl LiquidatorBot {
                             high_risk.insert(*pubkey);
                             newly_high_risk += 1;
                             self.liq_tx
-                                .send((*pubkey, user.clone(), current_slot))
+                                .try_send((*pubkey, user.clone(), current_slot))
                                 .expect("liq sent");
                         }
                         MarginStatus::HighRisk => {
@@ -537,6 +538,8 @@ async fn setup_grpc(
                     drift.clone(),
                     market_ids.as_ref(),
                 ))
+                .usermap_on()
+                .statsmap_on()
                 .on_account(
                     AccountFilter::partial().with_discriminator(User::DISCRIMINATOR),
                     {
@@ -641,22 +644,29 @@ fn try_liquidate_with_match(
         return;
     }
 
-    let keeper_account_data = drift
-        .try_get_account::<User>(&keeper_subaccount)
-        .expect("keeper account");
-
-    let liquidatee_subaccount_data = drift
-        .try_get_account::<User>(&liquidatee_subaccount)
-        .expect("taker account");
+    let keeper_account_data = drift.try_get_account::<User>(&keeper_subaccount);
+    if keeper_account_data.is_err() {
+        log::debug!(target: TARGET, "keeper acc lookup failed={keeper_subaccount:?}");
+        return;
+    }
+    let liquidatee_subaccount_data = drift.try_get_account::<User>(&liquidatee_subaccount);
+    if liquidatee_subaccount_data.is_err() {
+        log::debug!(target: TARGET, "liquidatee acc lookup failed={liquidatee_subaccount:?}");
+        return;
+    }
 
     let mut tx_builder = TransactionBuilder::new(
         drift.program_data(),
         keeper_subaccount,
-        std::borrow::Cow::Borrowed(&keeper_account_data),
+        std::borrow::Cow::Owned(keeper_account_data.unwrap()),
         false,
     )
     .with_priority_fee(priority_fee, Some(cu_limit))
-    .liquidate_perp_with_fill(market_index, &liquidatee_subaccount_data, top_makers);
+    .liquidate_perp_with_fill(
+        market_index,
+        &liquidatee_subaccount_data.unwrap(),
+        top_makers,
+    );
 
     // large accounts list, bump CU limit to compensate
     if let Some(ix) = tx_builder.ixs().last() {
@@ -687,14 +697,14 @@ fn spawn_liquidation_worker(
     liq_rx: crossbeam::channel::Receiver<(Pubkey, User, u64)>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build Tokio runtime");
 
-        let mut rate_limit: HashMap<Pubkey, u64> = HashMap::new();
+        let mut rate_limit = HashMap::<Pubkey, u64>::new();
         while let Ok((liquidatee, user_account, slot)) = liq_rx.recv() {
             if rate_limit
                 .get(&liquidatee)
@@ -717,7 +727,7 @@ fn spawn_liquidation_worker(
                 slot,
             );
         }
-    });
+    })
 }
 
 /// Default liquidation strategy that matches against top-of-book makers and
@@ -867,11 +877,14 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
 
                 let asset_spot_market = self
                     .drift
-                    .try_get_spot_market_account(asset_market_index)
+                    .program_data()
+                    .spot_market_config_by_index(asset_market_index)
                     .expect("asset spot market");
+
                 let liability_spot_market = self
                     .drift
-                    .try_get_spot_market_account(pos.market_index)
+                    .program_data()
+                    .spot_market_config_by_index(pos.market_index)
                     .expect("liability spot market");
 
                 let in_token_account = drift_rs::Wallet::derive_associated_token_address(
