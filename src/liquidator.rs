@@ -271,7 +271,7 @@ impl LiquidatorBot {
         let mut event_buffer = Vec::<GrpcEvent>::with_capacity(32);
         loop {
             let n_read = events_rx.recv_many(&mut event_buffer, 32).await;
-            log::debug!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
+            log::trace!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
             for event in event_buffer.drain(..) {
                 match event {
                     GrpcEvent::UserUpdate {
