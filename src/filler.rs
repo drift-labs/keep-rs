@@ -103,11 +103,7 @@ impl FillerBot {
             .expect("subscribed swift orders");
         log::info!(target: TARGET, "subscribed swift orders");
 
-        tokio::try_join!(
-            drift.subscribe_blockhashes(),
-            drift.subscribe_account(&filler_subaccount)
-        )
-        .expect("subscribed");
+        drift.subscribe_blockhashes().await.expect("subscribed");
         let slot_rx = setup_grpc(
             drift.clone(),
             dlob,
@@ -177,6 +173,7 @@ impl FillerBot {
                                 oracle_price,
                                 true,
                             );
+                            log::debug!("updated order params");
                             let (start_price, end_price, duration) = (order_params.auction_start_price.unwrap_or_default(), order_params.auction_end_price.unwrap_or_default(), order_params.auction_duration.unwrap_or_default());
                             let order = Order {
                                 slot: slot + 1,
@@ -231,7 +228,7 @@ impl FillerBot {
                                 }
                             };
                             let taker_order = TakerOrder::from_order_params(order_params, price);
-                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(vamm_price as u64));
+                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(vamm_price));
                             if !crosses.is_empty() {
                                 log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
                                 let pf = priority_fee_subscriber.priority_fee_nth(0.6);
