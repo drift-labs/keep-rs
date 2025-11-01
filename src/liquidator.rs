@@ -325,6 +325,7 @@ impl LiquidatorBot {
                         } else {
                             match check_margin_status(&margin_info) {
                                 MarginStatus::Liquidatable => {
+                                    log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                     high_risk.insert(pubkey);
                                     self.liq_tx
                                         .send((pubkey, user.clone(), current_slot))
@@ -405,6 +406,7 @@ impl LiquidatorBot {
 
                         match check_margin_status(&margin_info) {
                             MarginStatus::Liquidatable => {
+                                log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                 self.liq_tx
                                     .try_send((*pubkey, user.clone(), current_slot))
                                     .expect("liq sent");
@@ -450,6 +452,7 @@ impl LiquidatorBot {
                         MarginStatus::Liquidatable => {
                             high_risk.insert(*pubkey);
                             newly_high_risk += 1;
+                            log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                             self.liq_tx
                                 .try_send((*pubkey, user.clone(), current_slot))
                                 .expect("liq sent");
