@@ -19,7 +19,7 @@ use drift_rs::{
     types::{
         accounts::{User, UserStats},
         CommitmentConfig, MarketId, MarketPrecision, MarketStatus, MarketType, Order, OrderType,
-        PositionDirection, PostOnlyParam, RpcSendTransactionConfig, VersionedMessage,
+        PositionDirection, PostOnlyParam, RpcSendTransactionConfig, VersionedMessage, AMM,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, TransactionBuilder, Wallet,
 };
@@ -266,10 +266,10 @@ impl FillerBot {
                         let oracle_price = chain_oracle_data.price as u64;
                         let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
 
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot + 1, oracle_price, trigger_price, Some(&perp_market));
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, trigger_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
-                        if crosses_and_top_makers.crosses.len() > 0 {
+                        if !crosses_and_top_makers.crosses.is_empty() {
                             log::info!(target: TARGET, "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
                             try_auction_fill(
                                 drift,
@@ -280,13 +280,15 @@ impl FillerBot {
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
                                 None,
-                                perp_market.has_too_much_drawdown(),
+                                move |maker_cross| {
+                                    perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
+                                },
                             ).await;
                         }
 
                         // ghetto rate limit
                         if slot % 2 == 0 {
-                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, oracle_price, market_index, MarketType::Perp) {
+                            if let Some(crosses) = dlob.find_crossing_region(slot, oracle_price, market_index, MarketType::Perp) {
                                 log::info!(target: TARGET, "found limit crosses (market: {market_index})");
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
@@ -463,7 +465,7 @@ async fn try_auction_fill(
     auction_crosses: CrossesAndTopMakers,
     tx_worker_ref: TxSender,
     oracle_update: Option<PythPriceUpdate>,
-    is_vamm_inactive: bool,
+    is_vamm_inactive: impl Fn(&MakerCrosses) -> bool,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
@@ -553,7 +555,7 @@ async fn try_auction_fill(
             })
             .collect();
 
-        if crosses.has_vamm_cross && is_vamm_inactive {
+        if crosses.has_vamm_cross && is_vamm_inactive(&crosses) {
             log::debug!(target: TARGET, "skip inactive vamm cross: {crosses:?}");
             return;
         }
@@ -727,6 +729,18 @@ fn try_uncross(
             cu_limit as u64,
         );
     }
+}
+
+fn amm_wants_to_jit_make(amm: &AMM, taker_direction: PositionDirection) -> bool {
+    let amm_wants_to_jit_make = match taker_direction {
+        PositionDirection::Long => {
+            amm.base_asset_amount_with_amm.as_i128() < -(amm.order_step_size as i128)
+        }
+        PositionDirection::Short => {
+            amm.base_asset_amount_with_amm.as_i128() > amm.order_step_size as i128
+        }
+    };
+    amm_wants_to_jit_make && amm.amm_jit_intensity > 0
 }
 
 /// Setup gRPC subscriptions
