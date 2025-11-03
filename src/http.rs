@@ -7,7 +7,9 @@ use axum::{
     http::{header::CONTENT_TYPE, Response, StatusCode},
     response::IntoResponse,
 };
-use prometheus::{Encoder, HistogramVec, IntCounter, IntCounterVec, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
+};
 
 #[derive(Debug)]
 pub struct Metrics {
@@ -18,6 +20,11 @@ pub struct Metrics {
     pub trigger_actual: IntCounter,
     pub fill_expected: IntCounterVec,
     pub fill_actual: IntCounterVec,
+    pub liquidation_attempts: IntCounterVec,
+    pub liquidation_success: IntCounterVec,
+    pub liquidation_failed: IntCounterVec,
+    pub jupiter_quote_latency: Histogram,
+    pub jupiter_quote_failures: IntCounter,
     pub confirmation_slots: HistogramVec,
     pub cu_spent: HistogramVec,
     pub registry: Registry,
@@ -78,6 +85,60 @@ impl Metrics {
         .unwrap();
         registry.register(Box::new(trigger_actual.clone())).unwrap();
 
+        let liquidation_attempts = IntCounterVec::new(
+            prometheus::Opts::new(
+                "rfb_liquidation_attempts_total",
+                "Number of liquidation attempts",
+            ),
+            &["type"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(liquidation_attempts.clone()))
+            .unwrap();
+
+        let liquidation_success = IntCounterVec::new(
+            prometheus::Opts::new(
+                "rfb_liquidation_success_total",
+                "Number of successful liquidations",
+            ),
+            &["type"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(liquidation_success.clone()))
+            .unwrap();
+
+        let liquidation_failed = IntCounterVec::new(
+            prometheus::Opts::new(
+                "rfb_liquidation_failed_total",
+                "Number of failed liquidations",
+            ),
+            &["type"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(liquidation_failed.clone()))
+            .unwrap();
+
+        let jupiter_quote_latency = Histogram::with_opts(prometheus::HistogramOpts::new(
+            "rfb_jupiter_quote_latency_ms",
+            "Jupiter quote request latency in milliseconds",
+        ))
+        .unwrap();
+        registry
+            .register(Box::new(jupiter_quote_latency.clone()))
+            .unwrap();
+
+        let jupiter_quote_failures = IntCounter::new(
+            "rfb_jupiter_quote_failures_total",
+            "Number of Jupiter quote failures",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(jupiter_quote_failures.clone()))
+            .unwrap();
+
         let confirmation_slots = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "rfb_tx_confirmation_slots",
@@ -103,6 +164,11 @@ impl Metrics {
             tx_failed,
             fill_expected,
             fill_actual,
+            liquidation_attempts,
+            liquidation_success,
+            liquidation_failed,
+            jupiter_quote_latency,
+            jupiter_quote_failures,
             confirmation_slots,
             cu_spent,
             registry,
