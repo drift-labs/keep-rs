@@ -903,9 +903,9 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     authority,
                     token_amount,
                     SwapMode::ExactIn,
+                    100,
                     asset_market_index,
                     pos.market_index,
-                    100,
                     Some(true),
                     None,
                     None,
@@ -952,6 +952,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                 )
                 .build();
 
+                log::debug!(target: TARGET, "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}", pos.market_index);
                 tx_sender.send_tx(
                     tx,
                     TxIntent::LiquidateSpot {
