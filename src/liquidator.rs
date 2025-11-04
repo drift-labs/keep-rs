@@ -132,8 +132,7 @@ pub struct LiquidatorBot {
 impl LiquidatorBot {
     pub async fn new(config: Config, drift: DriftClient, metrics: Arc<Metrics>) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-
-        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry);
+        let tx_worker = TxWorker::new(drift.clone(), Arc::clone(&metrics), config.dry);
         let rt = tokio::runtime::Handle::current();
         let tx_sender = tx_worker.run(rt);
 
@@ -217,6 +216,7 @@ impl LiquidatorBot {
                 drift: drift.clone(),
                 market_state,
                 keeper_subaccount,
+                metrics: Arc::clone(&metrics),
             }),
             liq_rx,
             std::env::var("FILL_CU_LIMIT")
@@ -736,6 +736,7 @@ pub struct LiquidateWithMatchStrategy {
     pub dlob: &'static DLOB,
     pub market_state: &'static MarketState,
     pub keeper_subaccount: Pubkey,
+    pub metrics: Arc<Metrics>,
 }
 
 impl LiquidateWithMatchStrategy {
@@ -801,6 +802,11 @@ impl LiquidateWithMatchStrategy {
             return;
         };
 
+        self.metrics
+            .liquidation_attempts
+            .with_label_values(&["perp"])
+            .inc();
+
         log::info!(
             target: TARGET,
             "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}",
@@ -863,6 +869,11 @@ impl LiquidateWithMatchStrategy {
                 continue;
             }
 
+            self.metrics
+                .liquidation_attempts
+                .with_label_values(&["spot"])
+                .inc();
+
             // Find their largest deposit to use as collateral
             let Some(asset_market_index) = user_account
                 .spot_positions
@@ -917,6 +928,7 @@ impl LiquidateWithMatchStrategy {
             let authority = *authority;
             let keeper_account_data = keeper_account_data;
             let liquidatee_account_data = liquidatee_account_data;
+            let metrics = Arc::clone(&self.metrics);
 
             rt.spawn(async move {
                 // Fetch market configs inside async block to avoid lifetime issues
@@ -939,6 +951,7 @@ impl LiquidateWithMatchStrategy {
                     &liability_spot_market,
                 );
 
+                let t0 = std::time::Instant::now();
                 let res = drift
                     .jupiter_swap_query(
                         &authority,
@@ -954,8 +967,13 @@ impl LiquidateWithMatchStrategy {
                     .await;
 
                 let jupiter_swap_info = match res {
-                    Ok(info) => info,
+                    Ok(info) => {
+                        let latency = t0.elapsed().as_millis() as f64;
+                        metrics.jupiter_quote_latency.observe(latency);
+                        info
+                    }
                     Err(e) => {
+                        metrics.jupiter_quote_failures.inc();
                         log::warn!(
                             target: TARGET,
                             "failed to get jupiter quote for user {:?}, market {}: {:?}",
