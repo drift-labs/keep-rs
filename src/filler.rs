@@ -1,5 +1,6 @@
 //! Filler Bot
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +54,7 @@ pub struct FillerBot {
     config: Config,
     tx_worker_ref: TxSender,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
+    pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
 }
 
 impl FillerBot {
@@ -114,14 +116,14 @@ impl FillerBot {
         log::info!(target: TARGET, "subscribed gRPC");
 
         // pyth disabled for now
-        // let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
-        // let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
-        //     "wss://pyth-lazer.dourolabs.app/v1/stream",
-        //     pyth_access_token.as_str(),
-        // )
-        // .expect("pyth price feed connects");
-        // let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
-        // log::info!(target: TARGET, "subscribed pyth price feeds");
+        let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
+        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
+            "wss://pyth-lazer.dourolabs.app/v1/stream",
+            pyth_access_token.as_str(),
+        )
+        .expect("pyth price feed connects");
+        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
+        log::info!(target: TARGET, "subscribed pyth price feeds");
 
         FillerBot {
             drift,
@@ -134,6 +136,7 @@ impl FillerBot {
             config,
             tx_worker_ref,
             priority_fee_subscriber,
+            pyth_price_feed,
         }
     }
 
@@ -153,6 +156,8 @@ impl FillerBot {
             .state_account()
             .map(|s| s.has_median_trigger_price_feature())
             .unwrap_or(false);
+        let mut pyth_price_feed = self.pyth_price_feed;
+        let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
 
         loop {
             tokio::select! {
@@ -263,8 +268,15 @@ impl FillerBot {
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
                         let chain_oracle_data = drift.try_get_mmoracle_for_perp_market(market_index, slot).expect("got oracle price");
                         log::debug!(target: "oracle", "oracle price: delay:{:?},market:{:?},oracle:{:?},amm:{:?}", chain_oracle_data.delay, market, chain_oracle_data.price, perp_market.amm.mm_oracle_price);
-                        let oracle_price = chain_oracle_data.price as u64;
+                        let mut oracle_price = chain_oracle_data.price as u64;
                         let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
+                        let mut pyth_update = None;
+                        if let Some(p) = pyth_oracle_prices.get(&market_index) {
+                            if oracle_price != p.price {
+                                oracle_price = p.price;
+                                pyth_update = Some(p.clone());
+                            }
+                        }
 
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, trigger_price, Some(&perp_market));
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
@@ -279,7 +291,7 @@ impl FillerBot {
                                 filler_subaccount,
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
-                                None,
+                                pyth_update,
                                 move |maker_cross| {
                                     perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
                                 },
@@ -304,6 +316,11 @@ impl FillerBot {
                     }
                     let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
                     log::trace!(target: TARGET, "⏱️ checked fills at {slot}: {:?}ms", duration);
+                }
+                new_price = pyth_price_feed.recv() => {
+                    if let Some(update) = new_price {
+                        pyth_oracle_prices.insert(update.market_id, update);
+                    }
                 }
             }
         }

@@ -869,14 +869,17 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     token_amount
                 );
 
-                let keeper_account_data = self
-                    .drift
-                    .try_get_account::<User>(&self.keeper_subaccount)
-                    .expect("keeper account");
-                let liquidatee_subaccount_data = self
-                    .drift
-                    .try_get_account::<User>(liquidatee)
-                    .expect("liquidatee account");
+                let keeper_account_data =
+                    self.drift.try_get_account::<User>(&self.keeper_subaccount);
+                if keeper_account_data.is_err() {
+                    log::info!(target: TARGET, "keeper account not found: {:?}", self.keeper_subaccount);
+                    return;
+                }
+                let liquidatee_subaccount_data = self.drift.try_get_account::<User>(liquidatee);
+                if liquidatee_subaccount_data.is_err() {
+                    log::info!(target: TARGET, "liquidatee account not found: {liquidatee:?}");
+                    return;
+                }
 
                 let asset_spot_market = self
                     .drift
@@ -926,29 +929,19 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                 let tx = TransactionBuilder::new(
                     self.drift.program_data(),
                     self.keeper_subaccount,
-                    std::borrow::Cow::Borrowed(&keeper_account_data),
+                    std::borrow::Cow::Owned(keeper_account_data.unwrap()),
                     false,
                 )
                 .with_priority_fee(priority_fee, Some(cu_limit))
-                .liquidate_spot_with_swap_begin(
-                    asset_market_index,
-                    pos.market_index,
-                    token_amount,
-                    &liquidatee_subaccount_data,
-                )
-                .jupiter_swap(
+                .jupiter_swap_liquidate(
                     jupiter_swap_info,
                     &asset_spot_market,
                     &liability_spot_market,
                     &in_token_account,
                     &out_token_account,
-                    None,
-                    None,
-                )
-                .liquidate_spot_with_swap_end(
                     asset_market_index,
                     pos.market_index,
-                    &liquidatee_subaccount_data,
+                    &liquidatee_subaccount_data.unwrap(),
                 )
                 .build();
 
