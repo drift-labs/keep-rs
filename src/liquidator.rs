@@ -208,7 +208,7 @@ impl LiquidatorBot {
         }
 
         // start liquidation worker
-        let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64)>(256);
+        let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64)>(1024);
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
@@ -742,16 +742,19 @@ pub struct LiquidateWithMatchStrategy {
     pub keeper_subaccount: Pubkey,
 }
 
-impl LiquidationStrategy for LiquidateWithMatchStrategy {
-    fn liquidate_user(
-        &self,
+impl LiquidateWithMatchStrategy {
+    fn exec_liq(
         rt: &tokio::runtime::Runtime,
-        liquidatee: &Pubkey,
-        user_account: &User,
-        tx_sender: &TxSender,
+        liquidatee: Pubkey,
+        user_account: User,
+        drift: DriftClient,
+        dlob: &'static DLOB,
+        market_state: &'static MarketState,
+        keeper_subaccount: Pubkey,
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
+        tx_sender: TxSender,
     ) {
         // perp liquidation with fill
         if let Some(pos) = user_account
@@ -762,11 +765,8 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         {
             log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}", pos.market_index);
 
-            let l3_book = self
-                .dlob
-                .get_l3_snapshot(pos.market_index, MarketType::Perp);
-            let oracle_price = self
-                .market_state
+            let l3_book = dlob.get_l3_snapshot(pos.market_index, MarketType::Perp);
+            let oracle_price = market_state
                 .get_perp_oracle_price(pos.market_index)
                 .map(|x| x.price)
                 .unwrap_or(0) as u64;
@@ -794,7 +794,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
 
             let makers: Vec<User> = maker_pubkeys
                 .iter()
-                .filter_map(|p| self.drift.try_get_account::<User>(p).ok())
+                .filter_map(|p| drift.try_get_account::<User>(p).ok())
                 .collect();
 
             if makers.is_empty() {
@@ -803,12 +803,12 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             }
 
             try_liquidate_with_match(
-                &self.drift,
+                &drift,
                 pos.market_index,
-                self.keeper_subaccount,
-                *liquidatee,
+                keeper_subaccount,
+                liquidatee,
                 makers.as_slice(),
-                tx_sender,
+                &tx_sender,
                 priority_fee,
                 cu_limit,
                 slot,
@@ -816,13 +816,13 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         }
 
         // spot liquidation with swap
-        let authority = self.drift.wallet.authority();
+        let authority = drift.wallet.authority().clone();
         for pos in user_account
             .spot_positions
             .iter()
             .filter(|p| matches!(p.balance_type, SpotBalanceType::Borrow) && !p.is_available())
         {
-            let market_state = self.market_state.load();
+            let market_state = market_state.load();
             let spot_market = market_state.spot_markets.get(&pos.market_index);
 
             if let Some(market) = spot_market {
@@ -869,94 +869,129 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     token_amount
                 );
 
-                let keeper_account_data =
-                    self.drift.try_get_account::<User>(&self.keeper_subaccount);
+                let keeper_account_data = drift.try_get_account::<User>(&keeper_subaccount);
                 if keeper_account_data.is_err() {
-                    log::info!(target: TARGET, "keeper account not found: {:?}", self.keeper_subaccount);
+                    log::info!(target: TARGET, "keeper account not found: {:?}", keeper_subaccount);
                     return;
                 }
-                let liquidatee_subaccount_data = self.drift.try_get_account::<User>(liquidatee);
+                let liquidatee_subaccount_data = drift.try_get_account::<User>(&liquidatee);
                 if liquidatee_subaccount_data.is_err() {
                     log::info!(target: TARGET, "liquidatee account not found: {liquidatee:?}");
                     return;
                 }
 
-                let asset_spot_market = self
-                    .drift
+                let asset_spot_market = drift
                     .program_data()
                     .spot_market_config_by_index(asset_market_index)
                     .expect("asset spot market");
 
-                let liability_spot_market = self
-                    .drift
+                let liability_spot_market = drift
                     .program_data()
                     .spot_market_config_by_index(pos.market_index)
                     .expect("liability spot market");
 
                 let in_token_account = drift_rs::Wallet::derive_associated_token_address(
-                    authority,
+                    &authority,
                     &asset_spot_market,
                 );
                 let out_token_account = drift_rs::Wallet::derive_associated_token_address(
-                    authority,
+                    &authority,
                     &liability_spot_market,
                 );
 
-                let jupiter_swap_info = match rt.block_on(self.drift.jupiter_swap_query(
-                    authority,
-                    token_amount,
-                    SwapMode::ExactIn,
-                    100,
-                    asset_market_index,
-                    pos.market_index,
-                    Some(true),
-                    None,
-                    None,
-                )) {
-                    Ok(info) => info,
-                    Err(e) => {
-                        log::warn!(
-                            target: TARGET,
-                            "failed to get jupiter quote for user {:?}, market {}: {:?}",
-                            liquidatee,
-                            pos.market_index,
-                            e
-                        );
-                        return;
-                    }
-                };
+                let drift = drift.clone();
+                let keeper_subaccount = keeper_subaccount.clone();
+                let liability_market_index = pos.market_index;
+                rt.spawn({
+                    let tx_sender = tx_sender.clone();
+                    async move {
+                    let res = drift
+                        .jupiter_swap_query(
+                            &authority,
+                            token_amount,
+                            SwapMode::ExactIn,
+                            100,
+                            asset_market_index,
+                            liability_market_index,
+                            Some(true),
+                            None,
+                            None,
+                        )
+                        .await;
 
-                let tx = TransactionBuilder::new(
-                    self.drift.program_data(),
-                    self.keeper_subaccount,
-                    std::borrow::Cow::Owned(keeper_account_data.unwrap()),
-                    false,
-                )
-                .with_priority_fee(priority_fee, Some(cu_limit))
-                .jupiter_swap_liquidate(
-                    jupiter_swap_info,
-                    &asset_spot_market,
-                    &liability_spot_market,
-                    &in_token_account,
-                    &out_token_account,
-                    asset_market_index,
-                    pos.market_index,
-                    &liquidatee_subaccount_data.unwrap(),
-                )
-                .build();
+                    let jupiter_swap_info = match res {
+                        Ok(info) => info,
+                        Err(e) => {
+                            log::warn!(
+                                target: TARGET,
+                                "failed to get jupiter quote for user {:?}, market {}: {:?}",
+                                liquidatee,
+                                liability_market_index,
+                                e
+                            );
+                            return;
+                        }
+                    };
 
-                log::debug!(target: TARGET, "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}", pos.market_index);
-                tx_sender.send_tx(
-                    tx,
-                    TxIntent::LiquidateSpot {
+                    let tx = TransactionBuilder::new(
+                        drift.program_data(),
+                        keeper_subaccount,
+                        std::borrow::Cow::Owned(keeper_account_data.unwrap()),
+                        false,
+                    )
+                    .with_priority_fee(priority_fee, Some(cu_limit))
+                    .jupiter_swap_liquidate(
+                        jupiter_swap_info,
+                        &asset_spot_market,
+                        &liability_spot_market,
+                        &in_token_account,
+                        &out_token_account,
                         asset_market_index,
-                        liability_market_index: pos.market_index,
-                        liquidatee: *liquidatee,
-                        slot,
-                    },
-                    cu_limit as u64,
-                );
+                        liability_market_index,
+                        &liquidatee_subaccount_data.unwrap(),
+                    )
+                    .build();
+
+                    log::debug!(target: TARGET, "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}", liability_market_index);
+                    tx_sender.send_tx(
+                        tx,
+                        TxIntent::LiquidateSpot {
+                            asset_market_index,
+                            liability_market_index,
+                            liquidatee,
+                            slot,
+                        },
+                        cu_limit as u64,
+                    );
+                }});
             }
         }
+    }
+}
+
+impl LiquidationStrategy for LiquidateWithMatchStrategy {
+    fn liquidate_user(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        liquidatee: &Pubkey,
+        user_account: &User,
+        tx_sender: &TxSender,
+        priority_fee: u64,
+        cu_limit: u32,
+        slot: u64,
+    ) {
+        Self::exec_liq(
+            rt,
+            liquidatee.clone(),
+            user_account.clone(),
+            self.drift.clone(),
+            self.dlob,
+            self.market_state,
+            self.keeper_subaccount,
+            priority_fee,
+            cu_limit,
+            slot,
+            tx_sender.clone(),
+        );
     }
 }
