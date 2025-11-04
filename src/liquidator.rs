@@ -132,8 +132,7 @@ pub struct LiquidatorBot {
 impl LiquidatorBot {
     pub async fn new(config: Config, drift: DriftClient, metrics: Arc<Metrics>) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-
-        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry);
+        let tx_worker = TxWorker::new(drift.clone(), Arc::clone(&metrics), config.dry);
         let rt = tokio::runtime::Handle::current();
         let tx_sender = tx_worker.run(rt);
 
@@ -216,6 +215,7 @@ impl LiquidatorBot {
                 drift: drift.clone(),
                 market_state,
                 keeper_subaccount,
+                metrics: Arc::clone(&metrics),
             }),
             liq_rx,
             std::env::var("FILL_CU_LIMIT")
@@ -727,6 +727,7 @@ pub struct LiquidateWithMatchStrategy {
     pub dlob: &'static DLOB,
     pub market_state: &'static MarketState,
     pub keeper_subaccount: Pubkey,
+    pub metrics: Arc<Metrics>,
 }
 
 impl LiquidationStrategy for LiquidateWithMatchStrategy {
@@ -747,6 +748,11 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             .filter(|p| p.base_asset_amount != 0)
             .max_by_key(|p| p.quote_asset_amount)
         {
+            self.metrics
+                .liquidation_attempts
+                .with_label_values(&["perp"])
+                .inc();
+
             log::info!(target: TARGET, "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}", pos.market_index);
 
             let l3_book = self
@@ -847,6 +853,11 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
 
                 let asset_market_index = asset_market_index.unwrap();
 
+                self.metrics
+                    .liquidation_attempts
+                    .with_label_values(&["spot"])
+                    .inc();
+
                 log::info!(
                     target: TARGET,
                     "attempting spot liquidation: user={:?}, asset_market={}, liability_market={}, amount={}",
@@ -883,6 +894,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     &liability_spot_market,
                 );
 
+                let t0 = std::time::Instant::now();
                 let jupiter_swap_info = match rt.block_on(self.drift.jupiter_swap_query(
                     authority,
                     token_amount,
@@ -894,8 +906,13 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
                     None,
                     None,
                 )) {
-                    Ok(info) => info,
+                    Ok(info) => {
+                        let latency = t0.elapsed().as_millis() as f64;
+                        self.metrics.jupiter_quote_latency.observe(latency);
+                        info
+                    }
                     Err(e) => {
+                        self.metrics.jupiter_quote_failures.inc();
                         log::warn!(
                             target: TARGET,
                             "failed to get jupiter quote for user {:?}, market {}: {:?}",

@@ -1064,6 +1064,16 @@ impl TxWorker {
                                         .with_label_values(&[intent_label, "ok"])
                                         .inc();
                                 }
+
+                                match intent {
+                                    TxIntent::LiquidateWithFill { .. } => {
+                                        metrics.liquidation_success.with_label_values(&["perp"]).inc();
+                                    }
+                                    TxIntent::LiquidateSpot { .. } => {
+                                        metrics.liquidation_success.with_label_values(&["spot"]).inc();
+                                    }
+                                    _ => {}
+                                }
                             }
                             Some(
                                 TransactionError::InsufficientFundsForFee
@@ -1079,7 +1089,7 @@ impl TxWorker {
                                     .inc();
                             }
                             Some(err) => {
-                            log::warn!(target: TARGET, "tx failed: {err:?}");
+                                log::warn!(target: TARGET, "tx failed: {err:?}");
                                 // tx failed with error
                                 metrics
                                     .tx_failed
@@ -1088,6 +1098,15 @@ impl TxWorker {
                                         &format!("{:?}", err),
                                     ])
                                     .inc();
+                                match intent {
+                                    TxIntent::LiquidateWithFill { .. } => {
+                                        metrics.liquidation_failed.with_label_values(&["perp"]).inc();
+                                    }
+                                    TxIntent::LiquidateSpot { .. } => {
+                                        metrics.liquidation_failed.with_label_values(&["spot"]).inc();
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     } else {
