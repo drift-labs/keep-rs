@@ -1031,7 +1031,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             user_account,
             tx_sender,
             priority_fee,
-            cu_limit,
+            400_000,
             slot,
         );
     }
