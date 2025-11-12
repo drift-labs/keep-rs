@@ -751,14 +751,14 @@ impl LiquidateWithMatchStrategy {
 
         let maker_pubkeys: Vec<Pubkey> = if base_asset_amount >= 0 {
             l3_book
-                .asks(Some(oracle_price), 0)
+                .asks(Some(oracle_price), None)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
                 .collect()
         } else {
             l3_book
-                .bids(Some(oracle_price), 0)
+                .bids(Some(oracle_price), None)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)

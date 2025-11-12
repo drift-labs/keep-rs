@@ -1,6 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use drift_rs::{dlob::MakerCrosses, types::MarketId, Pubkey};
+use drift_rs::{
+    dlob::{L3Order, MakerCrosses},
+    types::MarketId,
+    Pubkey,
+};
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
 use pyth_lazer_protocol::{
@@ -166,14 +170,14 @@ impl TxIntent {
         }
     }
 
-    pub fn crosses_and_slot(&self) -> (Vec<(drift_rs::dlob::types::OrderMetadata, u64, u64)>, u64) {
+    pub fn crosses_and_slot(&self) -> (Vec<(L3Order, u64)>, u64) {
         match self {
             TxIntent::None => (vec![], 0),
             TxIntent::AuctionFill { maker_crosses, .. } => (
                 maker_crosses
                     .orders
                     .iter()
-                    .map(|(meta, price, size)| (*meta, *price, *size))
+                    .map(|(order, size)| (order.clone(), *size))
                     .collect(),
                 maker_crosses.slot,
             ),
@@ -181,7 +185,7 @@ impl TxIntent {
                 maker_crosses
                     .orders
                     .iter()
-                    .map(|(meta, price, size)| (*meta, *price, *size))
+                    .map(|(order, size)| (order.clone(), *size))
                     .collect(),
                 maker_crosses.slot,
             ),
