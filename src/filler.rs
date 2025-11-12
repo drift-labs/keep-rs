@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anchor_lang::prelude::*;
+use anchor_lang::Discriminator;
 use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
@@ -228,7 +228,7 @@ impl FillerBot {
                                     }
                                 }
                                 _ => {
-                                    log::warn!("invalid swift order type");
+                                    log::warn!(target: TARGET, "invalid swift order type");
                                     unreachable!();
                                 }
                             };
@@ -249,7 +249,7 @@ impl FillerBot {
                             }
                         }
                         None => {
-                            log::error!("swift order stream finished");
+                            log::error!(target: TARGET, "swift order stream finished");
                             break;
                         }
                     }
@@ -783,7 +783,9 @@ pub async fn setup_grpc(
     slot_rx
 }
 
-pub async fn sync_stats_accounts(drift: &DriftClient) -> Result<()> {
+pub async fn sync_stats_accounts(
+    drift: &DriftClient,
+) -> Result<(), solana_rpc_client_api::client_error::Error> {
     let stats_sync_result = drift
         .rpc()
         .get_program_accounts_with_config(
@@ -812,16 +814,20 @@ pub async fn sync_stats_accounts(drift: &DriftClient) -> Result<()> {
                     slot: 0,
                 });
             }
+            log::info!(target: "dlob", "syncd stats accounts");
+            Ok(())
         }
         Err(err) => {
             log::error!(target: "dlob", "dlob sync error: {err:?}");
+            Err(err)
         }
     }
-    log::info!(target: "dlob", "sync stats accounts");
-    Ok(())
 }
 
-pub async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifier) -> Result<()> {
+pub async fn sync_user_accounts(
+    drift: &DriftClient,
+    dlob_notifier: &DLOBNotifier,
+) -> Result<(), solana_rpc_client_api::client_error::Error> {
     let sync_result = drift
         .rpc()
         .get_program_accounts_with_config(
@@ -855,13 +861,14 @@ pub async fn sync_user_accounts(drift: &DriftClient, dlob_notifier: &DLOBNotifie
                     slot: 0,
                 });
             }
+            log::info!(target: "dlob", "synced initial orders");
+            Ok(())
         }
         Err(err) => {
             log::error!(target: "dlob", "dlob sync error: {err:?}");
+            Err(err)
         }
     }
-    log::info!(target: "dlob", "synced initial orders");
-    Ok(())
 }
 
 async fn subscribe_grpc(

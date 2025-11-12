@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anchor_lang::prelude::*;
+use anchor_lang::Discriminator;
 use drift_rs::jupiter::JupiterSwapApi;
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
@@ -751,14 +751,14 @@ impl LiquidateWithMatchStrategy {
 
         let maker_pubkeys: Vec<Pubkey> = if base_asset_amount >= 0 {
             l3_book
-                .asks(oracle_price)
+                .asks(Some(oracle_price), 0)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
                 .collect()
         } else {
             l3_book
-                .bids(oracle_price)
+                .bids(Some(oracle_price), 0)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
