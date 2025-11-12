@@ -292,6 +292,7 @@ impl FillerBot {
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
                                 pyth_update,
+                                trigger_price,
                                 move |maker_cross| {
                                     perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
                                 },
@@ -482,6 +483,7 @@ async fn try_auction_fill(
     auction_crosses: CrossesAndTopMakers,
     tx_worker_ref: TxSender,
     oracle_update: Option<PythPriceUpdate>,
+    trigger_price: u64,
     is_vamm_inactive: impl Fn(&MakerCrosses) -> bool,
 ) {
     let filler_account_data = drift
@@ -508,9 +510,9 @@ async fn try_auction_fill(
         })
         .collect();
     let mut sent_oracle_update = false;
-    for (taker_order_metadata, crosses) in auction_crosses.crosses {
-        log::info!(target: TARGET, "try fill auction order: {taker_order_metadata:?}");
-        let taker_subaccount = taker_order_metadata.user;
+    for (taker_order, crosses) in auction_crosses.crosses {
+        log::info!(target: TARGET, "try fill auction order: {taker_order:?}");
+        let taker_subaccount = taker_order.user;
 
         let taker_account_data = drift
             .try_get_account::<User>(&taker_subaccount)
@@ -543,20 +545,31 @@ async fn try_auction_fill(
         }
 
         let taker_is_trigger = matches!(
-            taker_order_metadata.kind,
+            taker_order.kind,
             OrderKind::TriggerMarket | OrderKind::TriggerLimit
         );
         if taker_is_trigger {
+            let can_trigger = if taker_order.is_trigger_above() && trigger_price > taker_order.price
+            {
+                true
+            } else if !taker_order.is_trigger_above() && trigger_price < taker_order.price {
+                true
+            } else {
+                false
+            };
+            if !can_trigger {
+                return;
+            }
             log::info!(
                 target: TARGET,
                 "attempting trigger and fill: {:?}/{:?}",
-                taker_order_metadata.order_id,
-                taker_order_metadata.user
+                taker_order.order_id,
+                taker_order.user
             );
             tx_builder = tx_builder.trigger_order(
                 taker_subaccount,
                 &taker_account_data,
-                taker_order_metadata.order_id,
+                taker_order.order_id,
                 (market_index, MarketType::Perp),
             );
         }
@@ -594,7 +607,7 @@ async fn try_auction_fill(
             taker_subaccount,
             &taker_account_data,
             &taker_stats.unwrap(),
-            Some(taker_order_metadata.order_id),
+            Some(taker_order.order_id),
             maker_accounts.as_slice(),
             None,
         );
@@ -614,7 +627,7 @@ async fn try_auction_fill(
         tx_worker_ref.send_tx(
             tx,
             TxIntent::AuctionFill {
-                taker_order_id: taker_order_metadata.order_id,
+                taker_order_id: taker_order.order_id,
                 maker_crosses: crosses,
                 has_trigger: taker_is_trigger,
             },
