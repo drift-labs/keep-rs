@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use drift_rs::{
-    dlob::{L3Order, MakerCrosses},
+    dlob::{MakerCrosses, OrderMetadata},
     types::MarketId,
     Pubkey,
 };
@@ -170,14 +170,14 @@ impl TxIntent {
         }
     }
 
-    pub fn crosses_and_slot(&self) -> (Vec<(L3Order, u64)>, u64) {
+    pub fn crosses_and_slot(&self) -> (Vec<(OrderMetadata, u64)>, u64) {
         match self {
             TxIntent::None => (vec![], 0),
             TxIntent::AuctionFill { maker_crosses, .. } => (
                 maker_crosses
                     .orders
                     .iter()
-                    .map(|(order, size)| (order.clone(), *size))
+                    .map(|(order, _maker_price, fill_size)| (order.clone(), *fill_size))
                     .collect(),
                 maker_crosses.slot,
             ),
@@ -185,7 +185,7 @@ impl TxIntent {
                 maker_crosses
                     .orders
                     .iter()
-                    .map(|(order, size)| (order.clone(), *size))
+                    .map(|(order, _maker_price, fill_size)| (order.clone(), *fill_size))
                     .collect(),
                 maker_crosses.slot,
             ),

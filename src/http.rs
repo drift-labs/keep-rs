@@ -8,7 +8,7 @@ use axum::{
     response::IntoResponse,
 };
 use prometheus::{
-    Encoder, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
+    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
 };
 
 #[derive(Debug)]
@@ -23,8 +23,9 @@ pub struct Metrics {
     pub liquidation_attempts: IntCounterVec,
     pub liquidation_success: IntCounterVec,
     pub liquidation_failed: IntCounterVec,
-    pub jupiter_quote_latency: Histogram,
+    pub swap_quote_latency_ms: IntGauge,
     pub jupiter_quote_failures: IntCounter,
+    pub titan_quote_failures: IntCounter,
     pub confirmation_slots: HistogramVec,
     pub cu_spent: HistogramVec,
     pub registry: Registry,
@@ -121,13 +122,13 @@ impl Metrics {
             .register(Box::new(liquidation_failed.clone()))
             .unwrap();
 
-        let jupiter_quote_latency = Histogram::with_opts(prometheus::HistogramOpts::new(
-            "rfb_jupiter_quote_latency_ms",
-            "Jupiter quote request latency in milliseconds",
-        ))
+        let swap_quote_latency_ms = IntGauge::new(
+            "rfb_swap_quote_latency_ms",
+            "Swap quote request latency in milliseconds",
+        )
         .unwrap();
         registry
-            .register(Box::new(jupiter_quote_latency.clone()))
+            .register(Box::new(swap_quote_latency_ms.clone()))
             .unwrap();
 
         let jupiter_quote_failures = IntCounter::new(
@@ -137,6 +138,15 @@ impl Metrics {
         .unwrap();
         registry
             .register(Box::new(jupiter_quote_failures.clone()))
+            .unwrap();
+
+        let titan_quote_failures = IntCounter::new(
+            "rfb_titan_quote_failures_total",
+            "Number of Titan quote failures",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(titan_quote_failures.clone()))
             .unwrap();
 
         let confirmation_slots = HistogramVec::new(
@@ -167,8 +177,9 @@ impl Metrics {
             liquidation_attempts,
             liquidation_success,
             liquidation_failed,
-            jupiter_quote_latency,
+            swap_quote_latency_ms,
             jupiter_quote_failures,
+            titan_quote_failures,
             confirmation_slots,
             cu_spent,
             registry,

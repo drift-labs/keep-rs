@@ -6,26 +6,27 @@
 //!
 //! The default strategy tries to liquidate perp positions against resting orders
 //!
+use anchor_lang::Discriminator;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anchor_lang::Discriminator;
-use drift_rs::jupiter::JupiterSwapApi;
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
     ffi::{OraclePriceData, SimplifiedMarginCalculation},
     grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
     jupiter::SwapMode,
     priority_fee_subscriber::PriorityFeeSubscriber,
+    titan,
     types::{
         accounts::{PerpMarket, SpotMarket, User},
         MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, SpotBalanceType,
     },
     DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
 };
+use drift_rs::{jupiter::JupiterSwapApi, titan::TitanSwapApi};
 use solana_sdk::{account::Account, clock::Slot, compute_budget::ComputeBudgetInstruction};
 
 use crate::{
@@ -743,22 +744,32 @@ impl LiquidateWithMatchStrategy {
     /// Find top makers for a perp position
     fn find_top_makers(&self, market_index: u16, base_asset_amount: i64) -> Option<Vec<User>> {
         let l3_book = self.dlob.get_l3_snapshot(market_index, MarketType::Perp);
+
+        let market_state = self.market_state.load();
+
+        let perp_market = market_state
+            .perp_markets
+            .get(&market_index)
+            .expect("perp market exists");
+
         let oracle_price = self
             .market_state
             .get_perp_oracle_price(market_index)
             .map(|x| x.price)
             .unwrap_or(0) as u64;
 
+        let vamm_price = perp_market.amm.last_mark_price_twap as u64;
+
         let maker_pubkeys: Vec<Pubkey> = if base_asset_amount >= 0 {
             l3_book
-                .asks(Some(oracle_price), None)
+                .asks(Some(oracle_price), vamm_price)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
                 .collect()
         } else {
             l3_book
-                .bids(Some(oracle_price), None)
+                .bids(Some(oracle_price), vamm_price)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
@@ -952,8 +963,8 @@ impl LiquidateWithMatchStrategy {
                 );
 
                 let t0 = std::time::Instant::now();
-                let res = drift
-                    .jupiter_swap_query(
+                let (jupiter_result, titan_result) = tokio::join!(
+                    drift.jupiter_swap_query(
                         &authority,
                         token_amount,
                         SwapMode::ExactIn,
@@ -963,52 +974,103 @@ impl LiquidateWithMatchStrategy {
                         Some(true),
                         None,
                         None,
+                    ),
+                    drift.titan_swap_query(
+                        &authority,
+                        token_amount,
+                        Some(50),
+                        titan::SwapMode::ExactIn,
+                        100,
+                        asset_market_index,
+                        liability_market_index,
+                        Some(true),
+                        None,
+                        None,
                     )
-                    .await;
+                );
 
-                let jupiter_swap_info = match res {
-                    Ok(info) => {
-                        let latency = t0.elapsed().as_millis() as f64;
-                        metrics.jupiter_quote_latency.observe(latency);
-                        info
-                    }
-                    Err(e) => {
-                        metrics.jupiter_quote_failures.inc();
-                        log::warn!(
+                let quote_latency_ms = t0.elapsed().as_millis() as i64;
+                metrics.swap_quote_latency_ms.set(quote_latency_ms);
+
+                if jupiter_result.is_err() && titan_result.is_err() {
+                    metrics.jupiter_quote_failures.inc();
+                    metrics.titan_quote_failures.inc();
+                    log::warn!(target: TARGET, "both quotes failed after {}ms", quote_latency_ms);
+                    return;
+                }
+
+                let use_titan = match (&jupiter_result, &titan_result) {
+                    (Ok(jup), Ok(titan)) => {
+                        let use_titan = titan.quote.out_amount > jup.quote.out_amount;
+                        log::debug!(
                             target: TARGET,
-                            "failed to get jupiter quote for user {:?}, market {}: {:?}",
-                            liquidatee,
-                            liability_market_index,
-                            e
+                            "got quotes in {}ms - jup: {}, titan: {} - using {}",
+                            quote_latency_ms,
+                            jup.quote.out_amount,
+                            titan.quote.out_amount,
+                            if use_titan { "titan" } else { "jupiter" }
                         );
-                        return;
+                        use_titan
                     }
+                    (Ok(_), Err(e)) => {
+                        metrics.titan_quote_failures.inc();
+                        log::debug!(target: TARGET, "titan failed in {}ms, using jupiter: {:?}", quote_latency_ms, e);
+                        false
+                    }
+                    (Err(e), Ok(_)) => {
+                        metrics.jupiter_quote_failures.inc();
+                        log::debug!(target: TARGET, "jupiter failed in {}ms, using titan: {:?}", quote_latency_ms, e);
+                        true
+                    }
+                    _ => unreachable!(),
                 };
 
-                let tx = TransactionBuilder::new(
-                    drift.program_data(),
-                    keeper_subaccount,
-                    std::borrow::Cow::Owned(keeper_account_data),
-                    false,
-                )
-                .with_priority_fee(priority_fee, Some(cu_limit))
-                .jupiter_swap_liquidate(
-                    jupiter_swap_info,
-                    &asset_spot_market,
-                    &liability_spot_market,
-                    &in_token_account,
-                    &out_token_account,
-                    asset_market_index,
-                    liability_market_index,
-                    &liquidatee_account_data,
-                )
-                .build();
-
+                let tx = if use_titan {
+                    TransactionBuilder::new(
+                        drift.program_data(),
+                        keeper_subaccount,
+                        std::borrow::Cow::Owned(keeper_account_data),
+                        false,
+                    )
+                    .with_priority_fee(priority_fee, Some(cu_limit))
+                    .titan_swap_liquidate(
+                        titan_result.unwrap(),
+                        &asset_spot_market,
+                        &liability_spot_market,
+                        &in_token_account,
+                        &out_token_account,
+                        asset_market_index,
+                        liability_market_index,
+                        &liquidatee_account_data,
+                    )
+                    .build()
+                } else {
+                    TransactionBuilder::new(
+                        drift.program_data(),
+                        keeper_subaccount,
+                        std::borrow::Cow::Owned(keeper_account_data),
+                        false,
+                    )
+                    .with_priority_fee(priority_fee, Some(cu_limit))
+                    .jupiter_swap_liquidate(
+                        jupiter_result.unwrap(),
+                        &asset_spot_market,
+                        &liability_spot_market,
+                        &in_token_account,
+                        &out_token_account,
+                        asset_market_index,
+                        liability_market_index,
+                        &liquidatee_account_data,
+                    )
+                    .build()
+                };
+                
                 log::debug!(
                     target: TARGET,
                     "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
                     liability_market_index
                 );
+                
                 tx_sender.send_tx(
                     tx,
                     TxIntent::LiquidateSpot {
