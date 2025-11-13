@@ -1064,13 +1064,11 @@ impl LiquidateWithMatchStrategy {
                     )
                     .build()
                 };
-                
                 log::debug!(
                     target: TARGET,
                     "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
                     liability_market_index
                 );
-                
                 tx_sender.send_tx(
                     tx,
                     TxIntent::LiquidateSpot {
