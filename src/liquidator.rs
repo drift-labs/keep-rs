@@ -18,11 +18,13 @@ use drift_rs::{
     ffi::{OraclePriceData, SimplifiedMarginCalculation},
     grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
     jupiter::SwapMode,
+    market_state::MarketStateData,
     priority_fee_subscriber::PriorityFeeSubscriber,
     titan,
     types::{
         accounts::{PerpMarket, SpotMarket, User},
-        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, SpotBalanceType,
+        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, Order,
+        PerpPosition, SpotBalanceType, SpotPosition,
     },
     DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
 };
@@ -184,7 +186,8 @@ impl LiquidatorBot {
         log::info!(target: TARGET, "subscribed gRPC");
 
         // populate market data
-        let market_state: &'static MarketState = Box::leak(Box::new(MarketState::new()));
+        let mut market_state = MarketStateData::default();
+
         for market in drift.program_data().perp_market_configs() {
             market_state.set_perp_market(*market);
             if let Some(oracle) = drift
@@ -205,6 +208,8 @@ impl LiquidatorBot {
                 market_state.set_spot_oracle_price(market.market_index, oracle.data);
             }
         }
+        let market_state: &'static MarketState =
+            Box::leak(Box::new(MarketState::new(market_state)));
 
         // start liquidation worker
         let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64)>(1024);
@@ -291,12 +296,12 @@ impl LiquidatorBot {
         log::info!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
 
         // main loop
-        let mut event_buffer = Vec::<GrpcEvent>::with_capacity(32);
+        let mut event_buffer = Vec::<GrpcEvent>::with_capacity(64);
         let mut oracle_update;
 
         loop {
             oracle_update = false;
-            let n_read = events_rx.recv_many(&mut event_buffer, 32).await;
+            let n_read = events_rx.recv_many(&mut event_buffer, 64).await;
             log::trace!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
             for event in event_buffer.drain(..) {
                 match event {
@@ -327,6 +332,91 @@ impl LiquidatorBot {
                             match check_margin_status(&margin_info) {
                                 MarginStatus::Liquidatable => {
                                     log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+
+                                    // Collect spot market IDs from open spot positions
+                                    let mut spot_market_ids: HashSet<u16> = user
+                                        .spot_positions
+                                        .iter()
+                                        .filter(|p| !p.is_available())
+                                        .map(|p| p.market_index)
+                                        .collect();
+
+                                    // Collect perp market IDs from open perp positions
+                                    let mut perp_market_ids: HashSet<u16> = user
+                                        .perp_positions
+                                        .iter()
+                                        .filter(|p| !p.is_available())
+                                        .map(|p| p.market_index)
+                                        .collect();
+
+                                    // Add market IDs from orders to the same sets
+                                    for order in
+                                        user.orders.iter().filter(|o| o.base_asset_amount != 0)
+                                    {
+                                        match order.market_type {
+                                            MarketType::Spot => {
+                                                spot_market_ids.insert(order.market_index);
+                                            }
+                                            MarketType::Perp => {
+                                                perp_market_ids.insert(order.market_index);
+                                            }
+                                        }
+                                    }
+
+                                    // Log market IDs
+                                    log::info!(
+                                        target: TARGET,
+                                        "user {:?} (sub: {}) spot positions: {:?}, perp positions: {:?}",
+                                        user.authority,
+                                        user.sub_account_id,
+                                        spot_market_ids,
+                                        perp_market_ids
+                                    );
+
+                                    // Log oracle prices for spot markets
+                                    for market_index in &spot_market_ids {
+                                        if let Some(oracle_price) =
+                                            self.market_state.get_spot_oracle_price(*market_index)
+                                        {
+                                            log::info!(
+                                                target: TARGET,
+                                                "spot market {} oracle price: {} (confidence: {}, delay: {})",
+                                                market_index,
+                                                oracle_price.price,
+                                                oracle_price.confidence,
+                                                oracle_price.delay
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                target: TARGET,
+                                                "spot market {} oracle price not available",
+                                                market_index
+                                            );
+                                        }
+                                    }
+
+                                    // Log oracle prices for perp markets
+                                    for market_index in &perp_market_ids {
+                                        if let Some(oracle_price) =
+                                            self.market_state.get_perp_oracle_price(*market_index)
+                                        {
+                                            log::info!(
+                                                target: TARGET,
+                                                "perp market {} oracle price: {} (confidence: {}, delay: {})",
+                                                market_index,
+                                                oracle_price.price,
+                                                oracle_price.confidence,
+                                                oracle_price.delay
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                target: TARGET,
+                                                "perp market {} oracle price not available",
+                                                market_index
+                                            );
+                                        }
+                                    }
+
                                     high_risk.insert(pubkey);
                                     self.liq_tx
                                         .send((pubkey, user.clone(), current_slot))
@@ -744,8 +834,6 @@ impl LiquidateWithMatchStrategy {
     /// Find top makers for a perp position
     fn find_top_makers(&self, market_index: u16, base_asset_amount: i64) -> Option<Vec<User>> {
         let l3_book = self.dlob.get_l3_snapshot(market_index, MarketType::Perp);
-
-        let market_state = self.market_state.load();
 
         let oracle_price = self
             .market_state
