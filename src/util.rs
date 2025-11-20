@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use drift_rs::{
-    dlob::{MakerCrosses, OrderMetadata},
+    dlob::{L3Order, MakerCrosses, OrderMetadata},
     types::MarketId,
     Pubkey,
 };
@@ -170,25 +170,15 @@ impl TxIntent {
         }
     }
 
-    pub fn crosses_and_slot(&self) -> (Vec<(OrderMetadata, u64)>, u64) {
+    pub fn crosses_and_slot(&self) -> (Vec<(L3Order, u64)>, u64) {
         match self {
             TxIntent::None => (vec![], 0),
-            TxIntent::AuctionFill { maker_crosses, .. } => (
-                maker_crosses
-                    .orders
-                    .iter()
-                    .map(|(order, _maker_price, fill_size)| (order.clone(), *fill_size))
-                    .collect(),
-                maker_crosses.slot,
-            ),
-            TxIntent::SwiftFill { maker_crosses, .. } => (
-                maker_crosses
-                    .orders
-                    .iter()
-                    .map(|(order, _maker_price, fill_size)| (order.clone(), *fill_size))
-                    .collect(),
-                maker_crosses.slot,
-            ),
+            TxIntent::AuctionFill { maker_crosses, .. } => {
+                (maker_crosses.orders.to_vec(), maker_crosses.slot)
+            }
+            TxIntent::SwiftFill { maker_crosses, .. } => {
+                (maker_crosses.orders.to_vec(), maker_crosses.slot)
+            }
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),
             Self::LiquidateWithFill { slot, .. } => (vec![], *slot),

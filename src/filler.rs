@@ -234,7 +234,7 @@ impl FillerBot {
                                 }
                             };
                             let taker_order = TakerOrder::from_order_params(order_params, price);
-                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(vamm_price));
+                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(&perp_market), None);
                             if !crosses.is_empty() {
                                 log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
                                 let pf = priority_fee_subscriber.priority_fee_nth(0.6);
@@ -279,7 +279,7 @@ impl FillerBot {
                             }
                         }
 
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, trigger_price, Some(&perp_market));
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), None);
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if !crosses_and_top_makers.crosses.is_empty() {
@@ -302,7 +302,7 @@ impl FillerBot {
 
                         // ghetto rate limit
                         if slot % 2 == 0 {
-                            if let Some(crosses) = dlob.find_crossing_region(slot + 1, oracle_price, market_index, MarketType::Perp) {
+                            if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
                                 log::info!(target: TARGET, "found limit crosses (market: {market_index})");
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
@@ -426,7 +426,7 @@ async fn try_swift_fill(
         .orders
         .iter()
         .filter(|m| m.0.user != taker_subaccount) // can't fill itself
-        .map(|(m, _maker_price, _fill_size)| {
+        .map(|(m, _fill_size)| {
             drift
                 .try_get_account::<User>(&m.user)
                 .expect("maker account syncd")
@@ -573,7 +573,8 @@ async fn try_auction_fill(
             }
             log::info!(
                 target: TARGET,
-                "attempting trigger and fill: {:?}/{:?}",
+                "attempting trigger and fill: trigger_price={trigger_price}, order_price={}, {:?}/{:?}",
+                actual_order.trigger_price,
                 taker_order.order_id,
                 taker_order.user
             );
@@ -589,7 +590,7 @@ async fn try_auction_fill(
             .orders
             .iter()
             .filter(|m| m.0.user != taker_subaccount) // can't fill itself
-            .map(|(m, _maker_price, _fill_size)| {
+            .map(|(m, _fill_size)| {
                 drift
                     .try_get_account::<User>(&m.user)
                     .expect("maker account syncd")
@@ -679,8 +680,8 @@ fn try_uncross(
         .iter()
         .take(5)
         .filter_map(|x| {
-            let maker = x.metadata.user;
-            if maker != best_bid.metadata.user {
+            let maker = x.user;
+            if maker != best_bid.user {
                 drift.try_get_account::<User>(&maker).ok()
             } else {
                 None
@@ -693,8 +694,8 @@ fn try_uncross(
         .iter()
         .take(5)
         .filter_map(|x| {
-            let maker = x.metadata.user;
-            if maker != best_ask.metadata.user {
+            let maker = x.user;
+            if maker != best_ask.user {
                 drift.try_get_account::<User>(&maker).ok()
             } else {
                 None
@@ -712,12 +713,12 @@ fn try_uncross(
 
     // try valid combinations of taker/maker with all crossing asks/bids
     for (taker_order, makers) in [(best_ask, maker_bids), (best_bid, maker_asks)] {
-        if taker_order.order_view.post_only {
+        if taker_order.is_post_only() {
             continue;
         }
 
-        let taker_order_id = taker_order.metadata.order_id;
-        let taker_subaccount = taker_order.metadata.user;
+        let taker_order_id = taker_order.order_id;
+        let taker_subaccount = taker_order.user;
         let taker_account_data = drift
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");

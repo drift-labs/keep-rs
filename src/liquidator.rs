@@ -747,29 +747,23 @@ impl LiquidateWithMatchStrategy {
 
         let market_state = self.market_state.load();
 
-        let perp_market = market_state
-            .perp_markets
-            .get(&market_index)
-            .expect("perp market exists");
-
         let oracle_price = self
             .market_state
             .get_perp_oracle_price(market_index)
             .map(|x| x.price)
             .unwrap_or(0) as u64;
 
-        let vamm_price = perp_market.amm.last_mark_price_twap as u64;
-
         let maker_pubkeys: Vec<Pubkey> = if base_asset_amount >= 0 {
+            // only want maker orders so don't pass vamm or trigger price
             l3_book
-                .asks(Some(oracle_price), vamm_price)
+                .asks(Some(oracle_price), None, None)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
                 .collect()
         } else {
             l3_book
-                .bids(Some(oracle_price), vamm_price)
+                .bids(Some(oracle_price), None, None)
                 .filter(|o| o.is_maker())
                 .map(|m| m.user)
                 .take(3)
