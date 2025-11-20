@@ -333,6 +333,87 @@ impl LiquidatorBot {
                                 MarginStatus::Liquidatable => {
                                     log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
 
+                                    high_risk.insert(pubkey);
+                                    self.liq_tx
+                                        .send((pubkey, user.clone(), current_slot))
+                                        .expect("liq sent");
+                                }
+                                MarginStatus::HighRisk => {
+                                    high_risk.insert(pubkey);
+                                }
+                                MarginStatus::Safe => {
+                                    high_risk.remove(&pubkey);
+                                }
+                            }
+                        }
+                    }
+                    GrpcEvent::OracleUpdate {
+                        oracle_price_data,
+                        market,
+                        slot,
+                    } => {
+                        current_slot = current_slot.max(slot);
+                        let is_perp_update = market.is_perp();
+                        if is_perp_update {
+                            self.market_state
+                                .set_perp_oracle_price(market.index(), oracle_price_data);
+                        } else {
+                            self.market_state
+                                .set_spot_oracle_price(market.index(), oracle_price_data);
+                        }
+                        oracle_update = true;
+                    }
+                    GrpcEvent::PerpMarketUpdate { market, slot } => {
+                        current_slot = current_slot.max(slot);
+                        if let Some(existing) = self
+                            .market_state
+                            .load()
+                            .perp_oracle_prices
+                            .get(&market.market_index)
+                        {
+                            if existing
+                                .sequence_id
+                                .is_some_and(|s| s < market.amm.mm_oracle_sequence_id)
+                                && market.amm.mm_oracle_price > 0
+                            {
+                                self.market_state.set_perp_oracle_price(
+                                    market.market_index,
+                                    OraclePriceData {
+                                        price: market.amm.mm_oracle_price,
+                                        confidence: 1,
+                                        delay: 0,
+                                        has_sufficient_number_of_data_points: true,
+                                        sequence_id: Some(market.amm.mm_oracle_sequence_id),
+                                    },
+                                );
+                                oracle_update = true;
+                            }
+                        }
+                    }
+                    GrpcEvent::SpotMarketUpdate { market, slot } => {
+                        current_slot = current_slot.max(slot);
+                        self.market_state.set_spot_market(market);
+                    }
+                }
+            }
+
+            // Only recheck margin for high-risk users on oracle price updates
+            if oracle_update {
+                let t0 = current_time_millis();
+                high_risk.retain(|pubkey| {
+                    if let Some(user) = users.get(pubkey) {
+                        let margin_info = self
+                            .market_state
+                            .calculate_simplified_margin_requirement(
+                                user,
+                                MarginRequirementType::Maintenance,
+                                Some(liquidation_margin_buffer_ratio),
+                            )
+                            .unwrap();
+
+                        match check_margin_status(&margin_info) {
+                            MarginStatus::Liquidatable => {
+                                log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                     // Collect spot market IDs from open spot positions
                                     let mut spot_market_ids: HashSet<u16> = user
                                         .spot_positions
@@ -417,87 +498,6 @@ impl LiquidatorBot {
                                         }
                                     }
 
-                                    high_risk.insert(pubkey);
-                                    self.liq_tx
-                                        .send((pubkey, user.clone(), current_slot))
-                                        .expect("liq sent");
-                                }
-                                MarginStatus::HighRisk => {
-                                    high_risk.insert(pubkey);
-                                }
-                                MarginStatus::Safe => {
-                                    high_risk.remove(&pubkey);
-                                }
-                            }
-                        }
-                    }
-                    GrpcEvent::OracleUpdate {
-                        oracle_price_data,
-                        market,
-                        slot,
-                    } => {
-                        current_slot = current_slot.max(slot);
-                        let is_perp_update = market.is_perp();
-                        if is_perp_update {
-                            self.market_state
-                                .set_perp_oracle_price(market.index(), oracle_price_data);
-                        } else {
-                            self.market_state
-                                .set_spot_oracle_price(market.index(), oracle_price_data);
-                        }
-                        oracle_update = true;
-                    }
-                    GrpcEvent::PerpMarketUpdate { market, slot } => {
-                        current_slot = current_slot.max(slot);
-                        if let Some(existing) = self
-                            .market_state
-                            .load()
-                            .perp_oracle_prices
-                            .get(&market.market_index)
-                        {
-                            if existing
-                                .sequence_id
-                                .is_some_and(|s| s < market.amm.mm_oracle_sequence_id)
-                                && market.amm.mm_oracle_price > 0
-                            {
-                                self.market_state.set_perp_oracle_price(
-                                    market.market_index,
-                                    OraclePriceData {
-                                        price: market.amm.mm_oracle_price,
-                                        confidence: 1,
-                                        delay: 0,
-                                        has_sufficient_number_of_data_points: true,
-                                        sequence_id: Some(market.amm.mm_oracle_sequence_id),
-                                    },
-                                );
-                                oracle_update = true;
-                            }
-                        }
-                    }
-                    GrpcEvent::SpotMarketUpdate { market, slot } => {
-                        current_slot = current_slot.max(slot);
-                        self.market_state.set_spot_market(market);
-                    }
-                }
-            }
-
-            // Only recheck margin for high-risk users on oracle price updates
-            if oracle_update {
-                let t0 = current_time_millis();
-                high_risk.retain(|pubkey| {
-                    if let Some(user) = users.get(pubkey) {
-                        let margin_info = self
-                            .market_state
-                            .calculate_simplified_margin_requirement(
-                                user,
-                                MarginRequirementType::Maintenance,
-                                Some(liquidation_margin_buffer_ratio),
-                            )
-                            .unwrap();
-
-                        match check_margin_status(&margin_info) {
-                            MarginStatus::Liquidatable => {
-                                log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                 self.liq_tx
                                     .try_send((*pubkey, user.clone(), current_slot))
                                     .expect("liq sent");
