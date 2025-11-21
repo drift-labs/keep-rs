@@ -1013,7 +1013,7 @@ impl TxWorker {
                 .await
             {
                 Ok(sig) => {
-                    log::info!(target: TARGET, "sent fill ⚡️: {sig:?}");
+                    log::info!(target: TARGET, "{intent_label} txn sent ⚡️: {sig:?}");
                     let mut pending = pending_txs.write().await;
                     pending.insert(PendingTxMeta::new(sig, intent, cu_limit));
                 }
