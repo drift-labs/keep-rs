@@ -447,11 +447,12 @@ impl LiquidatorBot {
                                     // Log market IDs
                                     log::info!(
                                         target: TARGET,
-                                        "user {:?} (sub: {}) spot positions: {:?}, perp positions: {:?}",
+                                        "user {:?} (sub: {}) spot positions: {:?}, perp positions: {:?}, orders: {:?}",
                                         user.authority,
                                         user.sub_account_id,
-                                        spot_market_ids,
-                                        perp_market_ids
+                                        user.spot_positions.iter().filter(|p| spot_market_ids.contains(&p.market_index)).collect::<Vec<&SpotPosition>>(),
+                                        user.perp_positions.iter().filter(|p| perp_market_ids.contains(&p.market_index)).collect::<Vec<&PerpPosition>>(),
+                                        user.orders.iter().filter(|o| o.base_asset_amount != 0).collect::<Vec<&Order>>(),
                                     );
 
                                     // Log oracle prices for spot markets
