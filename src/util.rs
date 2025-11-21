@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use drift_rs::{
-    dlob::{L3Order, MakerCrosses, OrderMetadata},
+    dlob::{L3Order, MakerCrosses},
     types::MarketId,
     Pubkey,
 };

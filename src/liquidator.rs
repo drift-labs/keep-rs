@@ -39,7 +39,7 @@ use crate::{
 };
 
 /// min slots between successive liquidation attempts on same user
-const LIQUIDATION_SLOT_RATE_LIMIT: u64 = 5;
+const LIQUIDATION_SLOT_RATE_LIMIT: u64 = 20; // ~8s
 
 const TARGET: &str = "liquidator";
 
