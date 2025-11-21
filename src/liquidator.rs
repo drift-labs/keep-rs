@@ -67,7 +67,11 @@ fn current_time_millis() -> u64 {
 
 /// Check margin status (liquidatable, high-risk, or safe)
 fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatus {
-    if margin_info.total_collateral < margin_info.margin_requirement as i128 {
+    const LIQUIDATION_BUFFER: f64 = 1.02;
+
+    let buffered_margin_req = (margin_info.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
+
+    if margin_info.total_collateral < buffered_margin_req {
         return MarginStatus::Liquidatable;
     }
 
