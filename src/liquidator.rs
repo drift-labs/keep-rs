@@ -864,7 +864,6 @@ fn spawn_liquidation_worker(
                 // Wrap liquidation in a timeout to enforce deadline
                 let result = tokio::time::timeout(deadline, async {
                     // Run liquidation in blocking task since strategy is synchronous
-                    tokio::task::spawn_blocking(move || {
                         strategy_clone.liquidate_user(
                             rt_clone,
                             &liquidatee_clone,
@@ -874,14 +873,12 @@ fn spawn_liquidation_worker(
                             cu_limit,
                             slot,
                         );
-                    })
-                    .await
                 })
                 .await;
 
                 let elapsed = start.elapsed();
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(()) => {
                         if elapsed.as_millis() > LIQUIDATION_DEADLINE_MS as u128 {
                             log::warn!(
                                 target: TARGET,
@@ -898,14 +895,6 @@ fn spawn_liquidation_worker(
                                 elapsed.as_millis()
                             );
                         }
-                    }
-                    Ok(Err(e)) => {
-                        log::warn!(
-                            target: TARGET,
-                            "liquidation task error for {:?}: {:?}",
-                            liquidatee_clone,
-                            e
-                        );
                     }
                     Err(_) => {
                         // Timeout - liquidation exceeded deadline
