@@ -1,15 +1,18 @@
 //! Rust Keeper Bot
 use std::sync::Arc;
 
+pub mod exchange_connectors;
 mod filler;
 mod http;
 mod liquidator;
+mod mm_oracle_cranker;
 mod util;
 
 use crate::{
     filler::FillerBot,
     http::{health_handler, metrics_handler, Metrics},
     liquidator::LiquidatorBot,
+    mm_oracle_cranker::MmOracleCrankerBot,
 };
 use clap::Parser;
 
@@ -25,6 +28,9 @@ pub struct Config {
     /// minimum collateral threshold for liquidatable accounts
     #[clap(long, default_value = "1000000")]
     pub min_collateral: u64,
+    /// Run perp liquidator bot
+    #[clap(long, default_value = "false")]
+    pub mm_oracle_cranker: bool,
     /// Run perp liquidator bot
     #[clap(long, default_value = "false")]
     pub liquidator: bool,
@@ -50,6 +56,12 @@ pub struct Config {
     pub dry: bool,
     #[clap(long, default_value = "0")]
     pub sub_account_id: u16,
+    /// Comma-separated Binance symbols to subscribe (lowercase)
+    #[clap(long, env = "BINANCE_SYMBOLS", default_value = "btcusdt,ethusdt")]
+    pub binance_symbols: String,
+    /// Comma-separated Coinbase symbols to subscribe
+    #[clap(long, env = "COINBASE_SYMBOLS", default_value = "USDT-USD")]
+    pub coinbase_symbols: String,
 }
 
 enum UseMarkets {
@@ -75,8 +87,9 @@ impl Config {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = dotenv::dotenv();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = Config::parse();
     let metrics = Arc::new(Metrics::new());
@@ -140,6 +153,9 @@ async fn main() {
 
     if config.liquidator {
         let bot = LiquidatorBot::new(config, drift, metrics).await;
+        bot.run().await;
+    } else if config.mm_oracle_cranker {
+        let bot = MmOracleCrankerBot::new(config, drift).await;
         bot.run().await;
     } else if config.filler {
         let bot = FillerBot::new(config, drift, metrics).await;
