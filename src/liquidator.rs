@@ -41,6 +41,12 @@ use crate::{
 /// min slots between successive liquidation attempts on same user
 const LIQUIDATION_SLOT_RATE_LIMIT: u64 = 20; // ~8s
 
+/// Maximum time allowed for a liquidation attempt in milliseconds
+const LIQUIDATION_DEADLINE_MS: u64 = 1_000;
+
+/// Maximum age for liquidation entries in milliseconds
+const MAX_LIQUIDATION_AGE_MS: u64 = 1_000;
+
 const TARGET: &str = "liquidator";
 
 /// Threshold for considering a user high-risk: free margin < 20% of margin requirement
@@ -132,8 +138,8 @@ pub struct LiquidatorBot {
     market_state: &'static MarketState,
     /// receives new updates from grpc
     events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
-    /// sends liquidatable accounts to work thread
-    liq_tx: crossbeam::channel::Sender<(Pubkey, User, u64)>,
+    /// sends liquidatable accounts to work thread (pubkey, user, slot, timestamp_ms)
+    liq_tx: crossbeam::channel::Sender<(Pubkey, User, u64, u64)>,
 }
 
 impl LiquidatorBot {
@@ -216,7 +222,7 @@ impl LiquidatorBot {
             Box::leak(Box::new(MarketState::new(market_state)));
 
         // start liquidation worker
-        let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64)>(1024);
+        let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64, u64)>(1024);
         spawn_liquidation_worker(
             tokio::runtime::Handle::current(),
             tx_sender.clone(),
@@ -344,7 +350,12 @@ impl LiquidatorBot {
                                         log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                         high_risk.insert(pubkey);
                                         self.liq_tx
-                                            .send((pubkey, user.clone(), current_slot))
+                                            .send((
+                                                pubkey,
+                                                user.clone(),
+                                                current_slot,
+                                                current_time_millis(),
+                                            ))
                                             .expect("liq sent");
                                     }
                                     MarginStatus::HighRisk => {
@@ -492,7 +503,7 @@ impl LiquidatorBot {
                                     }
 
                                 self.liq_tx
-                                    .try_send((*pubkey, user.clone(), current_slot))
+                                    .try_send((*pubkey, user.clone(), current_slot, current_time_millis()))
                                     .expect("liq sent");
                                 true
                             }
@@ -538,7 +549,12 @@ impl LiquidatorBot {
                             newly_high_risk += 1;
                             log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                             self.liq_tx
-                                .try_send((*pubkey, user.clone(), current_slot))
+                                .try_send((
+                                    *pubkey,
+                                    user.clone(),
+                                    current_slot,
+                                    current_time_millis(),
+                                ))
                                 .expect("liq sent");
                         }
                         MarginStatus::HighRisk => {
@@ -782,13 +798,45 @@ fn spawn_liquidation_worker(
     rt: tokio::runtime::Handle,
     tx_sender: TxSender,
     strategy: Arc<dyn LiquidationStrategy + Send + Sync>,
-    liq_rx: crossbeam::channel::Receiver<(Pubkey, User, u64)>,
+    liq_rx: crossbeam::channel::Receiver<(Pubkey, User, u64, u64)>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut rate_limit = HashMap::<Pubkey, u64>::new();
-        while let Ok((liquidatee, user_account, slot)) = liq_rx.recv() {
+        let mut cleanup_counter = 0u64;
+        const CLEANUP_INTERVAL: u64 = 1000; // Clean up every 1000 liquidations
+
+        loop {
+            // Receive liquidation request with timestamp
+            let (liquidatee, user_account, slot, ts) = match liq_rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => {
+                    log::info!(target: TARGET, "liquidation channel closed, worker exiting");
+                    break;
+                }
+            };
+
+            // Drop entries older than 1 second to handle backpressure
+            let now = current_time_millis();
+            if now.saturating_sub(ts) > MAX_LIQUIDATION_AGE_MS {
+                log::debug!(
+                    target: TARGET,
+                    "dropping stale liquidation for {:?} (age: {}ms)",
+                    liquidatee,
+                    now.saturating_sub(ts)
+                );
+                continue;
+            }
+
+            // Periodic cleanup of old rate limit entries to prevent unbounded growth
+            cleanup_counter += 1;
+            if cleanup_counter >= CLEANUP_INTERVAL {
+                let cutoff_slot = slot.saturating_sub(LIQUIDATION_SLOT_RATE_LIMIT * 10);
+                rate_limit.retain(|_, &mut last_slot| last_slot >= cutoff_slot);
+                cleanup_counter = 0;
+            }
+
             if rate_limit
                 .get(&liquidatee)
                 .is_some_and(|last| slot.saturating_sub(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
@@ -800,15 +848,76 @@ fn spawn_liquidation_worker(
             }
 
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
-            strategy.liquidate_user(
-                rt.clone(),
-                &liquidatee,
-                &user_account,
-                &tx_sender,
-                pf,
-                cu_limit,
-                slot,
-            );
+
+            // Spawn each liquidation as a separate async task with 100ms deadline
+            // This prevents one slow liquidation from blocking others and causing backups
+            let strategy_clone = Arc::clone(&strategy);
+            let liquidatee_clone = liquidatee;
+            let user_account_clone = user_account.clone();
+            let tx_sender_clone = tx_sender.clone();
+            let rt_clone = rt.clone();
+
+            rt.spawn(async move {
+                let deadline = std::time::Duration::from_millis(LIQUIDATION_DEADLINE_MS);
+                let start = std::time::Instant::now();
+
+                // Wrap liquidation in a timeout to enforce deadline
+                let result = tokio::time::timeout(deadline, async {
+                    // Run liquidation in blocking task since strategy is synchronous
+                    tokio::task::spawn_blocking(move || {
+                        strategy_clone.liquidate_user(
+                            rt_clone,
+                            &liquidatee_clone,
+                            &user_account_clone,
+                            &tx_sender_clone,
+                            pf,
+                            cu_limit,
+                            slot,
+                        );
+                    })
+                    .await
+                })
+                .await;
+
+                let elapsed = start.elapsed();
+                match result {
+                    Ok(Ok(())) => {
+                        if elapsed.as_millis() > LIQUIDATION_DEADLINE_MS as u128 {
+                            log::warn!(
+                                target: TARGET,
+                                "liquidation for {:?} took {}ms (exceeded {}ms deadline but completed)",
+                                liquidatee_clone,
+                                elapsed.as_millis(),
+                                LIQUIDATION_DEADLINE_MS
+                            );
+                        } else {
+                            log::trace!(
+                                target: TARGET,
+                                "liquidation for {:?} completed in {}ms",
+                                liquidatee_clone,
+                                elapsed.as_millis()
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            target: TARGET,
+                            "liquidation task error for {:?}: {:?}",
+                            liquidatee_clone,
+                            e
+                        );
+                    }
+                    Err(_) => {
+                        // Timeout - liquidation exceeded deadline
+                        log::warn!(
+                            target: TARGET,
+                            "liquidation for {:?} exceeded {}ms deadline, cancelled",
+                            liquidatee_clone,
+                            LIQUIDATION_DEADLINE_MS
+                        );
+                    }
+                }
+            });
         }
     })
 }
