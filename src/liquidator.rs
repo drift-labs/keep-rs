@@ -7,6 +7,7 @@
 //! The default strategy tries to liquidate perp positions against resting orders
 //!
 use anchor_lang::Discriminator;
+use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -47,6 +48,9 @@ const LIQUIDATION_DEADLINE_MS: u64 = 1_000;
 /// Maximum age for liquidation entries in milliseconds
 const MAX_LIQUIDATION_AGE_MS: u64 = 1_000;
 
+/// Maximum concurrent liquidation tasks to prevent system overload
+const MAX_CONCURRENT_LIQUIDATIONS: usize = 20;
+
 const TARGET: &str = "liquidator";
 
 /// Threshold for considering a user high-risk: free margin < 20% of margin requirement
@@ -73,7 +77,7 @@ fn current_time_millis() -> u64 {
 
 /// Check margin status (liquidatable, high-risk, or safe)
 fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatus {
-    const LIQUIDATION_BUFFER: f64 = 1.02;
+    const LIQUIDATION_BUFFER: f64 = 0.99;
 
     let buffered_margin_req = (margin_info.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
 
@@ -97,16 +101,15 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatu
 /// Trait for pluggable liquidation strategies
 pub trait LiquidationStrategy {
     /// Execute liquidation logic a user, including selecting makers and sending txs.
-    fn liquidate_user(
-        &self,
-        rt: tokio::runtime::Handle,
-        liquidatee: &Pubkey,
-        user_account: &User,
-        tx_sender: &TxSender,
+    fn liquidate_user<'a>(
+        &'a self,
+        liquidatee: Pubkey,
+        user_account: Arc<User>,
+        tx_sender: TxSender,
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
-    );
+    ) -> futures_util::future::BoxFuture<'a, ()>;
 }
 
 pub enum GrpcEvent {
@@ -139,7 +142,7 @@ pub struct LiquidatorBot {
     /// receives new updates from grpc
     events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
     /// sends liquidatable accounts to work thread (pubkey, user, slot, timestamp_ms)
-    liq_tx: crossbeam::channel::Sender<(Pubkey, User, u64, u64)>,
+    liq_tx: tokio::sync::mpsc::Sender<(Pubkey, User, u64, u64)>,
 }
 
 impl LiquidatorBot {
@@ -222,9 +225,8 @@ impl LiquidatorBot {
             Box::leak(Box::new(MarketState::new(market_state)));
 
         // start liquidation worker
-        let (liq_tx, liq_rx) = crossbeam::channel::bounded::<(Pubkey, User, u64, u64)>(1024);
+        let (liq_tx, liq_rx) = tokio::sync::mpsc::channel::<(Pubkey, User, u64, u64)>(1024);
         spawn_liquidation_worker(
-            tokio::runtime::Handle::current(),
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
             Arc::new(LiquidateWithMatchStrategy {
@@ -265,7 +267,7 @@ impl LiquidatorBot {
             .map(|x| x.liquidation_margin_buffer_ratio)
             .expect("State has liquidation_margin_buffer_ratio");
 
-        const RECHECK_CYCLE_INTERVAL: u32 = 64;
+        const RECHECK_CYCLE_INTERVAL: u32 = 1024;
 
         let mut cycle_count = 0u32;
 
@@ -349,14 +351,12 @@ impl LiquidatorBot {
                                     MarginStatus::Liquidatable => {
                                         log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                         high_risk.insert(pubkey);
-                                        self.liq_tx
-                                            .send((
-                                                pubkey,
-                                                user.clone(),
-                                                current_slot,
-                                                current_time_millis(),
-                                            ))
-                                            .expect("liq sent");
+                                        // self.liq_tx.try_send((
+                                        //     pubkey,
+                                        //     user.clone(),
+                                        //     current_slot,
+                                        //     current_time_millis(),
+                                        // ));
                                     }
                                     MarginStatus::HighRisk => {
                                         high_risk.insert(pubkey);
@@ -401,22 +401,35 @@ impl LiquidatorBot {
             }
 
             // Only recheck margin for high-risk users on oracle price updates
+            // Process in batches to avoid blocking the main event loop
             if oracle_update {
-                let t0 = current_time_millis();
-                high_risk.retain(|pubkey| {
-                    if let Some(user) = users.get(pubkey) {
-                        let margin_info = self
-                            .market_state
-                            .calculate_simplified_margin_requirement(
-                                user,
-                                MarginRequirementType::Maintenance,
-                                Some(liquidation_margin_buffer_ratio),
-                            )
-                            .unwrap();
+                let high_risk_list: Vec<Pubkey> = high_risk.iter().copied().collect();
+                let high_risk_count = high_risk_list.len();
 
-                        match check_margin_status(&margin_info) {
-                            MarginStatus::Liquidatable => {
-                                log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                // Spawn async task to check high-risk users without blocking event loop
+                let users_clone = users.clone();
+                let market_state = self.market_state;
+                let liq_tx_clone = self.liq_tx.clone();
+                let current_slot_clone = current_slot;
+
+                tokio::spawn(async move {
+                    let t0 = current_time_millis();
+                    let mut liquidatable_users = Vec::new();
+
+                    for pubkey in high_risk_list {
+                        if let Some(user) = users_clone.get(&pubkey) {
+                            let margin_info = market_state
+                                .calculate_simplified_margin_requirement(
+                                    user,
+                                    MarginRequirementType::Maintenance,
+                                    Some(liquidation_margin_buffer_ratio),
+                                )
+                                .unwrap();
+
+                            match check_margin_status(&margin_info) {
+                                MarginStatus::Liquidatable => {
+                                    log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+
                                     // Collect spot market IDs from open spot positions
                                     let mut spot_market_ids: HashSet<u16> = user
                                         .spot_positions
@@ -450,7 +463,7 @@ impl LiquidatorBot {
                                     // Log market IDs
                                     log::info!(
                                         target: TARGET,
-                                        "user {:?} (sub: {}) slot: {current_slot}, spot positions: {:?}, perp positions: {:?}, orders: {:?}",
+                                        "user {:?} (sub: {}) slot: {current_slot_clone}, spot positions: {:?}, perp positions: {:?}, orders: {:?}",
                                         user.authority,
                                         user.sub_account_id,
                                         user.spot_positions.iter().filter(|p| spot_market_ids.contains(&p.market_index) && !p.is_available()).collect::<Vec<&SpotPosition>>(),
@@ -461,7 +474,7 @@ impl LiquidatorBot {
                                     // Log oracle prices for spot markets
                                     for market_index in &spot_market_ids {
                                         if let Some(oracle_price) =
-                                            self.market_state.get_spot_oracle_price(*market_index)
+                                            market_state.get_spot_oracle_price(*market_index)
                                         {
                                             log::info!(
                                                 target: TARGET,
@@ -483,7 +496,7 @@ impl LiquidatorBot {
                                     // Log oracle prices for perp markets
                                     for market_index in &perp_market_ids {
                                         if let Some(oracle_price) =
-                                            self.market_state.get_perp_oracle_price(*market_index)
+                                            market_state.get_perp_oracle_price(*market_index)
                                         {
                                             log::info!(
                                                 target: TARGET,
@@ -502,12 +515,58 @@ impl LiquidatorBot {
                                         }
                                     }
 
-                                self.liq_tx
-                                    .try_send((*pubkey, user.clone(), current_slot, current_time_millis()))
-                                    .expect("liq sent");
-                                true
+                                    liquidatable_users.push((pubkey, user.clone()));
+                                }
+                                _ => {}
                             }
-                            MarginStatus::HighRisk => true,
+                        }
+                    }
+
+                    // Send liquidations outside the loop
+                    for (pubkey, user) in liquidatable_users {
+                        match liq_tx_clone.try_send((
+                            pubkey,
+                            user,
+                            current_slot_clone,
+                            current_time_millis(),
+                        )) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    target: TARGET,
+                                    "liquidation channel full, dropping liquidation for {:?}",
+                                    pubkey
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                log::error!(target: TARGET, "liquidation channel closed");
+                            }
+                        }
+                    }
+
+                    log::trace!(
+                        target: TARGET,
+                        "processed {} high-risk margin updates in {}ms",
+                        high_risk_count,
+                        current_time_millis() - t0,
+                    );
+                });
+
+                // Update high_risk set synchronously but quickly (just remove safe users)
+                let t0 = current_time_millis();
+                high_risk.retain(|pubkey| {
+                    if let Some(user) = users.get(pubkey) {
+                        let margin_info = self
+                            .market_state
+                            .calculate_simplified_margin_requirement(
+                                user,
+                                MarginRequirementType::Maintenance,
+                                Some(liquidation_margin_buffer_ratio),
+                            )
+                            .unwrap();
+
+                        match check_margin_status(&margin_info) {
+                            MarginStatus::Liquidatable | MarginStatus::HighRisk => true,
                             MarginStatus::Safe => false,
                         }
                     } else {
@@ -517,9 +576,9 @@ impl LiquidatorBot {
 
                 log::trace!(
                     target: TARGET,
-                    "processed {} high-risk margin updates in {}ms",
-                    high_risk.len(),
+                    "updated high_risk set in {}ms (now {} users)",
                     current_time_millis() - t0,
+                    high_risk.len(),
                 );
             }
 
@@ -548,14 +607,24 @@ impl LiquidatorBot {
                             high_risk.insert(*pubkey);
                             newly_high_risk += 1;
                             log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
-                            self.liq_tx
-                                .try_send((
-                                    *pubkey,
-                                    user.clone(),
-                                    current_slot,
-                                    current_time_millis(),
-                                ))
-                                .expect("liq sent");
+                            match self.liq_tx.try_send((
+                                *pubkey,
+                                user.clone(),
+                                current_slot,
+                                current_time_millis(),
+                            )) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    log::warn!(
+                                        target: TARGET,
+                                        "liquidation channel full, dropping liquidation for {:?}",
+                                        pubkey
+                                    );
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    log::error!(target: TARGET, "liquidation channel closed");
+                                }
+                            }
                         }
                         MarginStatus::HighRisk => {
                             high_risk.insert(*pubkey);
@@ -737,7 +806,7 @@ fn try_liquidate_with_match(
     keeper_subaccount: Pubkey,
     liquidatee_subaccount: Pubkey,
     top_makers: &[User],
-    tx_sender: &TxSender,
+    tx_sender: TxSender,
     priority_fee: u64,
     cu_limit: u32,
     slot: u64,
@@ -795,28 +864,16 @@ fn try_liquidate_with_match(
 }
 
 fn spawn_liquidation_worker(
-    rt: tokio::runtime::Handle,
     tx_sender: TxSender,
     strategy: Arc<dyn LiquidationStrategy + Send + Sync>,
-    liq_rx: crossbeam::channel::Receiver<(Pubkey, User, u64, u64)>,
+    mut liq_rx: tokio::sync::mpsc::Receiver<(Pubkey, User, u64, u64)>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut rate_limit = HashMap::<Pubkey, u64>::new();
-        let mut cleanup_counter = 0u64;
-        const CLEANUP_INTERVAL: u64 = 1000; // Clean up every 1000 liquidations
+) {
+    let mut rate_limit = HashMap::<Pubkey, u64>::new();
 
-        loop {
-            // Receive liquidation request with timestamp
-            let (liquidatee, user_account, slot, ts) = match liq_rx.recv() {
-                Ok(msg) => msg,
-                Err(_) => {
-                    log::info!(target: TARGET, "liquidation channel closed, worker exiting");
-                    break;
-                }
-            };
-
+    tokio::spawn(async move {
+        while let Some((liquidatee, user_account, slot, ts)) = liq_rx.recv().await {
             // Drop entries older than 1 second to handle backpressure
             let now = current_time_millis();
             if now.saturating_sub(ts) > MAX_LIQUIDATION_AGE_MS {
@@ -829,17 +886,9 @@ fn spawn_liquidation_worker(
                 continue;
             }
 
-            // Periodic cleanup of old rate limit entries to prevent unbounded growth
-            cleanup_counter += 1;
-            if cleanup_counter >= CLEANUP_INTERVAL {
-                let cutoff_slot = slot.saturating_sub(LIQUIDATION_SLOT_RATE_LIMIT * 10);
-                rate_limit.retain(|_, &mut last_slot| last_slot >= cutoff_slot);
-                cleanup_counter = 0;
-            }
-
             if rate_limit
                 .get(&liquidatee)
-                .is_some_and(|last| slot.saturating_sub(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
+                .is_some_and(|last| slot.abs_diff(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
             {
                 log::trace!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
                 continue;
@@ -849,31 +898,25 @@ fn spawn_liquidation_worker(
 
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
 
-            // Spawn each liquidation as a separate async task with 100ms deadline
-            // This prevents one slow liquidation from blocking others and causing backups
             let strategy_clone = Arc::clone(&strategy);
             let liquidatee_clone = liquidatee;
-            let user_account_clone = user_account.clone();
+            let user_account_clone = Arc::new(user_account);
             let tx_sender_clone = tx_sender.clone();
-            let rt_clone = rt.clone();
 
-            rt.spawn(async move {
+            tokio::spawn(async move {
                 let deadline = std::time::Duration::from_millis(LIQUIDATION_DEADLINE_MS);
                 let start = std::time::Instant::now();
-
-                // Wrap liquidation in a timeout to enforce deadline
-                let result = tokio::time::timeout(deadline, async {
-                    // Run liquidation in blocking task since strategy is synchronous
-                        strategy_clone.liquidate_user(
-                            rt_clone,
-                            &liquidatee_clone,
-                            &user_account_clone,
-                            &tx_sender_clone,
-                            pf,
-                            cu_limit,
-                            slot,
-                        );
-                })
+                let result = tokio::time::timeout(
+                    deadline,
+                    strategy_clone.liquidate_user(
+                        liquidatee_clone,
+                        user_account_clone,
+                        tx_sender_clone,
+                        pf,
+                        cu_limit,
+                        slot,
+                    ),
+                )
                 .await;
 
                 let elapsed = start.elapsed();
@@ -908,7 +951,7 @@ fn spawn_liquidation_worker(
                 }
             });
         }
-    })
+    });
 }
 
 /// Default liquidation strategy that matches against top-of-book makers and
@@ -923,11 +966,16 @@ pub struct LiquidateWithMatchStrategy {
 
 impl LiquidateWithMatchStrategy {
     /// Find top makers for a perp position
-    fn find_top_makers(&self, market_index: u16, base_asset_amount: i64) -> Option<Vec<User>> {
-        let l3_book = self.dlob.get_l3_snapshot(market_index, MarketType::Perp);
+    fn find_top_makers(
+        drift: &DriftClient,
+        dlob: &'static DLOB,
+        market_state: &'static MarketState,
+        market_index: u16,
+        base_asset_amount: i64,
+    ) -> Option<Vec<User>> {
+        let l3_book = dlob.get_l3_snapshot(market_index, MarketType::Perp);
 
-        let oracle_price = self
-            .market_state
+        let oracle_price = market_state
             .get_perp_oracle_price(market_index)
             .map(|x| x.price)
             .unwrap_or(0) as u64;
@@ -956,7 +1004,7 @@ impl LiquidateWithMatchStrategy {
 
         let makers: Vec<User> = maker_pubkeys
             .iter()
-            .filter_map(|p| self.drift.try_get_account::<User>(p).ok())
+            .filter_map(|p| drift.try_get_account::<User>(p).ok())
             .collect();
 
         if makers.is_empty() {
@@ -969,10 +1017,14 @@ impl LiquidateWithMatchStrategy {
 
     /// Attempt perp liquidation with order matching
     fn liquidate_perp(
-        &self,
-        liquidatee: &Pubkey,
-        user_account: &User,
-        tx_sender: &TxSender,
+        drift: &DriftClient,
+        dlob: &'static DLOB,
+        market_state: &'static MarketState,
+        metrics: Arc<Metrics>,
+        keeper_subaccount: Pubkey,
+        liquidatee: Pubkey,
+        user_account: Arc<User>,
+        tx_sender: TxSender,
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
@@ -986,7 +1038,7 @@ impl LiquidateWithMatchStrategy {
             return;
         };
 
-        self.metrics
+        metrics
             .liquidation_attempts
             .with_label_values(&["perp"])
             .inc();
@@ -997,15 +1049,21 @@ impl LiquidateWithMatchStrategy {
             pos.market_index
         );
 
-        let Some(makers) = self.find_top_makers(pos.market_index, pos.base_asset_amount) else {
+        let Some(makers) = Self::find_top_makers(
+            drift,
+            dlob,
+            market_state,
+            pos.market_index,
+            pos.base_asset_amount,
+        ) else {
             return;
         };
 
         try_liquidate_with_match(
-            &self.drift,
+            &drift,
             pos.market_index,
-            self.keeper_subaccount,
-            *liquidatee,
+            keeper_subaccount,
+            liquidatee,
             makers.as_slice(),
             tx_sender,
             priority_fee,
@@ -1015,18 +1073,19 @@ impl LiquidateWithMatchStrategy {
     }
 
     /// Attempt spot liquidation with Jupiter swap
-    fn liquidate_spot(
-        &self,
-        rt: &tokio::runtime::Handle,
-        liquidatee: &Pubkey,
-        user_account: &User,
-        tx_sender: &TxSender,
+    async fn liquidate_spot(
+        drift: DriftClient,
+        metrics: Arc<Metrics>,
+        market_state: Arc<MarketStateData>,
+        keeper_subaccount: Pubkey,
+        liquidatee: Pubkey,
+        user_account: Arc<User>,
+        tx_sender: TxSender,
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
     ) {
-        let authority = self.drift.wallet.authority();
-        let market_state = self.market_state.load();
+        let authority = drift.wallet.authority();
 
         for pos in user_account
             .spot_positions
@@ -1053,7 +1112,7 @@ impl LiquidateWithMatchStrategy {
                 continue;
             }
 
-            self.metrics
+            metrics
                 .liquidation_attempts
                 .with_label_values(&["spot"])
                 .inc();
@@ -1084,18 +1143,15 @@ impl LiquidateWithMatchStrategy {
             );
 
             // Fetch accounts once
-            let keeper_account_data = match self
-                .drift
-                .try_get_account::<User>(&self.keeper_subaccount)
-            {
+            let keeper_account_data = match drift.try_get_account::<User>(&keeper_subaccount) {
                 Ok(data) => data,
                 Err(_) => {
-                    log::info!(target: TARGET, "keeper account not found: {:?}", self.keeper_subaccount);
+                    log::info!(target: TARGET, "keeper account not found: {:?}", &keeper_subaccount);
                     continue;
                 }
             };
 
-            let liquidatee_account_data = match self.drift.try_get_account::<User>(liquidatee) {
+            let liquidatee_account_data = match drift.try_get_account::<User>(&liquidatee) {
                 Ok(data) => data,
                 Err(_) => {
                     log::info!(target: TARGET, "liquidatee account not found: {liquidatee:?}");
@@ -1103,187 +1159,182 @@ impl LiquidateWithMatchStrategy {
                 }
             };
 
-            // Spawn async task for Jupiter swap
-            let drift = self.drift.clone();
-            let keeper_subaccount = self.keeper_subaccount;
+            // Fetch market configs inside async block to avoid lifetime issues
+            let asset_spot_market = drift
+                .program_data()
+                .spot_market_config_by_index(asset_market_index)
+                .expect("asset spot market");
+
             let liability_market_index = pos.market_index;
-            let liquidatee = *liquidatee;
-            let tx_sender = tx_sender.clone();
-            let authority = *authority;
-            let keeper_account_data = keeper_account_data;
-            let liquidatee_account_data = liquidatee_account_data;
-            let metrics = Arc::clone(&self.metrics);
 
-            rt.spawn(async move {
-                // Fetch market configs inside async block to avoid lifetime issues
-                let asset_spot_market = drift
-                    .program_data()
-                    .spot_market_config_by_index(asset_market_index)
-                    .expect("asset spot market");
+            let liability_spot_market = drift
+                .program_data()
+                .spot_market_config_by_index(liability_market_index)
+                .expect("liability spot market");
 
-                let liability_spot_market = drift
-                    .program_data()
-                    .spot_market_config_by_index(liability_market_index)
-                    .expect("liability spot market");
+            let in_token_account =
+                drift_rs::Wallet::derive_associated_token_address(&authority, &asset_spot_market);
+            let out_token_account = drift_rs::Wallet::derive_associated_token_address(
+                &authority,
+                &liability_spot_market,
+            );
 
-                let in_token_account = drift_rs::Wallet::derive_associated_token_address(
+            let t0 = std::time::Instant::now();
+            let (jupiter_result, titan_result) = tokio::join!(
+                drift.jupiter_swap_query(
                     &authority,
-                    &asset_spot_market,
-                );
-                let out_token_account = drift_rs::Wallet::derive_associated_token_address(
+                    token_amount,
+                    SwapMode::ExactIn,
+                    100,
+                    asset_market_index,
+                    liability_market_index,
+                    Some(true),
+                    None,
+                    None,
+                ),
+                drift.titan_swap_query(
                     &authority,
-                    &liability_spot_market,
-                );
+                    token_amount,
+                    Some(50),
+                    titan::SwapMode::ExactIn,
+                    100,
+                    asset_market_index,
+                    liability_market_index,
+                    Some(true),
+                    None,
+                    None,
+                )
+            );
 
-                let t0 = std::time::Instant::now();
-                let (jupiter_result, titan_result) = tokio::join!(
-                    drift.jupiter_swap_query(
-                        &authority,
-                        token_amount,
-                        SwapMode::ExactIn,
-                        100,
-                        asset_market_index,
-                        liability_market_index,
-                        Some(true),
-                        None,
-                        None,
-                    ),
-                    drift.titan_swap_query(
-                        &authority,
-                        token_amount,
-                        Some(50),
-                        titan::SwapMode::ExactIn,
-                        100,
-                        asset_market_index,
-                        liability_market_index,
-                        Some(true),
-                        None,
-                        None,
-                    )
-                );
+            let quote_latency_ms = t0.elapsed().as_millis() as i64;
+            metrics.swap_quote_latency_ms.set(quote_latency_ms);
 
-                let quote_latency_ms = t0.elapsed().as_millis() as i64;
-                metrics.swap_quote_latency_ms.set(quote_latency_ms);
+            if jupiter_result.is_err() && titan_result.is_err() {
+                metrics.jupiter_quote_failures.inc();
+                metrics.titan_quote_failures.inc();
+                log::warn!(target: TARGET, "both quotes failed after {}ms", quote_latency_ms);
+                return;
+            }
 
-                if jupiter_result.is_err() && titan_result.is_err() {
-                    metrics.jupiter_quote_failures.inc();
-                    metrics.titan_quote_failures.inc();
-                    log::warn!(target: TARGET, "both quotes failed after {}ms", quote_latency_ms);
-                    return;
+            let use_titan = match (&jupiter_result, &titan_result) {
+                (Ok(jup), Ok(titan)) => {
+                    let use_titan = titan.quote.out_amount > jup.quote.out_amount;
+                    log::debug!(
+                        target: TARGET,
+                        "got quotes in {}ms - jup: {}, titan: {} - using {}",
+                        quote_latency_ms,
+                        jup.quote.out_amount,
+                        titan.quote.out_amount,
+                        if use_titan { "titan" } else { "jupiter" }
+                    );
+                    use_titan
                 }
+                (Ok(_), Err(e)) => {
+                    metrics.titan_quote_failures.inc();
+                    log::debug!(target: TARGET, "titan failed in {}ms, using jupiter: {:?}", quote_latency_ms, e);
+                    false
+                }
+                (Err(e), Ok(_)) => {
+                    metrics.jupiter_quote_failures.inc();
+                    log::debug!(target: TARGET, "jupiter failed in {}ms, using titan: {:?}", quote_latency_ms, e);
+                    true
+                }
+                _ => unreachable!(),
+            };
 
-                let use_titan = match (&jupiter_result, &titan_result) {
-                    (Ok(jup), Ok(titan)) => {
-                        let use_titan = titan.quote.out_amount > jup.quote.out_amount;
-                        log::debug!(
-                            target: TARGET,
-                            "got quotes in {}ms - jup: {}, titan: {} - using {}",
-                            quote_latency_ms,
-                            jup.quote.out_amount,
-                            titan.quote.out_amount,
-                            if use_titan { "titan" } else { "jupiter" }
-                        );
-                        use_titan
-                    }
-                    (Ok(_), Err(e)) => {
-                        metrics.titan_quote_failures.inc();
-                        log::debug!(target: TARGET, "titan failed in {}ms, using jupiter: {:?}", quote_latency_ms, e);
-                        false
-                    }
-                    (Err(e), Ok(_)) => {
-                        metrics.jupiter_quote_failures.inc();
-                        log::debug!(target: TARGET, "jupiter failed in {}ms, using titan: {:?}", quote_latency_ms, e);
-                        true
-                    }
-                    _ => unreachable!(),
-                };
-
-                let tx = if use_titan {
-                    TransactionBuilder::new(
-                        drift.program_data(),
-                        keeper_subaccount,
-                        std::borrow::Cow::Owned(keeper_account_data),
-                        false,
-                    )
-                    .with_priority_fee(priority_fee, Some(cu_limit))
-                    .titan_swap_liquidate(
-                        titan_result.unwrap(),
-                        &asset_spot_market,
-                        &liability_spot_market,
-                        &in_token_account,
-                        &out_token_account,
-                        asset_market_index,
-                        liability_market_index,
-                        &liquidatee_account_data,
-                    )
-                    .build()
-                } else {
-                    TransactionBuilder::new(
-                        drift.program_data(),
-                        keeper_subaccount,
-                        std::borrow::Cow::Owned(keeper_account_data),
-                        false,
-                    )
-                    .with_priority_fee(priority_fee, Some(cu_limit))
-                    .jupiter_swap_liquidate(
-                        jupiter_result.unwrap(),
-                        &asset_spot_market,
-                        &liability_spot_market,
-                        &in_token_account,
-                        &out_token_account,
-                        asset_market_index,
-                        liability_market_index,
-                        &liquidatee_account_data,
-                    )
-                    .build()
-                };
-                log::debug!(
-                    target: TARGET,
-                    "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
-                    liability_market_index
-                );
-                tx_sender.send_tx(
-                    tx,
-                    TxIntent::LiquidateSpot {
-                        asset_market_index,
-                        liability_market_index,
-                        liquidatee,
-                        slot,
-                    },
-                    cu_limit as u64,
-                );
-            });
+            let tx = if use_titan {
+                TransactionBuilder::new(
+                    drift.program_data(),
+                    keeper_subaccount,
+                    std::borrow::Cow::Owned(keeper_account_data),
+                    false,
+                )
+                .with_priority_fee(priority_fee, Some(cu_limit))
+                .titan_swap_liquidate(
+                    titan_result.unwrap(),
+                    &asset_spot_market,
+                    &liability_spot_market,
+                    &in_token_account,
+                    &out_token_account,
+                    asset_market_index,
+                    liability_market_index,
+                    &liquidatee_account_data,
+                )
+                .build()
+            } else {
+                TransactionBuilder::new(
+                    drift.program_data(),
+                    keeper_subaccount,
+                    std::borrow::Cow::Owned(keeper_account_data),
+                    false,
+                )
+                .with_priority_fee(priority_fee, Some(cu_limit))
+                .jupiter_swap_liquidate(
+                    jupiter_result.unwrap(),
+                    &asset_spot_market,
+                    &liability_spot_market,
+                    &in_token_account,
+                    &out_token_account,
+                    asset_market_index,
+                    liability_market_index,
+                    &liquidatee_account_data,
+                )
+                .build()
+            };
+            log::debug!(
+                target: TARGET,
+                "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
+                liability_market_index
+            );
+            tx_sender.send_tx(
+                tx,
+                TxIntent::LiquidateSpot {
+                    asset_market_index,
+                    liability_market_index,
+                    liquidatee,
+                    slot,
+                },
+                cu_limit as u64,
+            );
         }
     }
 }
 
 impl LiquidationStrategy for LiquidateWithMatchStrategy {
-    fn liquidate_user(
-        &self,
-        rt: tokio::runtime::Handle,
-        liquidatee: &Pubkey,
-        user_account: &User,
-        tx_sender: &TxSender,
+    fn liquidate_user<'a>(
+        &'a self,
+        liquidatee: Pubkey,
+        user_account: Arc<User>,
+        tx_sender: TxSender,
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
-    ) {
-        self.liquidate_perp(
+    ) -> futures_util::future::BoxFuture<'a, ()> {
+        Self::liquidate_perp(
+            &self.drift,
+            self.dlob,
+            self.market_state,
+            Arc::clone(&self.metrics),
+            self.keeper_subaccount,
             liquidatee,
-            user_account,
-            tx_sender,
+            Arc::clone(&user_account),
+            tx_sender.clone(),
             priority_fee,
             cu_limit,
             slot,
         );
-        self.liquidate_spot(
-            &rt,
+        Self::liquidate_spot(
+            self.drift.clone(),
+            Arc::clone(&self.metrics),
+            self.market_state.load(),
+            self.keeper_subaccount,
             liquidatee,
             user_account,
-            tx_sender,
+            tx_sender.clone(),
             priority_fee,
             400_000,
             slot,
-        );
+        )
+        .boxed()
     }
 }
