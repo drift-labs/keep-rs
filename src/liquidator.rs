@@ -35,7 +35,7 @@ use solana_sdk::{account::Account, clock::Slot, compute_budget::ComputeBudgetIns
 use crate::{
     filler::{TxSender, TxWorker},
     http::Metrics,
-    util::TxIntent,
+    util::{PythPriceUpdate, TxIntent},
     Config, UseMarkets,
 };
 
@@ -109,6 +109,7 @@ pub trait LiquidationStrategy {
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
+        pyth_price_update: Option<PythPriceUpdate>,
     ) -> futures_util::future::BoxFuture<'a, ()>;
 }
 
@@ -141,8 +142,9 @@ pub struct LiquidatorBot {
     market_state: &'static MarketState,
     /// receives new updates from grpc
     events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
-    /// sends liquidatable accounts to work thread (pubkey, user, slot, timestamp_ms)
-    liq_tx: tokio::sync::mpsc::Sender<(Pubkey, User, u64, u64)>,
+    /// sends liquidatable accounts to work thread (pubkey, user, slot, timestamp_ms, pyth price)
+    liq_tx: tokio::sync::mpsc::Sender<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>,
+    pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
 }
 
 impl LiquidatorBot {
@@ -224,8 +226,18 @@ impl LiquidatorBot {
         let market_state: &'static MarketState =
             Box::leak(Box::new(MarketState::new(market_state)));
 
+        let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
+        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
+            "wss://pyth-lazer.dourolabs.app/v1/stream",
+            pyth_access_token.as_str(),
+        )
+        .expect("pyth price feed connects");
+        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
+        log::info!(target: TARGET, "subscribed pyth price feeds");
+
         // start liquidation worker
-        let (liq_tx, liq_rx) = tokio::sync::mpsc::channel::<(Pubkey, User, u64, u64)>(1024);
+        let (liq_tx, liq_rx) =
+            tokio::sync::mpsc::channel::<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>(1024);
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
@@ -251,6 +263,7 @@ impl LiquidatorBot {
             config,
             market_state,
             liq_tx,
+            pyth_price_feed,
         }
     }
 
@@ -311,8 +324,18 @@ impl LiquidatorBot {
         let mut event_buffer = Vec::<GrpcEvent>::with_capacity(64);
         let mut oracle_update;
 
+        // Pyth Feed
+        let mut pyth_price_feed = self.pyth_price_feed;
+        let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
+
         loop {
             oracle_update = false;
+
+            // Drain pyth updates first (non-blocking)
+            while let Ok(update) = pyth_price_feed.try_recv() {
+                pyth_oracle_prices.insert(update.market_id, update);
+            }
+
             let n_read = events_rx.recv_many(&mut event_buffer, 64).await;
             log::trace!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
             for event in event_buffer.drain(..) {
@@ -351,11 +374,19 @@ impl LiquidatorBot {
                                     MarginStatus::Liquidatable => {
                                         log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                         high_risk.insert(pubkey);
+                                        // let pyth_price_update = user
+                                        //     .perp_positions
+                                        //     .iter()
+                                        //     .filter(|p| p.base_asset_amount != 0)
+                                        //     .max_by_key(|p| p.quote_asset_amount.abs())
+                                        //     .and_then(|p| pyth_oracle_prices.get(&p.market_index).cloned());
+                                        //
                                         // self.liq_tx.try_send((
                                         //     pubkey,
                                         //     user.clone(),
                                         //     current_slot,
                                         //     current_time_millis(),
+                                        //     pyth_price_update,
                                         // ));
                                     }
                                     MarginStatus::HighRisk => {
@@ -410,6 +441,8 @@ impl LiquidatorBot {
                 let users_clone = users.clone();
                 let market_state = self.market_state;
                 let liq_tx_clone = self.liq_tx.clone();
+                let pyth_oracle_prices_clone = pyth_oracle_prices.clone();
+
                 let current_slot_clone = current_slot;
 
                 tokio::spawn(async move {
@@ -524,11 +557,19 @@ impl LiquidatorBot {
 
                     // Send liquidations outside the loop
                     for (pubkey, user) in liquidatable_users {
+                        let pyth_price_update = user
+                            .perp_positions
+                            .iter()
+                            .filter(|p| p.base_asset_amount != 0)
+                            .max_by_key(|p| p.quote_asset_amount.abs())
+                            .and_then(|p| pyth_oracle_prices_clone.get(&p.market_index).cloned());
+
                         match liq_tx_clone.try_send((
                             pubkey,
                             user,
                             current_slot_clone,
                             current_time_millis(),
+                            pyth_price_update,
                         )) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -607,11 +648,20 @@ impl LiquidatorBot {
                             high_risk.insert(*pubkey);
                             newly_high_risk += 1;
                             log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+
+                            let pyth_price_update = user
+                                .perp_positions
+                                .iter()
+                                .filter(|p| p.base_asset_amount != 0)
+                                .max_by_key(|p| p.quote_asset_amount.abs())
+                                .and_then(|p| pyth_oracle_prices.get(&p.market_index).cloned());
+
                             match self.liq_tx.try_send((
                                 *pubkey,
                                 user.clone(),
                                 current_slot,
                                 current_time_millis(),
+                                pyth_price_update,
                             )) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -810,6 +860,7 @@ fn try_liquidate_with_match(
     priority_fee: u64,
     cu_limit: u32,
     slot: u64,
+    pyth_price_update: Option<PythPriceUpdate>,
 ) {
     if top_makers.is_empty() {
         log::debug!(target: TARGET, "skip empty maker cross. market={market_index} user={liquidatee_subaccount}");
@@ -833,8 +884,13 @@ fn try_liquidate_with_match(
         std::borrow::Cow::Owned(keeper_account_data.unwrap()),
         false,
     )
-    .with_priority_fee(priority_fee, Some(cu_limit))
-    .liquidate_perp_with_fill(
+    .with_priority_fee(priority_fee, Some(cu_limit));
+
+    if let Some(ref update) = pyth_price_update {
+        tx_builder = tx_builder.post_pyth_lazer_oracle_update(&[update.feed_id], &update.message);
+    }
+
+    tx_builder = tx_builder.liquidate_perp_with_fill(
         market_index,
         &liquidatee_subaccount_data.unwrap(),
         top_makers,
@@ -866,14 +922,16 @@ fn try_liquidate_with_match(
 fn spawn_liquidation_worker(
     tx_sender: TxSender,
     strategy: Arc<dyn LiquidationStrategy + Send + Sync>,
-    mut liq_rx: tokio::sync::mpsc::Receiver<(Pubkey, User, u64, u64)>,
+    mut liq_rx: tokio::sync::mpsc::Receiver<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
 ) {
     let mut rate_limit = HashMap::<Pubkey, u64>::new();
 
     tokio::spawn(async move {
-        while let Some((liquidatee, user_account, slot, ts)) = liq_rx.recv().await {
+        while let Some((liquidatee, user_account, slot, ts, pyth_price_update)) =
+            liq_rx.recv().await
+        {
             // Drop entries older than 1 second to handle backpressure
             let now = current_time_millis();
             if now.saturating_sub(ts) > MAX_LIQUIDATION_AGE_MS {
@@ -915,6 +973,7 @@ fn spawn_liquidation_worker(
                         pf,
                         cu_limit,
                         slot,
+                        pyth_price_update,
                     ),
                 )
                 .await;
@@ -1028,6 +1087,7 @@ impl LiquidateWithMatchStrategy {
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
+        pyth_price_update: Option<PythPriceUpdate>,
     ) {
         let Some(pos) = user_account
             .perp_positions
@@ -1069,6 +1129,7 @@ impl LiquidateWithMatchStrategy {
             priority_fee,
             cu_limit,
             slot,
+            pyth_price_update,
         );
     }
 
@@ -1309,6 +1370,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         priority_fee: u64,
         cu_limit: u32,
         slot: u64,
+        pyth_price_update: Option<PythPriceUpdate>,
     ) -> futures_util::future::BoxFuture<'a, ()> {
         Self::liquidate_perp(
             &self.drift,
@@ -1322,6 +1384,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             priority_fee,
             cu_limit,
             slot,
+            pyth_price_update,
         );
         Self::liquidate_spot(
             self.drift.clone(),
