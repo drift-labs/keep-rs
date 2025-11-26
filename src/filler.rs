@@ -999,6 +999,7 @@ impl TxWorker {
         if intent.expected_trigger() {
             metrics.trigger_expected.inc();
         }
+
         rt.spawn(async move {
             match drift
                 .sign_and_send_with_config(
@@ -1013,7 +1014,13 @@ impl TxWorker {
                 .await
             {
                 Ok(sig) => {
-                    log::info!(target: TARGET, "{intent_label} txn sent ⚡️: {sig:?}");
+                    log::info!(
+                        target: TARGET,
+                        r#"{{"intent": "{}", "txn": "{}", "observed_slot": {}}}"#,
+                        intent_label,
+                        sig,
+                        intent.slot().unwrap_or(0)
+                    );
                     let mut pending = pending_txs.write().await;
                     pending.insert(PendingTxMeta::new(sig, intent, cu_limit));
                 }

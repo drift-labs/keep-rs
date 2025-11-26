@@ -185,6 +185,16 @@ impl TxIntent {
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
         }
     }
+
+    pub fn slot(&self) -> Option<u64> {
+        match self {
+            Self::VAMMTakerFill { slot, .. }
+            | Self::LimitUncross { slot, .. }
+            | Self::LiquidateWithFill { slot, .. }
+            | Self::LiquidateSpot { slot, .. } => Some(*slot),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Default, Debug)]
