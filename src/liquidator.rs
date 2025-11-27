@@ -1119,6 +1119,13 @@ impl LiquidateWithMatchStrategy {
             return;
         };
 
+        let oracle_price = market_state
+            .get_perp_oracle_price(pos.market_index)
+            .map(|x| x.price)
+            .unwrap_or(0) as u64;
+
+        let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
+
         try_liquidate_with_match(
             &drift,
             pos.market_index,
@@ -1129,7 +1136,7 @@ impl LiquidateWithMatchStrategy {
             priority_fee,
             cu_limit,
             slot,
-            pyth_price_update,
+            pyth_update,
         );
     }
 
