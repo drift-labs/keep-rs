@@ -154,12 +154,20 @@ impl LiquidatorBot {
         let rt = tokio::runtime::Handle::current();
         let tx_sender = tx_worker.run(rt);
 
-        let mut market_ids = match config.use_markets() {
+        let mut perp_market_ids = match config.use_markets() {
             UseMarkets::All => drift.get_all_perp_market_ids(),
             UseMarkets::Subset(m) => m,
         };
+
+        let spot_market_ids: Vec<MarketId> = drift
+            .program_data()
+            .spot_market_configs()
+            .iter()
+            .map(|m| MarketId::spot(m.market_index))
+            .collect();
+
         // remove bet perp markets
-        market_ids.retain(|x| {
+        perp_market_ids.retain(|x| {
             let market = drift
                 .program_data()
                 .perp_market_config_by_index(x.index())
@@ -171,7 +179,7 @@ impl LiquidatorBot {
             !name.contains("bet") && market.status != MarketStatus::Initialized
         });
 
-        let market_pubkeys: Vec<Pubkey> = market_ids
+        let market_pubkeys: Vec<Pubkey> = perp_market_ids
             .iter()
             .map(|x| {
                 drift
@@ -195,13 +203,15 @@ impl LiquidatorBot {
             drift.clone(),
             dlob_notifier.clone(),
             tx_sender.clone(),
-            market_ids.clone(),
+            perp_market_ids.clone(),
         )
         .await;
         log::info!(target: TARGET, "subscribed gRPC");
 
         // populate market data
         let mut market_state = MarketStateData::default();
+        // Only use pyth price when it differs from oracle by >5 bps
+        market_state.pyth_oracle_diff_threshold_bps = 5;
 
         for market in drift.program_data().perp_market_configs() {
             market_state.set_perp_market(*market);
@@ -232,7 +242,8 @@ impl LiquidatorBot {
             pyth_access_token.as_str(),
         )
         .expect("pyth price feed connects");
-        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
+        let pyth_price_feed =
+            crate::util::subscribe_price_feeds(pyth_feed_cli, &perp_market_ids, &spot_market_ids);
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
         // start liquidation worker
@@ -326,14 +337,29 @@ impl LiquidatorBot {
 
         // Pyth Feed
         let mut pyth_price_feed = self.pyth_price_feed;
-        let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
+        let mut pyth_perp_prices = BTreeMap::<u16, PythPriceUpdate>::new();
 
         loop {
             oracle_update = false;
 
             // Drain pyth updates first (non-blocking)
             while let Ok(update) = pyth_price_feed.try_recv() {
-                pyth_oracle_prices.insert(update.market_id, update);
+                let market_id = update.market_id;
+                let price = update.price;
+
+                match update.market_type {
+                    MarketType::Perp => {
+                        pyth_perp_prices.insert(market_id, update);
+                        // Update market state with perp pyth price for margin calculation
+                        self.market_state
+                            .set_perp_pyth_price(market_id, price as i64);
+                    }
+                    MarketType::Spot => {
+                        // Update market state with spot pyth price for margin calculation
+                        self.market_state
+                            .set_spot_pyth_price(market_id, price as i64);
+                    }
+                }
             }
 
             let n_read = events_rx.recv_many(&mut event_buffer, 64).await;
@@ -379,7 +405,7 @@ impl LiquidatorBot {
                                         //     .iter()
                                         //     .filter(|p| p.base_asset_amount != 0)
                                         //     .max_by_key(|p| p.quote_asset_amount.abs())
-                                        //     .and_then(|p| pyth_oracle_prices.get(&p.market_index).cloned());
+                                        //     .and_then(|p| pyth_perp_prices.get(&p.market_index).cloned());
                                         //
                                         // self.liq_tx.try_send((
                                         //     pubkey,
@@ -441,7 +467,7 @@ impl LiquidatorBot {
                 let users_clone = users.clone();
                 let market_state = self.market_state;
                 let liq_tx_clone = self.liq_tx.clone();
-                let pyth_oracle_prices_clone = pyth_oracle_prices.clone();
+                let pyth_perp_prices_clone = pyth_perp_prices.clone();
 
                 let current_slot_clone = current_slot;
 
@@ -562,7 +588,7 @@ impl LiquidatorBot {
                             .iter()
                             .filter(|p| p.base_asset_amount != 0)
                             .max_by_key(|p| p.quote_asset_amount.abs())
-                            .and_then(|p| pyth_oracle_prices_clone.get(&p.market_index).cloned());
+                            .and_then(|p| pyth_perp_prices_clone.get(&p.market_index).cloned());
 
                         match liq_tx_clone.try_send((
                             pubkey,
@@ -654,7 +680,7 @@ impl LiquidatorBot {
                                 .iter()
                                 .filter(|p| p.base_asset_amount != 0)
                                 .max_by_key(|p| p.quote_asset_amount.abs())
-                                .and_then(|p| pyth_oracle_prices.get(&p.market_index).cloned());
+                                .and_then(|p| pyth_perp_prices.get(&p.market_index).cloned());
 
                             match self.liq_tx.try_send((
                                 *pubkey,

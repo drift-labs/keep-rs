@@ -1,8 +1,15 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use drift_rs::{
+    constants::{
+        perp_market_index_to_pyth_lazer_feed_id, pyth_lazer_feed_id_to_perp_market_index,
+        pyth_lazer_feed_id_to_spot_market_index, spot_market_index_to_pyth_lazer_feed_id,
+    },
     dlob::{L3Order, MakerCrosses},
-    types::MarketId,
+    types::{MarketId, MarketType},
     Pubkey,
 };
 use futures_util::StreamExt;
@@ -262,6 +269,7 @@ impl<const N: usize> PendingTxs<N> {
 
 #[derive(Clone, Debug)]
 pub struct PythPriceUpdate {
+    pub market_type: MarketType,
     pub market_id: u16,
     pub feed_id: u32,
     pub price: u64,
@@ -293,14 +301,24 @@ fn to_price_precision(price: u64, feed_id: u32) -> u64 {
 
 pub fn subscribe_price_feeds(
     mut cli: pyth_lazer_client::LazerClient,
-    market_ids: &[MarketId],
+    perp_market_ids: &[MarketId],
+    spot_market_ids: &[MarketId],
 ) -> tokio::sync::mpsc::Receiver<PythPriceUpdate> {
-    let feed_ids: Vec<PriceFeedId> = market_ids
-        .iter()
-        .filter_map(|m| {
-            drift_rs::constants::perp_market_index_to_pyth_lazer_feed_id(m.index()).map(PriceFeedId)
-        })
-        .collect();
+    let mut feed_id_set = HashSet::new();
+
+    for m in perp_market_ids {
+        if let Some(fid) = perp_market_index_to_pyth_lazer_feed_id(m.index()) {
+            feed_id_set.insert(fid);
+        }
+    }
+
+    for m in spot_market_ids {
+        if let Some(fid) = spot_market_index_to_pyth_lazer_feed_id(m.index()) {
+            feed_id_set.insert(fid);
+        }
+    }
+
+    let feed_ids: Vec<PriceFeedId> = feed_id_set.into_iter().map(PriceFeedId).collect();
 
     let (price_tx, price_rx) = tokio::sync::mpsc::channel(512);
     tokio::spawn(async move {
@@ -364,19 +382,35 @@ pub fn subscribe_price_feeds(
                                             {
                                                 // TODO: bulk msg to avoid bouncing around tokio, bucket in some way, one message updates multiple markets...
                                                 let feed_id = f.feed_id.0;
-                                                let market = drift_rs::constants::pyth_lazer_feed_id_to_perp_market_index(feed_id);
-                                                if market.is_none() {
-                                                    log::warn!(target: "filler", "unmapped market for pyth update feedId: {feed_id:?}");
-                                                    continue;
-                                                }
                                                 let price: u64 = new_price.0.unsigned_abs().into();
-                                                price_tx.try_send(PythPriceUpdate {
-                                                    market_id: market.unwrap(),
-                                                    feed_id,
-                                                    price: to_price_precision(price, feed_id),
-                                                    message: buf.clone(),
-                                                    ts: data.timestamp_us,
-                                                });
+                                                let scaled_price =
+                                                    to_price_precision(price, feed_id);
+
+                                                if let Some(market_id) =
+                                                    pyth_lazer_feed_id_to_perp_market_index(feed_id)
+                                                {
+                                                    let _ = price_tx.try_send(PythPriceUpdate {
+                                                        market_type: MarketType::Perp,
+                                                        market_id,
+                                                        feed_id,
+                                                        price: scaled_price,
+                                                        message: buf.clone(),
+                                                        ts: data.timestamp_us,
+                                                    });
+                                                }
+
+                                                if let Some(market_id) =
+                                                    pyth_lazer_feed_id_to_spot_market_index(feed_id)
+                                                {
+                                                    let _ = price_tx.try_send(PythPriceUpdate {
+                                                        market_type: MarketType::Spot,
+                                                        market_id,
+                                                        feed_id,
+                                                        price: scaled_price,
+                                                        message: buf.clone(),
+                                                        ts: data.timestamp_us,
+                                                    });
+                                                }
                                             }
                                         }
                                     }

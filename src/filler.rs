@@ -123,7 +123,7 @@ impl FillerBot {
             pyth_access_token.as_str(),
         )
         .expect("pyth price feed connects");
-        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids);
+        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids, &[]);
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
         FillerBot {
