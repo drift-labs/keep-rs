@@ -366,7 +366,7 @@ impl LiquidatorBot {
                     }
                     Err(TryRecvError::Disconnected) => {
                         log::warn!(target: TARGET, "pyth price feed disconnected");
-                        break;
+                        return;
                     }
                     Err(TryRecvError::Empty) => break,
                 }
