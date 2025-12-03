@@ -330,15 +330,27 @@ pub fn subscribe_price_feeds(
 
     let feed_ids: Vec<PriceFeedId> = feed_id_set.into_iter().map(PriceFeedId).collect();
 
+    const MAX_RETRIES: u32 = 10;
+
     let (price_tx, price_rx) = tokio::sync::mpsc::channel(512);
+
+    let mut retries = 0u32;
     tokio::spawn(async move {
         loop {
             let pyth_lazer_stream = match cli.start().await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    log::error!(target: "filler", "pyth feed start failed: {err:?}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                    retries += 1;
+
+                    if retries >= MAX_RETRIES {
+                        log::error!(target: "pyth", "feed connection failed after {MAX_RETRIES} attempts, shutting down");
+                        return;
+                    } else {
+                        let backoff = 2u64.pow(retries).min(30); // 2^retries seconds, capped at 30s
+                        log::warn!(target: "pyth", "feed connection failed: {err:?}, retry {retries}/{MAX_RETRIES} in {backoff}s");
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                        continue;
+                    }
                 }
             };
 
@@ -372,6 +384,8 @@ pub fn subscribe_price_feeds(
                     continue;
                 }
             }
+
+            retries = 0u32; // retry on successful connect
 
             let mut stream = pyth_lazer_stream.boxed();
             while let Some(update) = stream.next().await {
@@ -434,7 +448,15 @@ pub fn subscribe_price_feeds(
                     }
                 }
             }
-            log::error!(target: "filler", "pyth lazer feed finished");
+            // stream ended, will retry
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                log::error!(target: "pyth", "feed disconnected after {MAX_RETRIES} attempts, shutting down");
+                return;
+            }
+            let backoff = 2u64.pow(retries).min(30);
+            log::warn!(target: "pyth", "feed disconnected, retry {retries}/{MAX_RETRIES} in {backoff}s");
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
         }
     });
 
