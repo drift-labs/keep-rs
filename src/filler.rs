@@ -320,8 +320,14 @@ impl FillerBot {
                     log::trace!(target: TARGET, "⏱️ checked fills at {slot}: {:?}ms", duration);
                 }
                 new_price = pyth_price_feed.recv() => {
-                    if let Some(update) = new_price {
-                        pyth_oracle_prices.insert(update.market_id, update);
+                    match new_price {
+                        Some(update) => {
+                            pyth_oracle_prices.insert(update.market_id, update);
+                        }
+                        None => {
+                            log::error!(target: TARGET, "pyth price feed disconnected, shutting down");
+                            break;  // exits the loop
+                        }
                     }
                 }
             }
