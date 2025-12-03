@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::mpsc::error::TryRecvError;
 
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
@@ -343,22 +344,31 @@ impl LiquidatorBot {
             oracle_update = false;
 
             // Drain pyth updates first (non-blocking)
-            while let Ok(update) = pyth_price_feed.try_recv() {
-                let market_id = update.market_id;
-                let price = update.price;
+            loop {
+                match pyth_price_feed.try_recv() {
+                    Ok(update) => {
+                        let market_id = update.market_id;
+                        let price = update.price;
 
-                match update.market_type {
-                    MarketType::Perp => {
-                        pyth_perp_prices.insert(market_id, update);
-                        // Update market state with perp pyth price for margin calculation
-                        self.market_state
-                            .set_perp_pyth_price(market_id, price as i64);
+                        match update.market_type {
+                            MarketType::Perp => {
+                                pyth_perp_prices.insert(market_id, update);
+                                // Update market state with perp pyth price for margin calculation
+                                self.market_state
+                                    .set_perp_pyth_price(market_id, price as i64);
+                            }
+                            MarketType::Spot => {
+                                // Update market state with spot pyth price for margin calculation
+                                self.market_state
+                                    .set_spot_pyth_price(market_id, price as i64);
+                            }
+                        }
                     }
-                    MarketType::Spot => {
-                        // Update market state with spot pyth price for margin calculation
-                        self.market_state
-                            .set_spot_pyth_price(market_id, price as i64);
+                    Err(TryRecvError::Disconnected) => {
+                        log::warn!(target: TARGET, "pyth price feed disconnected");
+                        break;
                     }
+                    Err(TryRecvError::Empty) => break,
                 }
             }
 
