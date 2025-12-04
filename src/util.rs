@@ -298,11 +298,15 @@ fn fixed_rate(feed_id: u32) -> FixedRate {
 
 // scale pyth lazer price into drift price precision
 #[inline(always)]
-fn to_price_precision(price: u64, feed_id: u32) -> u64 {
+fn to_price_precision(price: u64, feed_id: u32, market_type: MarketType) -> u64 {
     match feed_id {
         // https://docs.pyth.network/lazer/price-feed-ids
         // LAZER_1M
-        4 | 9 => price * 100, // -10
+        9 => match market_type {
+            MarketType::Perp => price * 100, // -10
+            MarketType::Spot => price / 100, // -8
+        },
+        4 => price * 100, // -10
         // LAZER_1K
         137 => price * 1000, // -10
         _ => price / 100,    // -8
@@ -407,12 +411,15 @@ pub fn subscribe_price_feeds(
                                                 // TODO: bulk msg to avoid bouncing around tokio, bucket in some way, one message updates multiple markets...
                                                 let feed_id = f.feed_id.0;
                                                 let price: u64 = new_price.0.unsigned_abs().into();
-                                                let scaled_price =
-                                                    to_price_precision(price, feed_id);
 
                                                 if let Some(market_id) =
                                                     pyth_lazer_feed_id_to_perp_market_index(feed_id)
                                                 {
+                                                    let scaled_price = to_price_precision(
+                                                        price,
+                                                        feed_id,
+                                                        MarketType::Perp,
+                                                    );
                                                     let _ = price_tx.try_send(PythPriceUpdate {
                                                         market_type: MarketType::Perp,
                                                         market_id,
@@ -426,6 +433,11 @@ pub fn subscribe_price_feeds(
                                                 if let Some(market_id) =
                                                     pyth_lazer_feed_id_to_spot_market_index(feed_id)
                                                 {
+                                                    let scaled_price = to_price_precision(
+                                                        price,
+                                                        feed_id,
+                                                        MarketType::Spot,
+                                                    );
                                                     let _ = price_tx.try_send(PythPriceUpdate {
                                                         market_type: MarketType::Spot,
                                                         market_id,
