@@ -25,8 +25,7 @@ use drift_rs::{
     titan,
     types::{
         accounts::{PerpMarket, SpotMarket, User},
-        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, Order,
-        OrderStatus, PerpPosition, SpotBalanceType, SpotPosition,
+        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, SpotBalanceType,
     },
     DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
 };
@@ -78,7 +77,7 @@ fn current_time_millis() -> u64 {
 
 /// Check margin status (liquidatable, high-risk, or safe)
 fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatus {
-    const LIQUIDATION_BUFFER: f64 = 0.99;
+    const LIQUIDATION_BUFFER: f64 = 0.95;
 
     let buffered_margin_req = (margin_info.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
 
