@@ -470,14 +470,19 @@ impl LiquidatorBot {
 
                 for pubkey in &high_risk {
                     if let Some(user) = users.get(&pubkey) {
-                        let margin_info = self
+                        let margin_info = match self
                             .market_state
                             .calculate_simplified_margin_requirement(
                                 user,
                                 MarginRequirementType::Maintenance,
                                 Some(liquidation_margin_buffer_ratio),
-                            )
-                            .unwrap();
+                            ) {
+                            Ok(info) => info,
+                            Err(e) => {
+                                log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                                continue;
+                            }
+                        };
 
                         match check_margin_status(&margin_info) {
                             MarginStatus::Liquidatable => {
