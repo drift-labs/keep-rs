@@ -308,8 +308,8 @@ fn to_price_precision(price: u64, feed_id: u32, market_type: MarketType) -> u64 
         },
         4 => price * 100, // -10
         // LAZER_1K
-        137 => price * 1000, // -10
-        _ => price / 100,    // -8
+        137 | 2396 | 1578 => price * 1000, // -10
+        _ => price / 100,                  // -8
     }
 }
 
