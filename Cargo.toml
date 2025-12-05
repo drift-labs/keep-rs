@@ -14,7 +14,7 @@ axum = "0.8"
 clap = { version = "4.5.40", "features" = ["env", "derive"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "7675ce0", features = ["unsafe_pub", "titan"] }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs", rev = "f2500e7", features = ["unsafe_pub", "titan"] }
 env_logger = "0.11"
 # DLOB 'trace' logs are expensive so compile them out
 log = { version = "0.4", features = ["max_level_trace"] }

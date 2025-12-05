@@ -303,13 +303,17 @@ impl LiquidatorBot {
             .backend()
             .account_map()
             .iter_accounts_with::<User>(|pubkey, user, _slot| {
-                let margin_info = self
-                    .market_state
-                    .calculate_simplified_margin_requirement(
-                        user,
-                        MarginRequirementType::Maintenance,
-                        Some(liquidation_margin_buffer_ratio),
-                    ).unwrap();
+                let margin_info = match self.market_state.calculate_simplified_margin_requirement(
+                    user,
+                    MarginRequirementType::Maintenance,
+                    Some(liquidation_margin_buffer_ratio),
+                ) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                        return;
+                    }
+                };
 
                 if margin_info.total_collateral < config.min_collateral as i128
                     && margin_info.margin_requirement < config.min_collateral as u128
@@ -390,14 +394,19 @@ impl LiquidatorBot {
                             );
                             users.insert(pubkey, user.clone());
                             // calculate user margin after update
-                            let margin_info = self
+                            let margin_info = match self
                                 .market_state
                                 .calculate_simplified_margin_requirement(
                                     &user,
                                     MarginRequirementType::Maintenance,
                                     Some(liquidation_margin_buffer_ratio),
-                                )
-                                .unwrap();
+                                ) {
+                                Ok(info) => info,
+                                Err(e) => {
+                                    log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                                    continue;
+                                }
+                            };
 
                             if margin_info.total_collateral < config.min_collateral as i128
                                 && margin_info.margin_requirement < config.min_collateral as u128
@@ -487,14 +496,18 @@ impl LiquidatorBot {
 
                     for pubkey in high_risk_list {
                         if let Some(user) = users_clone.get(&pubkey) {
-                            let margin_info = market_state
+                            let margin_info = match market_state
                                 .calculate_simplified_margin_requirement(
                                     user,
                                     MarginRequirementType::Maintenance,
                                     Some(liquidation_margin_buffer_ratio),
-                                )
-                                .unwrap();
-
+                                ) {
+                                Ok(info) => info,
+                                Err(e) => {
+                                    log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                                    continue;
+                                }
+                            };
                             match check_margin_status(&margin_info) {
                                 MarginStatus::Liquidatable => {
                                     log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
@@ -633,14 +646,15 @@ impl LiquidatorBot {
                 let t0 = current_time_millis();
                 high_risk.retain(|pubkey| {
                     if let Some(user) = users.get(pubkey) {
-                        let margin_info = self
-                            .market_state
-                            .calculate_simplified_margin_requirement(
+                        let margin_info =
+                            match self.market_state.calculate_simplified_margin_requirement(
                                 user,
                                 MarginRequirementType::Maintenance,
                                 Some(liquidation_margin_buffer_ratio),
-                            )
-                            .unwrap();
+                            ) {
+                                Ok(info) => info,
+                                Err(_) => return false,
+                            };
 
                         match check_margin_status(&margin_info) {
                             MarginStatus::Liquidatable | MarginStatus::HighRisk => true,
@@ -670,14 +684,19 @@ impl LiquidatorBot {
                         continue;
                     }
 
-                    let margin_info = self
+                    let margin_info = match self
                         .market_state
                         .calculate_simplified_margin_requirement(
                             user,
                             MarginRequirementType::Maintenance,
                             Some(liquidation_margin_buffer_ratio),
-                        )
-                        .unwrap();
+                        ) {
+                        Ok(info) => info,
+                        Err(e) => {
+                            log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                            continue;
+                        }
+                    };
 
                     match check_margin_status(&margin_info) {
                         MarginStatus::Liquidatable => {
