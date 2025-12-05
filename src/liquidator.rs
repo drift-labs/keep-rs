@@ -348,7 +348,7 @@ impl LiquidatorBot {
             oracle_update = false;
 
             // Drain pyth updates first (non-blocking)
-            loop {
+            'pyth: loop {
                 match pyth_price_feed.try_recv() {
                     Ok(update) => {
                         let market_id = update.market_id;
@@ -372,7 +372,7 @@ impl LiquidatorBot {
                         log::error!(target: TARGET, "pyth price feed disconnected");
                         return;
                     }
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => break 'pyth,
                 }
             }
 
@@ -419,20 +419,6 @@ impl LiquidatorBot {
                                     MarginStatus::Liquidatable => {
                                         log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                         high_risk.insert(pubkey);
-                                        // let pyth_price_update = user
-                                        //     .perp_positions
-                                        //     .iter()
-                                        //     .filter(|p| p.base_asset_amount != 0)
-                                        //     .max_by_key(|p| p.quote_asset_amount.abs())
-                                        //     .and_then(|p| pyth_perp_prices.get(&p.market_index).cloned());
-                                        //
-                                        // self.liq_tx.try_send((
-                                        //     pubkey,
-                                        //     user.clone(),
-                                        //     current_slot,
-                                        //     current_time_millis(),
-                                        //     pyth_price_update,
-                                        // ));
                                     }
                                     MarginStatus::HighRisk => {
                                         high_risk.insert(pubkey);
@@ -479,168 +465,67 @@ impl LiquidatorBot {
             // Only recheck margin for high-risk users on oracle price updates
             // Process in batches to avoid blocking the main event loop
             if oracle_update {
-                let high_risk_list: Vec<Pubkey> = high_risk.iter().copied().collect();
-                let high_risk_count = high_risk_list.len();
+                let high_risk_count = high_risk.len();
+                let t0 = current_time_millis();
+                let mut liquidatable_users = Vec::new();
 
-                // Spawn async task to check high-risk users without blocking event loop
-                let users_clone = users.clone();
-                let market_state = self.market_state;
-                let liq_tx_clone = self.liq_tx.clone();
-                let pyth_perp_prices_clone = pyth_perp_prices.clone();
+                for pubkey in &high_risk {
+                    if let Some(user) = users.get(&pubkey) {
+                        let margin_info = self
+                            .market_state
+                            .calculate_simplified_margin_requirement(
+                                user,
+                                MarginRequirementType::Maintenance,
+                                Some(liquidation_margin_buffer_ratio),
+                            )
+                            .unwrap();
 
-                let current_slot_clone = current_slot;
-
-                tokio::spawn(async move {
-                    let t0 = current_time_millis();
-                    let mut liquidatable_users = Vec::new();
-
-                    for pubkey in high_risk_list {
-                        if let Some(user) = users_clone.get(&pubkey) {
-                            let margin_info = match market_state
-                                .calculate_simplified_margin_requirement(
-                                    user,
-                                    MarginRequirementType::Maintenance,
-                                    Some(liquidation_margin_buffer_ratio),
-                                ) {
-                                Ok(info) => info,
-                                Err(e) => {
-                                    log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
-                                    continue;
-                                }
-                            };
-                            match check_margin_status(&margin_info) {
-                                MarginStatus::Liquidatable => {
-                                    log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
-
-                                    // Collect spot market IDs from open spot positions
-                                    let mut spot_market_ids: HashSet<u16> = user
-                                        .spot_positions
-                                        .iter()
-                                        .filter(|p| !p.is_available())
-                                        .map(|p| p.market_index)
-                                        .collect();
-
-                                    // Collect perp market IDs from open perp positions
-                                    let mut perp_market_ids: HashSet<u16> = user
-                                        .perp_positions
-                                        .iter()
-                                        .filter(|p| !p.is_available())
-                                        .map(|p| p.market_index)
-                                        .collect();
-
-                                    // Add market IDs from orders to the same sets
-                                    for order in
-                                        user.orders.iter().filter(|o| o.base_asset_amount != 0)
-                                    {
-                                        match order.market_type {
-                                            MarketType::Spot => {
-                                                spot_market_ids.insert(order.market_index);
-                                            }
-                                            MarketType::Perp => {
-                                                perp_market_ids.insert(order.market_index);
-                                            }
-                                        }
-                                    }
-
-                                    // Log market IDs
-                                    log::info!(
-                                        target: TARGET,
-                                        "user {:?} (sub: {}) slot: {current_slot_clone}, spot positions: {:?}, perp positions: {:?}, orders: {:?}",
-                                        user.authority,
-                                        user.sub_account_id,
-                                        user.spot_positions.iter().filter(|p| spot_market_ids.contains(&p.market_index) && !p.is_available()).collect::<Vec<&SpotPosition>>(),
-                                        user.perp_positions.iter().filter(|p| perp_market_ids.contains(&p.market_index)).collect::<Vec<&PerpPosition>>(),
-                                        user.orders.iter().filter(|o| o.base_asset_amount != 0 && o.status == OrderStatus::Open).collect::<Vec<&Order>>(),
-                                    );
-
-                                    // Log oracle prices for spot markets
-                                    for market_index in &spot_market_ids {
-                                        if let Some(oracle_price) =
-                                            market_state.get_spot_oracle_price(*market_index)
-                                        {
-                                            log::info!(
-                                                target: TARGET,
-                                                "spot market {} oracle price: {} (confidence: {}, delay: {})",
-                                                market_index,
-                                                oracle_price.price,
-                                                oracle_price.confidence,
-                                                oracle_price.delay
-                                            );
-                                        } else {
-                                            log::warn!(
-                                                target: TARGET,
-                                                "spot market {} oracle price not available",
-                                                market_index
-                                            );
-                                        }
-                                    }
-
-                                    // Log oracle prices for perp markets
-                                    for market_index in &perp_market_ids {
-                                        if let Some(oracle_price) =
-                                            market_state.get_perp_oracle_price(*market_index)
-                                        {
-                                            log::info!(
-                                                target: TARGET,
-                                                "perp market {} oracle price: {} (confidence: {}, delay: {})",
-                                                market_index,
-                                                oracle_price.price,
-                                                oracle_price.confidence,
-                                                oracle_price.delay
-                                            );
-                                        } else {
-                                            log::warn!(
-                                                target: TARGET,
-                                                "perp market {} oracle price not available",
-                                                market_index
-                                            );
-                                        }
-                                    }
-
-                                    liquidatable_users.push((pubkey, user.clone()));
-                                }
-                                _ => {}
+                        match check_margin_status(&margin_info) {
+                            MarginStatus::Liquidatable => {
+                                log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                                liquidatable_users.push((pubkey, user.clone()));
                             }
+                            _ => {}
                         }
                     }
+                }
 
-                    // Send liquidations outside the loop
-                    for (pubkey, user) in liquidatable_users {
-                        let pyth_price_update = user
-                            .perp_positions
-                            .iter()
-                            .filter(|p| p.base_asset_amount != 0)
-                            .max_by_key(|p| p.quote_asset_amount.abs())
-                            .and_then(|p| pyth_perp_prices_clone.get(&p.market_index).cloned());
+                // Send liquidations outside the loop
+                for (pubkey, user) in liquidatable_users {
+                    let pyth_price_update = user
+                        .perp_positions
+                        .iter()
+                        .filter(|p| p.base_asset_amount != 0)
+                        .max_by_key(|p| p.quote_asset_amount.abs())
+                        .and_then(|p| pyth_perp_prices.get(&p.market_index).cloned());
 
-                        match liq_tx_clone.try_send((
-                            pubkey,
-                            user,
-                            current_slot_clone,
-                            current_time_millis(),
-                            pyth_price_update,
-                        )) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                log::warn!(
-                                    target: TARGET,
-                                    "liquidation channel full, dropping liquidation for {:?}",
-                                    pubkey
-                                );
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                log::error!(target: TARGET, "liquidation channel closed");
-                            }
+                    match self.liq_tx.try_send((
+                        *pubkey,
+                        user,
+                        current_slot,
+                        current_time_millis(),
+                        pyth_price_update,
+                    )) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!(
+                                target: TARGET,
+                                "liquidation channel full, dropping liquidation for {:?}",
+                                pubkey
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            log::error!(target: TARGET, "liquidation channel closed");
                         }
                     }
+                }
 
-                    log::trace!(
-                        target: TARGET,
-                        "processed {} high-risk margin updates in {}ms",
-                        high_risk_count,
-                        current_time_millis() - t0,
-                    );
-                });
+                log::trace!(
+                    target: TARGET,
+                    "processed {} high-risk margin updates in {}ms",
+                    high_risk_count,
+                    current_time_millis() - t0,
+                );
 
                 // Update high_risk set synchronously but quickly (just remove safe users)
                 let t0 = current_time_millis();
