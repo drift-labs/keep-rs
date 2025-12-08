@@ -303,13 +303,13 @@ fn to_price_precision(price: u64, feed_id: u32, market_type: MarketType) -> u64 
         // https://docs.pyth.network/lazer/price-feed-ids
         // LAZER_1M
         9 => match market_type {
-            MarketType::Perp => price * 100, // -10
-            MarketType::Spot => price / 100, // -8
+            MarketType::Perp => price * 100,    // -10 => -6 * 1M
+            MarketType::Spot => price / 10_000, // -10 => -6
         },
-        4 => price * 100, // -10
+        4 => price * 100, // -10 => -6 * 1M
         // LAZER_1K
-        137 | 2396 | 1578 => price * 1000, // -10
-        _ => price / 100,                  // -8
+        137 | 2396 | 1578 => price * 10, // -8 => -6 * 1K
+        _ => price / 100,                // -8 => -6
     }
 }
 
