@@ -1,6 +1,17 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use drift_rs::{dlob::MakerCrosses, types::MarketId, Pubkey};
+use drift_rs::{
+    constants::{
+        perp_market_index_to_pyth_lazer_feed_id, pyth_lazer_feed_id_to_perp_market_index,
+        pyth_lazer_feed_id_to_spot_market_index, spot_market_index_to_pyth_lazer_feed_id,
+    },
+    dlob::{L3Order, MakerCrosses},
+    types::{MarketId, MarketType},
+    Pubkey,
+};
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
 use pyth_lazer_protocol::{
@@ -166,29 +177,29 @@ impl TxIntent {
         }
     }
 
-    pub fn crosses_and_slot(&self) -> (Vec<(drift_rs::dlob::types::OrderMetadata, u64, u64)>, u64) {
+    pub fn crosses_and_slot(&self) -> (Vec<(L3Order, u64)>, u64) {
         match self {
             TxIntent::None => (vec![], 0),
-            TxIntent::AuctionFill { maker_crosses, .. } => (
-                maker_crosses
-                    .orders
-                    .iter()
-                    .map(|(meta, price, size)| (*meta, *price, *size))
-                    .collect(),
-                maker_crosses.slot,
-            ),
-            TxIntent::SwiftFill { maker_crosses, .. } => (
-                maker_crosses
-                    .orders
-                    .iter()
-                    .map(|(meta, price, size)| (*meta, *price, *size))
-                    .collect(),
-                maker_crosses.slot,
-            ),
+            TxIntent::AuctionFill { maker_crosses, .. } => {
+                (maker_crosses.orders.to_vec(), maker_crosses.slot)
+            }
+            TxIntent::SwiftFill { maker_crosses, .. } => {
+                (maker_crosses.orders.to_vec(), maker_crosses.slot)
+            }
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),
             Self::LiquidateWithFill { slot, .. } => (vec![], *slot),
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
+        }
+    }
+
+    pub fn slot(&self) -> Option<u64> {
+        match self {
+            Self::VAMMTakerFill { slot, .. }
+            | Self::LimitUncross { slot, .. }
+            | Self::LiquidateWithFill { slot, .. }
+            | Self::LiquidateSpot { slot, .. } => Some(*slot),
+            _ => None,
         }
     }
 }
@@ -268,6 +279,7 @@ impl<const N: usize> PendingTxs<N> {
 
 #[derive(Clone, Debug)]
 pub struct PythPriceUpdate {
+    pub market_type: MarketType,
     pub market_id: u16,
     pub feed_id: u32,
     pub price: u64,
@@ -286,37 +298,66 @@ fn fixed_rate(feed_id: u32) -> FixedRate {
 
 // scale pyth lazer price into drift price precision
 #[inline(always)]
-fn to_price_precision(price: u64, feed_id: u32) -> u64 {
+fn to_price_precision(price: u64, feed_id: u32, market_type: MarketType) -> u64 {
     match feed_id {
         // https://docs.pyth.network/lazer/price-feed-ids
         // LAZER_1M
-        4 | 9 => price * 100, // -10
+        9 => match market_type {
+            MarketType::Perp => price * 100,    // -10 => -6 * 1M
+            MarketType::Spot => price / 10_000, // -10 => -6
+        },
+        4 => price * 100, // -10 => -6 * 1M
         // LAZER_1K
-        137 => price * 1000, // -10
-        _ => price / 100,    // -8
+        1578 | 2396 | 137 => match market_type {
+            MarketType::Perp => price * 10,  // -10 => -6 * 1K
+            MarketType::Spot => price / 100, // -8 => -6
+        },
+        _ => price / 100, // -8 => -6
     }
 }
 
 pub fn subscribe_price_feeds(
     mut cli: pyth_lazer_client::LazerClient,
-    market_ids: &[MarketId],
+    perp_market_ids: &[MarketId],
+    spot_market_ids: &[MarketId],
 ) -> tokio::sync::mpsc::Receiver<PythPriceUpdate> {
-    let feed_ids: Vec<PriceFeedId> = market_ids
-        .iter()
-        .filter_map(|m| {
-            drift_rs::constants::perp_market_index_to_pyth_lazer_feed_id(m.index()).map(PriceFeedId)
-        })
-        .collect();
+    let mut feed_id_set = HashSet::new();
+
+    for m in perp_market_ids {
+        if let Some(fid) = perp_market_index_to_pyth_lazer_feed_id(m.index()) {
+            feed_id_set.insert(fid);
+        }
+    }
+
+    for m in spot_market_ids {
+        if let Some(fid) = spot_market_index_to_pyth_lazer_feed_id(m.index()) {
+            feed_id_set.insert(fid);
+        }
+    }
+
+    let feed_ids: Vec<PriceFeedId> = feed_id_set.into_iter().map(PriceFeedId).collect();
+
+    const MAX_RETRIES: u32 = 10;
 
     let (price_tx, price_rx) = tokio::sync::mpsc::channel(512);
+
+    let mut retries = 0u32;
     tokio::spawn(async move {
         loop {
             let pyth_lazer_stream = match cli.start().await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    log::error!(target: "filler", "pyth feed start failed: {err:?}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                    retries += 1;
+
+                    if retries >= MAX_RETRIES {
+                        log::error!(target: "pyth", "feed connection failed after {MAX_RETRIES} attempts, shutting down");
+                        return;
+                    } else {
+                        let backoff = 2u64.pow(retries).min(30); // 2^retries seconds, capped at 30s
+                        log::warn!(target: "pyth", "feed connection failed: {err:?}, retry {retries}/{MAX_RETRIES} in {backoff}s");
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                        continue;
+                    }
                 }
             };
 
@@ -351,6 +392,8 @@ pub fn subscribe_price_feeds(
                 }
             }
 
+            retries = 0u32; // retry on successful connect
+
             let mut stream = pyth_lazer_stream.boxed();
             while let Some(update) = stream.next().await {
                 match update {
@@ -370,19 +413,43 @@ pub fn subscribe_price_feeds(
                                             {
                                                 // TODO: bulk msg to avoid bouncing around tokio, bucket in some way, one message updates multiple markets...
                                                 let feed_id = f.feed_id.0;
-                                                let market = drift_rs::constants::pyth_lazer_feed_id_to_perp_market_index(feed_id);
-                                                if market.is_none() {
-                                                    log::warn!(target: "filler", "unmapped market for pyth update feedId: {feed_id:?}");
-                                                    continue;
-                                                }
                                                 let price: u64 = new_price.0.unsigned_abs().into();
-                                                price_tx.try_send(PythPriceUpdate {
-                                                    market_id: market.unwrap(),
-                                                    feed_id,
-                                                    price: to_price_precision(price, feed_id),
-                                                    message: buf.clone(),
-                                                    ts: data.timestamp_us,
-                                                });
+
+                                                if let Some(market_id) =
+                                                    pyth_lazer_feed_id_to_perp_market_index(feed_id)
+                                                {
+                                                    let scaled_price = to_price_precision(
+                                                        price,
+                                                        feed_id,
+                                                        MarketType::Perp,
+                                                    );
+                                                    let _ = price_tx.try_send(PythPriceUpdate {
+                                                        market_type: MarketType::Perp,
+                                                        market_id,
+                                                        feed_id,
+                                                        price: scaled_price,
+                                                        message: buf.clone(),
+                                                        ts: data.timestamp_us,
+                                                    });
+                                                }
+
+                                                if let Some(market_id) =
+                                                    pyth_lazer_feed_id_to_spot_market_index(feed_id)
+                                                {
+                                                    let scaled_price = to_price_precision(
+                                                        price,
+                                                        feed_id,
+                                                        MarketType::Spot,
+                                                    );
+                                                    let _ = price_tx.try_send(PythPriceUpdate {
+                                                        market_type: MarketType::Spot,
+                                                        market_id,
+                                                        feed_id,
+                                                        price: scaled_price,
+                                                        message: buf.clone(),
+                                                        ts: data.timestamp_us,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -396,7 +463,15 @@ pub fn subscribe_price_feeds(
                     }
                 }
             }
-            log::error!(target: "filler", "pyth lazer feed finished");
+            // stream ended, will retry
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                log::error!(target: "pyth", "feed disconnected after {MAX_RETRIES} attempts, shutting down");
+                return;
+            }
+            let backoff = 2u64.pow(retries).min(30);
+            log::warn!(target: "pyth", "feed disconnected, retry {retries}/{MAX_RETRIES} in {backoff}s");
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
         }
     });
 

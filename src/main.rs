@@ -8,7 +8,10 @@ mod util;
 
 use crate::{
     filler::FillerBot,
-    http::{health_handler, metrics_handler, Metrics},
+    http::{
+        dashboard_api_handler, dashboard_handler, health_handler, metrics_handler,
+        DashboardStateRef, Metrics,
+    },
     liquidator::LiquidatorBot,
 };
 use clap::Parser;
@@ -73,13 +76,15 @@ impl Config {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
     env_logger::init();
     let _ = dotenv::dotenv();
 
     let config = Config::parse();
     let metrics = Arc::new(Metrics::new());
+    let dashboard_state: DashboardStateRef = Arc::new(tokio::sync::RwLock::new(None));
+
     // Start Prometheus metrics server
     let metrics_port = std::env::var("METRICS_PORT")
         .ok()
@@ -90,14 +95,20 @@ async fn main() {
         .await
         .expect("bind metrics port");
 
-    let metrics_ref = Arc::clone(&metrics);
+    let app_state = crate::http::AppState {
+        metrics: Arc::clone(&metrics),
+        dashboard_state: Arc::clone(&dashboard_state),
+    };
     let _http_task = tokio::spawn(async move {
         axum::serve(
             listener,
             axum::Router::new()
                 .route("/metrics", axum::routing::get(metrics_handler))
                 .route("/health", axum::routing::get(health_handler))
-                .with_state(metrics_ref),
+                .route("/", axum::routing::get(dashboard_handler))
+                .route("/dashboard", axum::routing::get(dashboard_handler))
+                .route("/api/dashboard", axum::routing::get(dashboard_api_handler))
+                .with_state(app_state),
         )
         .await
         .unwrap();
@@ -139,7 +150,7 @@ async fn main() {
     });
 
     if config.liquidator {
-        let bot = LiquidatorBot::new(config, drift, metrics).await;
+        let bot = LiquidatorBot::new(config, drift, metrics, dashboard_state).await;
         bot.run().await;
     } else if config.filler {
         let bot = FillerBot::new(config, drift, metrics).await;

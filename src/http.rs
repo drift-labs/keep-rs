@@ -5,11 +5,33 @@ use axum::{
     body::Body,
     extract::State,
     http::{header::CONTENT_TYPE, Response, StatusCode},
-    response::IntoResponse,
+    response::{Html, IntoResponse, Json},
 };
 use prometheus::{
-    Encoder, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
+    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
 };
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+/// Margin status indicating liquidation risk level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarginStatus {
+    /// User is liquidatable (total_collateral < margin_requirement)
+    Liquidatable,
+    /// User is high-risk but not yet liquidatable (free margin < 20% of margin requirement)
+    HighRisk,
+    /// User is safe (not liquidatable and not high-risk)
+    Safe,
+}
+
+/// Market type for positions and oracles
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketType {
+    Perp,
+    Spot,
+}
 
 #[derive(Debug)]
 pub struct Metrics {
@@ -23,8 +45,9 @@ pub struct Metrics {
     pub liquidation_attempts: IntCounterVec,
     pub liquidation_success: IntCounterVec,
     pub liquidation_failed: IntCounterVec,
-    pub jupiter_quote_latency: Histogram,
+    pub swap_quote_latency_ms: IntGauge,
     pub jupiter_quote_failures: IntCounter,
+    pub titan_quote_failures: IntCounter,
     pub confirmation_slots: HistogramVec,
     pub cu_spent: HistogramVec,
     pub registry: Registry,
@@ -121,13 +144,13 @@ impl Metrics {
             .register(Box::new(liquidation_failed.clone()))
             .unwrap();
 
-        let jupiter_quote_latency = Histogram::with_opts(prometheus::HistogramOpts::new(
-            "rfb_jupiter_quote_latency_ms",
-            "Jupiter quote request latency in milliseconds",
-        ))
+        let swap_quote_latency_ms = IntGauge::new(
+            "rfb_swap_quote_latency_ms",
+            "Swap quote request latency in milliseconds",
+        )
         .unwrap();
         registry
-            .register(Box::new(jupiter_quote_latency.clone()))
+            .register(Box::new(swap_quote_latency_ms.clone()))
             .unwrap();
 
         let jupiter_quote_failures = IntCounter::new(
@@ -137,6 +160,15 @@ impl Metrics {
         .unwrap();
         registry
             .register(Box::new(jupiter_quote_failures.clone()))
+            .unwrap();
+
+        let titan_quote_failures = IntCounter::new(
+            "rfb_titan_quote_failures_total",
+            "Number of Titan quote failures",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(titan_quote_failures.clone()))
             .unwrap();
 
         let confirmation_slots = HistogramVec::new(
@@ -167,8 +199,9 @@ impl Metrics {
             liquidation_attempts,
             liquidation_success,
             liquidation_failed,
-            jupiter_quote_latency,
+            swap_quote_latency_ms,
             jupiter_quote_failures,
+            titan_quote_failures,
             confirmation_slots,
             cu_spent,
             registry,
@@ -178,8 +211,8 @@ impl Metrics {
     }
 }
 
-pub async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoResponse {
-    let metric_families = metrics.registry.gather();
+pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let metric_families = state.metrics.registry.gather();
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();
     encoder.encode(&metric_families, &mut buffer).unwrap();
@@ -196,4 +229,75 @@ pub async fn health_handler() -> impl IntoResponse {
         .status(StatusCode::OK)
         .body(Body::empty())
         .unwrap()
+}
+
+/// Dashboard state shared between liquidator and HTTP server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardState {
+    pub high_risk_users: Vec<HighRiskUser>,
+    pub oracle_prices: Vec<OraclePriceInfo>,
+    pub current_slot: u64,
+    pub last_updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighRiskUser {
+    pub pubkey: String,
+    pub authority: String,
+    pub total_collateral: i128,
+    pub margin_requirement: u128,
+    pub free_margin: i128,
+    pub free_margin_ratio: f64,
+    pub status: MarginStatus,
+    pub last_updated_slot: u64,
+    pub last_updated_ms: u64,
+    pub positions: Vec<PositionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionInfo {
+    pub market_type: MarketType,
+    pub market_index: u16,
+    pub base_asset_amount: i64,
+    pub quote_asset_amount: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OraclePriceInfo {
+    pub market_type: MarketType,
+    pub market_index: u16,
+    pub price: i64,
+    pub last_updated_slot: u64,
+    pub last_updated_ms: u64,
+    pub age_slots: u64,
+    pub age_ms: u64,
+    pub is_stale: bool,
+}
+
+/// Shared dashboard state
+pub type DashboardStateRef = Arc<RwLock<Option<DashboardState>>>;
+
+/// Combined state for HTTP handlers
+#[derive(Clone)]
+pub struct AppState {
+    pub metrics: Arc<Metrics>,
+    pub dashboard_state: DashboardStateRef,
+}
+
+/// API endpoint to get dashboard data
+pub async fn dashboard_api_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let dashboard_state = state.dashboard_state.read().await;
+    match dashboard_state.as_ref() {
+        Some(data) => Json(data.clone()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Dashboard data not available"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Serve the dashboard HTML page
+pub async fn dashboard_handler() -> Html<&'static str> {
+    Html(include_str!("../static/dashboard.html"))
 }
