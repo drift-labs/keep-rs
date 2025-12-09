@@ -282,7 +282,7 @@ async fn update_dashboard_state(
 
 /// Check margin status (liquidatable, high-risk, or safe)
 fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatus {
-    const LIQUIDATION_BUFFER: f64 = 0.999;
+    const LIQUIDATION_BUFFER: f64 = 1.0;
 
     let buffered_margin_req = (margin_info.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
 
