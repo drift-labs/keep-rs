@@ -61,10 +61,6 @@ const MAX_USER_AGE_SLOTS: u64 = 100;
 const MAX_ORACLE_AGE_SLOTS: u64 = 50;
 /// Maximum age for Pyth prices in milliseconds before considering stale
 const MAX_PYTH_AGE_MS: u64 = 5000;
-/// Maximum age for user account before sending to liquidation worker (ms)
-const MAX_LIQUIDATION_USER_AGE_MS: u64 = 2000;
-/// Maximum slot age for user account before sending to liquidation worker
-const MAX_LIQUIDATION_SLOT_AGE: u64 = 10;
 
 /// Metadata tracking for user accounts to detect staleness
 #[derive(Clone, Debug)]
@@ -799,25 +795,6 @@ impl LiquidatorBot {
 
                 // Send liquidations outside the loop
                 for (pubkey, user) in liquidatable_users {
-                    // Final staleness check before sending to liquidation worker
-                    if let Some(user_meta) = users.get(&pubkey) {
-                        let now_ms = current_time_millis();
-                        let user_age_ms =
-                            now_ms.saturating_sub(user_meta.last_updated_timestamp_ms);
-                        let slot_age = current_slot.saturating_sub(user_meta.last_updated_slot);
-
-                        if user_age_ms > MAX_LIQUIDATION_USER_AGE_MS
-                            || slot_age > MAX_LIQUIDATION_SLOT_AGE
-                        {
-                            log::warn!(
-                                target: TARGET,
-                                "Dropping liquidation for {:?}: user data stale ({}ms, {} slots)",
-                                pubkey, user_age_ms, slot_age
-                            );
-                            continue;
-                        }
-                    }
-
                     let pyth_price_update = user
                         .perp_positions
                         .iter()
@@ -1009,23 +986,6 @@ impl LiquidatorBot {
                                         }
                                     })
                                 });
-
-                            // Final staleness check before sending to liquidation worker
-                            let now_ms = current_time_millis();
-                            let user_age_ms =
-                                now_ms.saturating_sub(user_meta.last_updated_timestamp_ms);
-                            let slot_age = current_slot.saturating_sub(user_meta.last_updated_slot);
-
-                            if user_age_ms > MAX_LIQUIDATION_USER_AGE_MS
-                                || slot_age > MAX_LIQUIDATION_SLOT_AGE
-                            {
-                                log::warn!(
-                                    target: TARGET,
-                                    "Dropping liquidation for {:?}: user data stale ({}ms, {} slots)",
-                                    pubkey, user_age_ms, slot_age
-                                );
-                                continue;
-                            }
 
                             match self.liq_tx.try_send((
                                 *pubkey,
