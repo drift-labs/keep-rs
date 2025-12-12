@@ -25,6 +25,26 @@ pub enum MarginStatus {
     Safe,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMarginStatus {
+    pub cross: MarginStatus,
+    pub isolated: Vec<(u16, MarginStatus)>, // (market_index, status)
+}
+
+impl UserMarginStatus {
+    pub fn is_liquidatable(&self) -> bool {
+        self.cross == MarginStatus::Liquidatable
+            || self
+                .isolated
+                .iter()
+                .any(|(_, s)| *s == MarginStatus::Liquidatable)
+    }
+
+    pub fn is_at_risk(&self) -> bool {
+        self.cross != MarginStatus::Safe || !self.isolated.is_empty()
+    }
+}
+
 /// Market type for positions and oracles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
