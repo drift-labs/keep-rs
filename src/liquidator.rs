@@ -287,7 +287,7 @@ async fn update_dashboard_state(
 /// Check margin status (liquidatable, high-risk, or safe)
 fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginStatus {
     const LIQUIDATION_BUFFER: f64 = 1.0;
-    let mut isolated = Vec::new();
+    let mut isolated = Vec::with_capacity(8);
 
     // Check isolated positions
     for calc in &margin_info.isolated_margin_calculations {
@@ -1463,11 +1463,9 @@ impl LiquidateWithMatchStrategy {
         // Check isolated liquidations first
         for (market_index, iso_status) in &status.isolated {
             if *iso_status == MarginStatus::Liquidatable {
-                if let Some(pos) = user_account
-                    .perp_positions
-                    .iter()
-                    .find(|p| p.market_index == *market_index && p.base_asset_amount != 0)
-                {
+                if let Some(pos) = user_account.perp_positions.iter().find(|p| {
+                    p.market_index == *market_index && p.isolated_position_scaled_balance != 0
+                }) {
                     metrics
                         .liquidation_attempts
                         .with_label_values(&["perp"])

@@ -28,6 +28,7 @@ pub enum MarginStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMarginStatus {
     pub cross: MarginStatus,
+    /// Only contains isolated positions that are high risk or liquidatable
     pub isolated: Vec<(u16, MarginStatus)>, // (market_index, status)
 }
 
