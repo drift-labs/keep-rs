@@ -454,8 +454,13 @@ impl LiquidatorBot {
             pyth_access_token.as_str(),
         )
         .expect("pyth price feed connects");
-        let pyth_price_feed =
-            crate::util::subscribe_price_feeds(pyth_feed_cli, &perp_market_ids, &spot_market_ids);
+
+        let pyth_price_feed: tokio::sync::mpsc::Receiver<_> = if config.use_spot_liquidation {
+            crate::util::subscribe_price_feeds(pyth_feed_cli, &perp_market_ids, &spot_market_ids)
+        } else {
+            crate::util::subscribe_price_feeds(pyth_feed_cli, &perp_market_ids, &[])
+        };
+
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
         // start liquidation worker
@@ -470,6 +475,7 @@ impl LiquidatorBot {
                 market_state,
                 keeper_subaccount,
                 metrics: Arc::clone(&metrics),
+                use_spot_liquidation: config.use_spot_liquidation,
             }),
             liq_rx,
             std::env::var("FILL_CU_LIMIT")
@@ -1352,6 +1358,7 @@ pub struct LiquidateWithMatchStrategy {
     pub market_state: &'static MarketState,
     pub keeper_subaccount: Pubkey,
     pub metrics: Arc<Metrics>,
+    pub use_spot_liquidation: bool,
 }
 
 impl LiquidateWithMatchStrategy {
@@ -1724,18 +1731,23 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             slot,
             pyth_price_update,
         );
-        Self::liquidate_spot(
-            self.drift.clone(),
-            Arc::clone(&self.metrics),
-            self.market_state.load(),
-            self.keeper_subaccount,
-            liquidatee,
-            user_account,
-            tx_sender.clone(),
-            priority_fee,
-            400_000,
-            slot,
-        )
-        .boxed()
+
+        if self.use_spot_liquidation {
+            Self::liquidate_spot(
+                self.drift.clone(),
+                Arc::clone(&self.metrics),
+                self.market_state.load(),
+                self.keeper_subaccount,
+                liquidatee,
+                user_account,
+                tx_sender.clone(),
+                priority_fee,
+                400_000,
+                slot,
+            )
+            .boxed()
+        } else {
+            async {}.boxed()
+        }
     }
 }
