@@ -32,7 +32,7 @@ pub struct Config {
     #[clap(long, default_value = "false")]
     pub liquidator: bool,
     /// Use spot liquidation in liquidator
-    #[clap(long, default_value = "true")]
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
     pub use_spot_liquidation: bool,
     /// Run perp filler bot
     #[clap(long, default_value = "true")]
