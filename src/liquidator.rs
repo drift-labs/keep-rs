@@ -1732,23 +1732,22 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             pyth_price_update,
         );
 
-        async move {
-            if self.use_spot_liquidation {
-                Self::liquidate_spot(
-                    self.drift.clone(),
-                    Arc::clone(&self.metrics),
-                    self.market_state.load(),
-                    self.keeper_subaccount,
-                    liquidatee,
-                    user_account,
-                    tx_sender.clone(),
-                    priority_fee,
-                    400_000,
-                    slot,
-                )
-                .await;
-            }
+        if self.use_spot_liquidation {
+            Self::liquidate_spot(
+                self.drift.clone(),
+                Arc::clone(&self.metrics),
+                self.market_state.load(),
+                self.keeper_subaccount,
+                liquidatee,
+                user_account,
+                tx_sender.clone(),
+                priority_fee,
+                400_000,
+                slot,
+            )
+            .boxed()
+        } else {
+            async {}.boxed()
         }
-        .boxed()
     }
 }
