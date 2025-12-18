@@ -36,6 +36,7 @@ use crate::{
     filler::{TxSender, TxWorker},
     http::{
         DashboardState, DashboardStateRef, HighRiskUser, MarginStatus, Metrics, OraclePriceInfo,
+        UserMarginStatus,
     },
     util::{PythPriceUpdate, TxIntent},
     Config, UseMarkets,
@@ -191,10 +192,13 @@ async fn update_dashboard_state(
                 0.0
             };
 
-            let status = match check_margin_status(&margin_info) {
-                MarginStatus::Liquidatable => MarginStatus::Liquidatable,
-                MarginStatus::HighRisk => MarginStatus::HighRisk,
-                MarginStatus::Safe => continue, // Shouldn't happen if in high_risk set
+            let status = check_margin_status(&margin_info);
+            let display_status = if status.is_liquidatable() {
+                MarginStatus::Liquidatable
+            } else if status.is_at_risk() {
+                MarginStatus::HighRisk
+            } else {
+                continue;
             };
 
             let mut positions = Vec::new();
@@ -240,7 +244,7 @@ async fn update_dashboard_state(
                 margin_requirement: margin_info.margin_requirement,
                 free_margin,
                 free_margin_ratio,
-                status,
+                status: display_status,
                 last_updated_slot: user_meta.last_updated_slot,
                 last_updated_ms: user_meta.last_updated_timestamp_ms,
                 positions,
@@ -281,26 +285,48 @@ async fn update_dashboard_state(
 }
 
 /// Check margin status (liquidatable, high-risk, or safe)
-fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> MarginStatus {
+fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginStatus {
     const LIQUIDATION_BUFFER: f64 = 1.0;
+    let mut isolated = Vec::with_capacity(8);
 
-    let buffered_margin_req = (margin_info.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
-
-    if margin_info.total_collateral < buffered_margin_req {
-        return MarginStatus::Liquidatable;
-    }
-
-    // Calculate free margin
-    let free_margin = margin_info.total_collateral - margin_info.margin_requirement as i128;
-
-    // User is high-risk if free margin < 20% of margin requirement
-    if margin_info.margin_requirement > 0 && free_margin > 0 {
-        let free_margin_ratio = free_margin as f64 / margin_info.margin_requirement as f64;
-        if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
-            return MarginStatus::HighRisk;
+    // Check isolated positions
+    for calc in &margin_info.isolated_margin_calculations {
+        if !calc.is_empty() {
+            let buffered_iso_margin_req =
+                (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
+            if calc.total_collateral < buffered_iso_margin_req {
+                isolated.push((calc.market_index, MarginStatus::Liquidatable));
+            } else {
+                let free_margin = calc.total_collateral - calc.margin_requirement as i128;
+                if calc.margin_requirement > 0 && free_margin > 0 {
+                    let free_margin_ratio = free_margin as f64 / calc.margin_requirement as f64;
+                    if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
+                        isolated.push((calc.market_index, MarginStatus::HighRisk));
+                    }
+                }
+            }
         }
     }
-    MarginStatus::Safe
+
+    // Check cross margin
+    let buffered_margin_req = (margin_info.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
+    let cross = if margin_info.total_collateral < buffered_margin_req {
+        MarginStatus::Liquidatable
+    } else {
+        let free_margin = margin_info.total_collateral - margin_info.margin_requirement as i128;
+        if margin_info.margin_requirement > 0 && free_margin > 0 {
+            let free_margin_ratio = free_margin as f64 / margin_info.margin_requirement as f64;
+            if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
+                MarginStatus::HighRisk
+            } else {
+                MarginStatus::Safe
+            }
+        } else {
+            MarginStatus::Safe
+        }
+    };
+
+    UserMarginStatus { cross, isolated }
 }
 
 /// Trait for pluggable liquidation strategies
@@ -315,6 +341,7 @@ pub trait LiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
+        status: UserMarginStatus,
     ) -> futures_util::future::BoxFuture<'a, ()>;
 }
 
@@ -348,7 +375,14 @@ pub struct LiquidatorBot {
     /// receives new updates from grpc
     events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
     /// sends liquidatable accounts to work thread (pubkey, user, slot, timestamp_ms, pyth price)
-    liq_tx: tokio::sync::mpsc::Sender<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>,
+    liq_tx: tokio::sync::mpsc::Sender<(
+        Pubkey,
+        User,
+        u64,
+        u64,
+        Option<PythPriceUpdate>,
+        UserMarginStatus,
+    )>,
     pyth_price_feed: Option<tokio::sync::mpsc::Receiver<PythPriceUpdate>>,
     /// Dashboard state for HTTP API
     dashboard_state: DashboardStateRef,
@@ -464,8 +498,14 @@ impl LiquidatorBot {
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
         // start liquidation worker
-        let (liq_tx, liq_rx) =
-            tokio::sync::mpsc::channel::<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>(1024);
+        let (liq_tx, liq_rx) = tokio::sync::mpsc::channel::<(
+            Pubkey,
+            User,
+            u64,
+            u64,
+            Option<PythPriceUpdate>,
+            UserMarginStatus,
+        )>(1024);
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
@@ -550,12 +590,11 @@ impl LiquidatorBot {
                         },
                     );
                     // Check margin status and add to high-risk set if needed
-                    match check_margin_status(&margin_info) {
-                        MarginStatus::Liquidatable | MarginStatus::HighRisk => {
-                            high_risk.insert(*pubkey);
-                            initial_high_risk_count += 1;
-                        }
-                        MarginStatus::Safe => {}
+                    let status = check_margin_status(&margin_info);
+
+                    if status.is_at_risk(){
+                        high_risk.insert(*pubkey);
+                        initial_high_risk_count += 1;
                     }
                 }
             });
@@ -798,7 +837,7 @@ impl LiquidatorBot {
                 }
 
                 // Send liquidations outside the loop
-                for (pubkey, user) in liquidatable_users {
+                for (pubkey, user, status) in liquidatable_users {
                     let pyth_price_update = user
                         .perp_positions
                         .iter()
@@ -826,6 +865,7 @@ impl LiquidatorBot {
                         current_slot,
                         current_time_millis(),
                         pyth_price_update,
+                        status,
                     )) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -885,10 +925,7 @@ impl LiquidatorBot {
                                 Err(_) => return false,
                             };
 
-                        match check_margin_status(&margin_info) {
-                            MarginStatus::Liquidatable | MarginStatus::HighRisk => true,
-                            MarginStatus::Safe => false,
-                        }
+                        check_margin_status(&margin_info).is_at_risk()
                     } else {
                         false
                     }
@@ -965,13 +1002,14 @@ impl LiquidatorBot {
                         }
                     };
 
-                    match check_margin_status(&margin_info) {
-                        MarginStatus::Liquidatable => {
-                            high_risk.insert(*pubkey);
-                            newly_high_risk += 1;
-                            log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                    let status = check_margin_status(&margin_info);
 
-                            let pyth_price_update = user_meta
+                    if status.is_liquidatable() {
+                        high_risk.insert(*pubkey);
+                        newly_high_risk += 1;
+                        log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+
+                        let pyth_price_update = user_meta
                                 .user
                                 .perp_positions
                                 .iter()
@@ -993,31 +1031,29 @@ impl LiquidatorBot {
                                     })
                                 });
 
-                            match self.liq_tx.try_send((
-                                *pubkey,
-                                user_meta.user.clone(),
-                                current_slot,
-                                current_time_millis(),
-                                pyth_price_update,
-                            )) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    log::warn!(
-                                        target: TARGET,
-                                        "liquidation channel full, dropping liquidation for {:?}",
-                                        pubkey
-                                    );
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    log::error!(target: TARGET, "liquidation channel closed");
-                                }
+                        match self.liq_tx.try_send((
+                            *pubkey,
+                            user_meta.user.clone(),
+                            current_slot,
+                            current_time_millis(),
+                            pyth_price_update,
+                            status,
+                        )) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    target: TARGET,
+                                    "liquidation channel full, dropping liquidation for {:?}",
+                                    pubkey
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                log::error!(target: TARGET, "liquidation channel closed");
                             }
                         }
-                        MarginStatus::HighRisk => {
-                            high_risk.insert(*pubkey);
-                            newly_high_risk += 1;
-                        }
-                        MarginStatus::Safe => {}
+                    } else if status.is_at_risk() {
+                        high_risk.insert(*pubkey);
+                        newly_high_risk += 1;
                     }
                 }
 
@@ -1259,14 +1295,21 @@ fn try_liquidate_with_match(
 fn spawn_liquidation_worker(
     tx_sender: TxSender,
     strategy: Arc<dyn LiquidationStrategy + Send + Sync>,
-    mut liq_rx: tokio::sync::mpsc::Receiver<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>,
+    mut liq_rx: tokio::sync::mpsc::Receiver<(
+        Pubkey,
+        User,
+        u64,
+        u64,
+        Option<PythPriceUpdate>,
+        UserMarginStatus,
+    )>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
 ) {
     let mut rate_limit = HashMap::<Pubkey, u64>::new();
 
     tokio::spawn(async move {
-        while let Some((liquidatee, user_account, slot, ts, pyth_price_update)) =
+        while let Some((liquidatee, user_account, slot, ts, pyth_price_update, status)) =
             liq_rx.recv().await
         {
             // Drop entries older than 1 second to handle backpressure
@@ -1311,6 +1354,7 @@ fn spawn_liquidation_worker(
                         cu_limit,
                         slot,
                         pyth_price_update,
+                        status,
                     ),
                 )
                 .await;
@@ -1426,7 +1470,65 @@ impl LiquidateWithMatchStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
+        status: &UserMarginStatus,
     ) {
+        // Check isolated liquidations first
+        for (market_index, iso_status) in &status.isolated {
+            if *iso_status == MarginStatus::Liquidatable {
+                if let Some(pos) = user_account.perp_positions.iter().find(|p| {
+                    p.market_index == *market_index && p.isolated_position_scaled_balance != 0
+                }) {
+                    metrics
+                        .liquidation_attempts
+                        .with_label_values(&["perp"])
+                        .inc();
+
+                    log::info!(
+                        target: TARGET,
+                        "try liquidate [ISOLATED]: https://app.drift.trade/?userAccount={liquidatee:?}, market={}",
+                        market_index
+                    );
+
+                    let Some(makers) = Self::find_top_makers(
+                        drift,
+                        dlob,
+                        market_state,
+                        *market_index,
+                        pos.base_asset_amount,
+                    ) else {
+                        return;
+                    };
+
+                    let oracle_price = market_state
+                        .get_perp_oracle_price(*market_index)
+                        .map(|x| x.price)
+                        .unwrap_or(0) as u64;
+
+                    let pyth_update =
+                        pyth_price_update.filter(|update| update.price != oracle_price);
+
+                    try_liquidate_with_match(
+                        drift,
+                        *market_index,
+                        keeper_subaccount,
+                        liquidatee,
+                        makers.as_slice(),
+                        tx_sender,
+                        priority_fee,
+                        cu_limit,
+                        slot,
+                        pyth_update,
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Cross margin
+        if status.cross != MarginStatus::Liquidatable {
+            return;
+        }
+
         let Some(pos) = user_account
             .perp_positions
             .iter()
@@ -1710,6 +1812,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
+        status: UserMarginStatus,
     ) -> futures_util::future::BoxFuture<'a, ()> {
         Self::liquidate_perp(
             &self.drift,
@@ -1724,6 +1827,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             cu_limit,
             slot,
             pyth_price_update,
+            &status,
         );
 
         if self.use_spot_liquidation {
