@@ -1478,7 +1478,7 @@ impl LiquidateWithMatchStrategy {
                         .with_label_values(&["perp"])
                         .inc();
 
-                    log::info!(
+                    log::debug!(
                         target: TARGET,
                         "try liquidate [ISOLATED]: https://app.drift.trade/?userAccount={liquidatee:?}, market={}",
                         market_index
