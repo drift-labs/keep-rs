@@ -602,7 +602,7 @@ impl LiquidatorBot {
                     Err(TryRecvError::Empty) => break 'pyth,
                 }
             }
-
+            events_rx.recv_many(&mut event_buffer, 64).await;
             for event in event_buffer.drain(..) {
                 match event {
                     GrpcEvent::UserUpdate {
