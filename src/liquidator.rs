@@ -577,8 +577,8 @@ impl LiquidatorBot {
                 if margin_info.total_collateral < config.min_collateral as i128
                     && margin_info.margin_requirement < config.min_collateral as u128
                 {
-                    exclude_count+=1;
-                    log::debug!(target: TARGET, "excluding user: {:?}. insignificant collateral: {}/{}", user.authority, margin_info.total_collateral, margin_info.margin_requirement);
+                    exclude_count += 1;
+                    // log::debug!(target: TARGET, "excluding user: {:?}. insignificant collateral: {}/{}", user.authority, margin_info.total_collateral, margin_info.margin_requirement);
                 } else {
                     let now_ms = current_time_millis();
                     users.insert(
@@ -599,8 +599,8 @@ impl LiquidatorBot {
                 }
             });
 
-        log::info!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
-        log::info!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
+        log::debug!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
+        log::debug!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
 
         // main loop
         let mut event_buffer = Vec::<GrpcEvent>::with_capacity(64);
@@ -642,8 +642,6 @@ impl LiquidatorBot {
                 }
             }
 
-            let n_read = events_rx.recv_many(&mut event_buffer, 64).await;
-            log::trace!(target: TARGET, "read: {n_read}, remaning: {:?}", events_rx.len());
             for event in event_buffer.drain(..) {
                 match event {
                     GrpcEvent::UserUpdate {
@@ -670,18 +668,18 @@ impl LiquidatorBot {
                             {
                                 match staleness_err {
                                     StalenessError::UserAccountStale { age_slots } => {
-                                        log::trace!(
-                                            target: TARGET,
-                                            "Recalculating margin for stale user {:?}: user account {} slots old",
-                                            pubkey, age_slots
-                                        );
+                                        // log::debug!(
+                                        //     target: TARGET,
+                                        //     "Recalculating margin for stale user {:?}: user account {} slots old",
+                                        //     pubkey, age_slots
+                                        // );
                                     }
                                     StalenessError::OraclePriceStale { market, age_slots } => {
-                                        log::trace!(
-                                            target: TARGET,
-                                            "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
-                                            pubkey, market, age_slots
-                                        );
+                                        // log::debug!(
+                                        //     target: TARGET,
+                                        //     "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
+                                        //     pubkey, market, age_slots
+                                        // );
                                     }
                                     StalenessError::PythPriceStale { .. } => {
                                         // Pyth staleness checked separately
@@ -707,18 +705,21 @@ impl LiquidatorBot {
                             if margin_info.total_collateral < config.min_collateral as i128
                                 && margin_info.margin_requirement < config.min_collateral as u128
                             {
-                                log::trace!(target: TARGET, "filtered account with dust collateral: {pubkey:?}");
+                                // log::debug!(target: TARGET, "filtered account with dust collateral: {pubkey:?}");
                                 high_risk.remove(&pubkey);
                                 users.remove(&pubkey);
                             } else {
-                                let status = check_margin_status(&margin_info);
-                                if status.is_liquidatable() {
-                                    log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
-                                    high_risk.insert(pubkey);
-                                } else if status.is_at_risk() {
-                                    high_risk.insert(pubkey);
-                                } else {
-                                    high_risk.remove(&pubkey);
+                                match check_margin_status(&margin_info) {
+                                    MarginStatus::Liquidatable => {
+                                        // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                                        high_risk.insert(pubkey);
+                                    }
+                                    MarginStatus::HighRisk => {
+                                        high_risk.insert(pubkey);
+                                    }
+                                    MarginStatus::Safe => {
+                                        high_risk.remove(&pubkey);
+                                    }
                                 }
                             }
                         }
@@ -792,18 +793,18 @@ impl LiquidatorBot {
                         {
                             match staleness_err {
                                 StalenessError::UserAccountStale { age_slots } => {
-                                    log::trace!(
-                                        target: TARGET,
-                                        "Recalculating margin for stale user {:?}: user account {} slots old",
-                                        pubkey, age_slots
-                                    );
+                                    // log::debug!(
+                                    //     target: TARGET,
+                                    //     "Recalculating margin for stale user {:?}: user account {} slots old",
+                                    //     pubkey, age_slots
+                                    // );
                                 }
                                 StalenessError::OraclePriceStale { market, age_slots } => {
-                                    log::trace!(
-                                        target: TARGET,
-                                        "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
-                                        pubkey, market, age_slots
-                                    );
+                                    // log::debug!(
+                                    //     target: TARGET,
+                                    //     "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
+                                    //     pubkey, market, age_slots
+                                    // );
                                 }
                                 StalenessError::PythPriceStale { .. } => {
                                     // Pyth staleness checked separately
@@ -825,10 +826,12 @@ impl LiquidatorBot {
                             }
                         };
 
-                        let status = check_margin_status(&margin_info);
-                        if status.is_liquidatable() {
-                            log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
-                            liquidatable_users.push((pubkey, user_meta.user.clone(), status));
+                        match check_margin_status(&margin_info) {
+                            MarginStatus::Liquidatable => {
+                                // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                                liquidatable_users.push((pubkey, user_meta.user.clone()));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -878,33 +881,35 @@ impl LiquidatorBot {
                     }
                 }
 
-                log::trace!(
-                    target: TARGET,
-                    "processed {} high-risk margin updates in {}ms",
-                    high_risk_count,
-                    current_time_millis() - t0,
-                );
+                // log::debug!(
+                //     target: TARGET,
+                //     "processed {} high-risk margin updates in {}ms",
+                //     high_risk_count,
+                //     current_time_millis() - t0,
+                // );
 
                 // Update high_risk set synchronously but quickly (just remove safe users)
                 let t0 = current_time_millis();
                 high_risk.retain(|pubkey| {
                     if let Some(user_meta) = users.get(pubkey) {
                         // Log staleness but still check margin status
-                        if let Err(staleness_err) = validate_data_freshness(user_meta, &oracle_prices, current_slot) {
+                        if let Err(staleness_err) =
+                            validate_data_freshness(user_meta, &oracle_prices, current_slot)
+                        {
                             match staleness_err {
                                 StalenessError::UserAccountStale { age_slots } => {
-                                    log::trace!(
-                                        target: TARGET,
-                                        "Checking stale user {:?} for high-risk status: {} slots old",
-                                        pubkey, age_slots
-                                    );
+                                    // log::debug!(
+                                    //     target: TARGET,
+                                    //     "Checking stale user {:?} for high-risk status: {} slots old",
+                                    //     pubkey, age_slots
+                                    // );
                                 }
                                 StalenessError::OraclePriceStale { market, age_slots } => {
-                                    log::trace!(
-                                        target: TARGET,
-                                        "Checking {:?} with stale oracle {:?}: {} slots old",
-                                        pubkey, market, age_slots
-                                    );
+                                    // log::debug!(
+                                    //     target: TARGET,
+                                    //     "Checking {:?} with stale oracle {:?}: {} slots old",
+                                    //     pubkey, market, age_slots
+                                    // );
                                 }
                                 StalenessError::PythPriceStale { .. } => {}
                             }
@@ -926,12 +931,12 @@ impl LiquidatorBot {
                     }
                 });
 
-                log::trace!(
-                    target: TARGET,
-                    "updated high_risk set in {}ms (now {} users)",
-                    current_time_millis() - t0,
-                    high_risk.len(),
-                );
+                // log::debug!(
+                //     target: TARGET,
+                //     "updated high_risk set in {}ms (now {} users)",
+                //     current_time_millis() - t0,
+                //     high_risk.len(),
+                // );
             }
 
             // Every RECHECK_CYCLE_INTERVAL cycles, recheck all users to find new high-risk users
@@ -964,18 +969,18 @@ impl LiquidatorBot {
                     {
                         match staleness_err {
                             StalenessError::UserAccountStale { age_slots } => {
-                                log::trace!(
-                                    target: TARGET,
-                                    "Recalculating margin for stale user {:?}: user account {} slots old",
-                                    pubkey, age_slots
-                                );
+                                // log::debug!(
+                                //     target: TARGET,
+                                //     "Recalculating margin for stale user {:?}: user account {} slots old",
+                                //     pubkey, age_slots
+                                // );
                             }
                             StalenessError::OraclePriceStale { market, age_slots } => {
-                                log::trace!(
-                                    target: TARGET,
-                                    "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
-                                    pubkey, market, age_slots
-                                );
+                                // log::debug!(
+                                //     target: TARGET,
+                                //     "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
+                                //     pubkey, market, age_slots
+                                // );
                             }
                             StalenessError::PythPriceStale { .. } => {
                                 // Pyth staleness checked separately
@@ -1002,7 +1007,7 @@ impl LiquidatorBot {
                     if status.is_liquidatable() {
                         high_risk.insert(*pubkey);
                         newly_high_risk += 1;
-                        log::info!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                        log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
 
                         let pyth_price_update = user_meta
                                 .user
@@ -1052,12 +1057,12 @@ impl LiquidatorBot {
                     }
                 }
 
-                log::debug!(
-                    target: TARGET,
-                    "margin recheck: checked {} users, {newly_high_risk} newly high-risk, took {}ms",
-                    users.len(),
-                    current_time_millis() - t0
-                );
+                // log::debug!(
+                //     target: TARGET,
+                //     "margin recheck: checked {} users, {newly_high_risk} newly high-risk, took {}ms",
+                //     users.len(),
+                //     current_time_millis() - t0
+                // );
             }
         }
     }
@@ -1310,12 +1315,12 @@ fn spawn_liquidation_worker(
             // Drop entries older than 1 second to handle backpressure
             let now = current_time_millis();
             if now.saturating_sub(ts) > MAX_LIQUIDATION_AGE_MS {
-                log::debug!(
-                    target: TARGET,
-                    "dropping stale liquidation for {:?} (age: {}ms)",
-                    liquidatee,
-                    now.saturating_sub(ts)
-                );
+                // log::debug!(
+                //     target: TARGET,
+                //     "dropping stale liquidation for {:?} (age: {}ms)",
+                //     liquidatee,
+                //     now.saturating_sub(ts)
+                // );
                 continue;
             }
 
@@ -1366,12 +1371,12 @@ fn spawn_liquidation_worker(
                                 LIQUIDATION_DEADLINE_MS
                             );
                         } else {
-                            log::trace!(
-                                target: TARGET,
-                                "liquidation for {:?} completed in {}ms",
-                                liquidatee_clone,
-                                elapsed.as_millis()
-                            );
+                            // log::debug!(
+                            //     target: TARGET,
+                            //     "liquidation for {:?} completed in {}ms",
+                            //     liquidatee_clone,
+                            //     elapsed.as_millis()
+                            // );
                         }
                     }
                     Err(_) => {
@@ -1538,12 +1543,6 @@ impl LiquidateWithMatchStrategy {
             .with_label_values(&["perp"])
             .inc();
 
-        log::info!(
-            target: TARGET,
-            "try liquidate: https://app.drift.trade/?userAccount={liquidatee:?}, market={}",
-            pos.market_index
-        );
-
         let Some(makers) = Self::find_top_makers(
             drift,
             dlob,
@@ -1606,12 +1605,12 @@ impl LiquidateWithMatchStrategy {
 
             // Filter dust positions
             if token_amount < spot_market.min_order_size * 2 {
-                log::trace!(
-                    target: TARGET,
-                    "skip dust spot position. market={}, amount={}",
-                    pos.market_index,
-                    token_amount
-                );
+                // log::debug!(
+                //     target: TARGET,
+                //     "skip dust spot position. market={}, amount={}",
+                //     pos.market_index,
+                //     token_amount
+                // );
                 continue;
             }
 
@@ -1636,7 +1635,7 @@ impl LiquidateWithMatchStrategy {
                 continue;
             };
 
-            log::info!(
+            log::debug!(
                 target: TARGET,
                 "attempting spot liquidation: user={:?}, asset_market={}, liability_market={}, amount={}",
                 liquidatee,
@@ -1722,24 +1721,24 @@ impl LiquidateWithMatchStrategy {
             let use_titan = match (&jupiter_result, &titan_result) {
                 (Ok(jup), Ok(titan)) => {
                     let use_titan = titan.quote.out_amount > jup.quote.out_amount;
-                    log::debug!(
-                        target: TARGET,
-                        "got quotes in {}ms - jup: {}, titan: {} - using {}",
-                        quote_latency_ms,
-                        jup.quote.out_amount,
-                        titan.quote.out_amount,
-                        if use_titan { "titan" } else { "jupiter" }
-                    );
+                    // log::debug!(
+                    //     target: TARGET,
+                    //     "got quotes in {}ms - jup: {}, titan: {} - using {}",
+                    //     quote_latency_ms,
+                    //     jup.quote.out_amount,
+                    //     titan.quote.out_amount,
+                    //     if use_titan { "titan" } else { "jupiter" }
+                    // );
                     use_titan
                 }
                 (Ok(_), Err(e)) => {
                     metrics.titan_quote_failures.inc();
-                    log::debug!(target: TARGET, "titan failed in {}ms, using jupiter: {:?}", quote_latency_ms, e);
+                    log::warn!(target: TARGET, "titan failed in {}ms, using jupiter: {:?}", quote_latency_ms, e);
                     false
                 }
                 (Err(e), Ok(_)) => {
                     metrics.jupiter_quote_failures.inc();
-                    log::debug!(target: TARGET, "jupiter failed in {}ms, using titan: {:?}", quote_latency_ms, e);
+                    log::warn!(target: TARGET, "jupiter failed in {}ms, using titan: {:?}", quote_latency_ms, e);
                     true
                 }
                 _ => unreachable!(),
@@ -1784,11 +1783,11 @@ impl LiquidateWithMatchStrategy {
                 )
                 .build()
             };
-            log::debug!(
-                target: TARGET,
-                "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
-                liability_market_index
-            );
+            // log::debug!(
+            //     target: TARGET,
+            //     "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
+            //     liability_market_index
+            // );
             tx_sender.send_tx(
                 tx,
                 TxIntent::LiquidateSpot {
