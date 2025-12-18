@@ -592,7 +592,7 @@ impl LiquidatorBot {
                     // Check margin status and add to high-risk set if needed
                     let status = check_margin_status(&margin_info);
 
-                    if status.is_at_risk(){
+                    if status.is_at_risk() {
                         high_risk.insert(*pubkey);
                         initial_high_risk_count += 1;
                     }
@@ -709,17 +709,14 @@ impl LiquidatorBot {
                                 high_risk.remove(&pubkey);
                                 users.remove(&pubkey);
                             } else {
-                                match check_margin_status(&margin_info) {
-                                    MarginStatus::Liquidatable => {
-                                        // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
-                                        high_risk.insert(pubkey);
-                                    }
-                                    MarginStatus::HighRisk => {
-                                        high_risk.insert(pubkey);
-                                    }
-                                    MarginStatus::Safe => {
-                                        high_risk.remove(&pubkey);
-                                    }
+                                let status = check_margin_status(&margin_info);
+                                if status.is_liquidatable() {
+                                    // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                                    high_risk.insert(pubkey);
+                                } else if status.is_at_risk() {
+                                    high_risk.insert(pubkey);
+                                } else {
+                                    high_risk.remove(&pubkey);
                                 }
                             }
                         }
@@ -826,12 +823,10 @@ impl LiquidatorBot {
                             }
                         };
 
-                        match check_margin_status(&margin_info) {
-                            MarginStatus::Liquidatable => {
-                                // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
-                                liquidatable_users.push((pubkey, user_meta.user.clone()));
-                            }
-                            _ => {}
+                        let status = check_margin_status(&margin_info);
+                        if status.is_liquidatable() {
+                            // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
+                            liquidatable_users.push((pubkey, user_meta.user.clone(), status));
                         }
                     }
                 }
