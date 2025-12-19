@@ -1414,7 +1414,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs?branch=trunk%2Fisolated-positions#41b125577ebc46f93d126ca2f9b8c68778546d4f"
+source = "git+https://github.com/drift-labs/drift-rs?branch=trunk%2Fisolated-positions#77dea4b9b5cc19520d7ee4868f4f300f814d4c0a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1427,7 +1427,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs?branch=trunk%2Fisolated-positions#41b125577ebc46f93d126ca2f9b8c68778546d4f"
+source = "git+https://github.com/drift-labs/drift-rs?branch=trunk%2Fisolated-positions#77dea4b9b5cc19520d7ee4868f4f300f814d4c0a"
 dependencies = [
  "futures-util",
  "gjson",
@@ -1447,7 +1447,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0-alpha.16"
-source = "git+https://github.com/drift-labs/drift-rs?branch=trunk%2Fisolated-positions#41b125577ebc46f93d126ca2f9b8c68778546d4f"
+source = "git+https://github.com/drift-labs/drift-rs?branch=trunk%2Fisolated-positions#77dea4b9b5cc19520d7ee4868f4f300f814d4c0a"
 dependencies = [
  "abi_stable",
  "ahash 0.8.12",

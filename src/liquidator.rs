@@ -1409,7 +1409,7 @@ impl LiquidateWithMatchStrategy {
         market_index: u16,
         base_asset_amount: i64,
     ) -> Option<Vec<User>> {
-        let l3_book = dlob.get_l3_snapshot(market_index, MarketType::Perp);
+        let l3_book = dlob.get_l3_snapshot_safe(market_index, MarketType::Perp);
 
         let oracle_price = market_state
             .get_perp_oracle_price(market_index)
