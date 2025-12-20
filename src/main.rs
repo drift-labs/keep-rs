@@ -56,6 +56,9 @@ pub struct Config {
     pub dry: bool,
     #[clap(long, default_value = "0")]
     pub sub_account_id: u16,
+    /// Use TPU direct sending instead of RPC
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub use_tpu: bool,
 }
 
 enum UseMarkets {
