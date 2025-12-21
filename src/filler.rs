@@ -1073,13 +1073,10 @@ impl TxWorker {
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
         let intent_label = intent.label();
-        metrics
-            .tx_sent
-            .with_label_values(&[intent_label, "rpc"])
-            .inc();
+        metrics.tx_sent.with_label_values(&[intent_label]).inc();
         metrics
             .fill_expected
-            .with_label_values(&[intent_label, "rpc"])
+            .with_label_values(&[intent_label])
             .inc();
         if intent.expected_trigger() {
             metrics.trigger_expected.inc();
@@ -1135,13 +1132,10 @@ impl TxWorker {
         let metrics = self.metrics.clone();
         let intent_label = intent.label();
 
-        metrics
-            .tx_sent
-            .with_label_values(&[intent_label, "tpu"])
-            .inc();
+        metrics.tx_sent.with_label_values(&[intent_label]).inc();
         metrics
             .fill_expected
-            .with_label_values(&[intent_label, "tpu"])
+            .with_label_values(&[intent_label])
             .inc();
         if intent.expected_trigger() {
             metrics.trigger_expected.inc();
