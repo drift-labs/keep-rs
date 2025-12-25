@@ -27,12 +27,14 @@ use drift_rs::{
 };
 use futures_util::StreamExt;
 use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_keypair::Keypair as KeypairV3;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
 };
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction, signature::Signature, transaction::TransactionError,
 };
+use solana_signature::Signature as SignatureV3;
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use tokio::{runtime::Handle, sync::RwLock};
 
@@ -40,6 +42,10 @@ use crate::{
     http::Metrics,
     util::{OrderSlotLimiter, PendingTxMeta, PendingTxs, PythPriceUpdate, TxIntent},
     Config, UseMarkets,
+};
+
+use yellowstone_jet_tpu_client::yellowstone_grpc::sender::{
+    create_yellowstone_tpu_sender, Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender,
 };
 
 const TARGET: &str = "filler";
@@ -61,7 +67,54 @@ pub struct FillerBot {
 impl FillerBot {
     pub async fn new(config: Config, drift: DriftClient, metrics: Arc<Metrics>) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry);
+
+        let tpu_sender = if config.use_tpu {
+            log::info!(target: TARGET, "initializing Jet TPU client...");
+
+            let grpc_endpoint = std::env::var("GRPC_ENDPOINT")
+                .unwrap_or_else(|_| "https://api.rpcpool.com".to_string());
+            let grpc_token =
+                std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN required when USE_TPU=true");
+            let rpc_endpoint = drift.rpc().url().to_string();
+
+            let keypair_for_tpu = drift_rs::utils::load_keypair_multi_format(
+                &std::env::var("BOT_PRIVATE_KEY").expect("BOT_PRIVATE_KEY for TPU"),
+            )
+            .expect("loaded keypair for TPU");
+
+            let keypair_v3 =
+                KeypairV3::try_from(keypair_for_tpu.to_bytes().as_ref()).expect("valid keypair");
+
+            match create_yellowstone_tpu_sender(
+                Default::default(),
+                keypair_v3,
+                Endpoints {
+                    rpc: rpc_endpoint,
+                    grpc: grpc_endpoint,
+                    grpc_x_token: Some(grpc_token),
+                },
+            )
+            .await
+            {
+                Ok(NewYellowstoneTpuSender {
+                    sender,
+                    related_objects_jh: _,
+                }) => {
+                    log::info!(target: TARGET, "initialized Jet TPU client");
+                    Some(sender)
+                }
+                Err(err) => {
+                    log::error!(target: TARGET, "failed to initialize TPU client: {err:?}");
+                    log::warn!(target: TARGET, "falling back to RPC mode");
+                    None
+                }
+            }
+        } else {
+            log::info!(target: TARGET, "TPU disabled, using RPC mode");
+            None
+        };
+
+        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry, tpu_sender);
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
 
@@ -954,15 +1007,22 @@ pub struct TxWorker {
     pending_txs: Arc<RwLock<PendingTxs<1024>>>,
     metrics: Arc<Metrics>,
     dry_run: bool,
+    tpu_sender: Option<YellowstoneTpuSender>,
 }
 
 impl TxWorker {
-    pub fn new(drift: DriftClient, metrics: Arc<Metrics>, dry_run: bool) -> Self {
+    pub fn new(
+        drift: DriftClient,
+        metrics: Arc<Metrics>,
+        dry_run: bool,
+        tpu_sender: Option<YellowstoneTpuSender>,
+    ) -> Self {
         Self {
             drift: Box::leak(Box::new(drift)),
             pending_txs: Arc::new(RwLock::new(PendingTxs::new())),
             metrics,
             dry_run,
+            tpu_sender,
         }
     }
     pub fn run(self, rt: tokio::runtime::Handle) -> TxSender {
@@ -992,6 +1052,13 @@ impl TxWorker {
         TxSender(tx)
     }
     fn send_tx(&self, rt: &Handle, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
+        if self.tpu_sender.is_some() {
+            self.send_tx_tpu(rt, tx, intent, cu_limit);
+        } else {
+            self.send_tx_rpc(rt, tx, intent, cu_limit);
+        }
+    }
+    fn send_tx_rpc(&self, rt: &Handle, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
         log::debug!(target: TARGET, "txworker send tx: {intent:?}");
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
@@ -1035,6 +1102,93 @@ impl TxWorker {
                     metrics
                         .tx_failed
                         .with_label_values(&[intent_label, "send_error"])
+                        .inc();
+                }
+            }
+        });
+    }
+    fn send_tx_tpu(&self, rt: &Handle, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
+        log::debug!(target: TARGET, "txworker send tx (TPU): {intent:?}");
+
+        let mut tpu_sender = match &self.tpu_sender {
+            Some(sender) => sender.clone(),
+            None => {
+                log::error!(target: TARGET, "TPU sender not initialized");
+                return;
+            }
+        };
+
+        let drift = self.drift;
+        let pending_txs = Arc::clone(&self.pending_txs);
+        let metrics = self.metrics.clone();
+        let intent_label = intent.label();
+
+        metrics.tx_sent.with_label_values(&[intent_label]).inc();
+        metrics
+            .fill_expected
+            .with_label_values(&[intent_label])
+            .inc();
+        if intent.expected_trigger() {
+            metrics.trigger_expected.inc();
+        }
+
+        rt.spawn(async move {
+            let recent_blockhash = match drift.get_latest_blockhash().await {
+                Ok(hash) => hash,
+                Err(err) => {
+                    log::error!(target: TARGET, "failed to get blockhash: {err}");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "blockhash_error"])
+                        .inc();
+                    return;
+                }
+            };
+
+            let signed_tx = match drift.wallet().sign_tx(tx, recent_blockhash) {
+                Ok(tx) => tx,
+                Err(err) => {
+                    log::error!(target: TARGET, "failed to sign tx: {err}");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "sign_error"])
+                        .inc();
+                    return;
+                }
+            };
+
+            let signature = signed_tx.signatures[0];
+            let signature_v3 = SignatureV3::try_from(signature.as_ref()).expect("valid signature");
+            let bincoded_txn: Vec<u8> = match bincode::serialize(&signed_tx) {
+                Ok(data) => data,
+                Err(err) => {
+                    log::error!(target: TARGET, "failed to serialize tx: {err}");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "serialize_error"])
+                        .inc();
+                    return;
+                }
+            };
+
+            match tpu_sender.send_txn(signature_v3, bincoded_txn).await {
+                Ok(_) => {
+                    log::info!(
+                        target: TARGET,
+                        r#"{{"intent": "{}", "txn": "{}", "observed_slot": {}, "method": "tpu"}}"#,
+                        intent_label,
+                        signature,
+                        intent.slot().unwrap_or(0)
+                    );
+
+                    let mut pending = pending_txs.write().await;
+                    pending.insert(PendingTxMeta::new(signature, intent, cu_limit));
+                }
+                Err(err) => {
+                    log::error!(target: TARGET, "TPU send failed: {err}");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "tpu_send_error"])
                         .inc();
                 }
             }
