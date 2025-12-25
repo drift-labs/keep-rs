@@ -362,13 +362,7 @@ impl LiquidatorBot {
         dashboard_state: DashboardStateRef,
     ) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-        let tx_worker = TxWorker::new(
-            drift.clone(),
-            Arc::clone(&metrics),
-            config.dry,
-            None,
-            config.use_tpu,
-        );
+        let tx_worker = TxWorker::new(drift.clone(), Arc::clone(&metrics), config.dry, None);
         let rt = tokio::runtime::Handle::current();
         let tx_sender = tx_worker.run(rt);
 

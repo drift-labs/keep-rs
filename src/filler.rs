@@ -114,13 +114,7 @@ impl FillerBot {
             None
         };
 
-        let tx_worker = TxWorker::new(
-            drift.clone(),
-            metrics,
-            config.dry,
-            tpu_sender,
-            config.use_tpu,
-        );
+        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry, tpu_sender);
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
 
@@ -1014,7 +1008,6 @@ pub struct TxWorker {
     metrics: Arc<Metrics>,
     dry_run: bool,
     tpu_sender: Option<YellowstoneTpuSender>,
-    use_tpu: bool,
 }
 
 impl TxWorker {
@@ -1023,7 +1016,6 @@ impl TxWorker {
         metrics: Arc<Metrics>,
         dry_run: bool,
         tpu_sender: Option<YellowstoneTpuSender>,
-        use_tpu: bool,
     ) -> Self {
         Self {
             drift: Box::leak(Box::new(drift)),
@@ -1031,7 +1023,6 @@ impl TxWorker {
             metrics,
             dry_run,
             tpu_sender,
-            use_tpu,
         }
     }
     pub fn run(self, rt: tokio::runtime::Handle) -> TxSender {
@@ -1061,7 +1052,7 @@ impl TxWorker {
         TxSender(tx)
     }
     fn send_tx(&self, rt: &Handle, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
-        if self.use_tpu && self.tpu_sender.is_some() {
+        if self.tpu_sender.is_some() {
             self.send_tx_tpu(rt, tx, intent, cu_limit);
         } else {
             self.send_tx_rpc(rt, tx, intent, cu_limit);
