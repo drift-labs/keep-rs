@@ -56,6 +56,9 @@ pub struct Config {
     pub dry: bool,
     #[clap(long, default_value = "0")]
     pub sub_account_id: u16,
+    /// Disable Pyth price feed subscription
+    #[clap(long, default_value = "false")]
+    pub no_pyth: bool,
 }
 
 enum UseMarkets {
