@@ -55,7 +55,7 @@ pub struct FillerBot {
     config: Config,
     tx_worker_ref: TxSender,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
-    pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
+    pyth_price_feed: Option<tokio::sync::mpsc::Receiver<PythPriceUpdate>>,
 }
 
 impl FillerBot {
@@ -116,15 +116,20 @@ impl FillerBot {
         .await;
         log::info!(target: TARGET, "subscribed gRPC");
 
-        // pyth disabled for now
-        let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
-        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
-            "wss://pyth-lazer.dourolabs.app/v1/stream",
-            pyth_access_token.as_str(),
-        )
-        .expect("pyth price feed connects");
-        let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids, &[]);
-        log::info!(target: TARGET, "subscribed pyth price feeds");
+        let pyth_price_feed = if !config.no_pyth {
+            let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
+            let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
+                "wss://pyth-lazer.dourolabs.app/v1/stream",
+                pyth_access_token.as_str(),
+            )
+            .expect("pyth price feed connects");
+            let feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids, &[]);
+            log::info!(target: TARGET, "subscribed pyth price feeds");
+            Some(feed)
+        } else {
+            log::info!(target: TARGET, "pyth price feed disabled");
+            None
+        };
 
         FillerBot {
             drift,
@@ -157,8 +162,11 @@ impl FillerBot {
             .state_account()
             .map(|s| s.has_median_trigger_price_feature())
             .unwrap_or(false);
-        let mut pyth_price_feed = self.pyth_price_feed;
         let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
+
+        // Create a dummy receiver that never sends when pyth is disabled
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<PythPriceUpdate>(1);
+        let mut pyth_price_feed = self.pyth_price_feed.unwrap_or(dummy_rx);
 
         loop {
             tokio::select! {
@@ -303,7 +311,7 @@ impl FillerBot {
                         // ghetto rate limit
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
-                                log::info!(target: TARGET, "found limit crosses (market: {market_index})");
+                                log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_asks.first(), crosses.crossing_bids.first());
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
                         }

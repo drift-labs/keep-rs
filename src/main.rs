@@ -31,6 +31,9 @@ pub struct Config {
     /// Run perp liquidator bot
     #[clap(long, default_value = "false")]
     pub liquidator: bool,
+    /// Use spot liquidation in liquidator
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub use_spot_liquidation: bool,
     /// Run perp filler bot
     #[clap(long, default_value = "true")]
     pub filler: bool,
@@ -53,6 +56,9 @@ pub struct Config {
     pub dry: bool,
     #[clap(long, default_value = "0")]
     pub sub_account_id: u16,
+    /// Disable Pyth price feed subscription
+    #[clap(long, default_value = "false")]
+    pub no_pyth: bool,
 }
 
 enum UseMarkets {
