@@ -10,7 +10,7 @@ use anchor_lang::Discriminator;
 use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc::error::TryRecvError;
@@ -21,13 +21,17 @@ use drift_rs::{
     grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
     jupiter::SwapMode,
     market_state::MarketStateData,
+    math::{
+        constants::{BASE_PRECISION, MARGIN_PRECISION_U128, PRICE_PRECISION, QUOTE_PRECISION},
+        liquidation::{calculate_collateral, CollateralInfo},
+    },
     priority_fee_subscriber::PriorityFeeSubscriber,
     titan,
     types::{
         accounts::{PerpMarket, SpotMarket, User},
         MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, SpotBalanceType,
     },
-    DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
+    DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder, Wallet,
 };
 use drift_rs::{jupiter::JupiterSwapApi, titan::TitanSwapApi};
 use solana_sdk::{account::Account, clock::Slot, compute_budget::ComputeBudgetInstruction};
@@ -315,6 +319,7 @@ pub trait LiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
+        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
     ) -> futures_util::future::BoxFuture<'a, ()>;
 }
 
@@ -352,6 +357,8 @@ pub struct LiquidatorBot {
     pyth_price_feed: Option<tokio::sync::mpsc::Receiver<PythPriceUpdate>>,
     /// Dashboard state for HTTP API
     dashboard_state: DashboardStateRef,
+    /// Track collateral info per subaccount
+    collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
 }
 
 impl LiquidatorBot {
@@ -463,6 +470,10 @@ impl LiquidatorBot {
 
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
+        let collateral_info_per_subaccount = Arc::new(RwLock::new(
+            get_collateral_info_per_subaccount(&drift, &config.get_subaccounts()).await,
+        ));
+
         // start liquidation worker
         let (liq_tx, liq_rx) =
             tokio::sync::mpsc::channel::<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>(1024);
@@ -483,6 +494,7 @@ impl LiquidatorBot {
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(config.fill_cu_limit),
             Arc::clone(&priority_fee_subscriber),
+            Arc::clone(&collateral_info_per_subaccount),
         );
 
         LiquidatorBot {
@@ -494,6 +506,7 @@ impl LiquidatorBot {
             liq_tx,
             pyth_price_feed: Some(pyth_price_feed),
             dashboard_state,
+            collateral_info_per_subaccount,
         }
     }
 
@@ -610,6 +623,12 @@ impl LiquidatorBot {
                         user,
                         slot: update_slot,
                     } => {
+                        // Update collaterals
+                        let new_collateral =
+                            get_collateral_info_per_subaccount(&drift, &config.get_subaccounts())
+                                .await;
+                        *self.collateral_info_per_subaccount.write().unwrap() = new_collateral;
+
                         let old_user = users.get(&pubkey).map(|m| &m.user);
                         dlob_notifier.user_update(pubkey, old_user, &user, update_slot);
                         let now_ms = current_time_millis();
@@ -1032,6 +1051,82 @@ impl LiquidatorBot {
     }
 }
 
+async fn get_collateral_info_per_subaccount(
+    drift: &DriftClient,
+    subaccounts: &[u16],
+) -> HashMap<Pubkey, CollateralInfo> {
+    let mut collateral_info_per_subaccount = HashMap::<Pubkey, CollateralInfo>::new();
+    for subaccount in subaccounts {
+        let subaccount_pubkey = Wallet::derive_user_account(&drift.wallet.authority(), *subaccount);
+        match drift.get_user_account(&subaccount_pubkey).await {
+            Ok(user_account) => {
+                match calculate_collateral(
+                    &drift,
+                    &user_account,
+                    MarginRequirementType::Maintenance,
+                ) {
+                    Ok(collateral_info) => {
+                        collateral_info_per_subaccount.insert(subaccount_pubkey, collateral_info);
+                        log::info!(
+                            target: TARGET,
+                            "Subaccount {}: free_collateral = {}, total_collateral = {}",
+                            subaccount,
+                            collateral_info.free,
+                            collateral_info.total
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            target: TARGET,
+                            "Failed to calculate collateral for subaccount {}: {:?}",
+                            subaccount,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    target: TARGET,
+                    "Failed to load subaccount {}: {:?}",
+                    subaccount,
+                    e
+                );
+            }
+        }
+    }
+    collateral_info_per_subaccount
+}
+
+fn calculate_perp_collateral_requirement(
+    market_state: &MarketState,
+    market_index: u16,
+    base_asset_amount: i64,
+) -> Option<u128> {
+    let state = market_state.load();
+
+    let perp_market = state.perp_markets.get(&market_index)?;
+    let oracle = state.perp_oracle_prices.get(&market_index)?;
+
+    let margin_ratio = perp_market
+        .get_margin_ratio(
+            base_asset_amount.unsigned_abs() as u128,
+            MarginRequirementType::Initial,
+            false,
+        )
+        .ok()?;
+
+    let collateral = (base_asset_amount.abs() as u128)
+        .saturating_mul(oracle.price as u128)
+        .saturating_mul(QUOTE_PRECISION)
+        .saturating_mul(margin_ratio as u128)
+        .saturating_div(MARGIN_PRECISION_U128)
+        .saturating_div(PRICE_PRECISION)
+        .saturating_div(BASE_PRECISION);
+
+    Some(collateral)
+}
+
 fn on_transaction_update_fn(
     tx_sender: TxSender,
 ) -> impl Fn(&TransactionUpdate) + Send + Sync + 'static {
@@ -1256,12 +1351,79 @@ fn try_liquidate_with_match(
     );
 }
 
+/// Try to liquidate by taking over position
+fn try_liquidate_with_collateral(
+    drift: &DriftClient,
+    market_index: u16,
+    keeper_subaccount: Pubkey,
+    liquidatee_subaccount: Pubkey,
+    base_asset_amount: u64,
+    tx_sender: TxSender,
+    priority_fee: u64,
+    cu_limit: u32,
+    slot: u64,
+    pyth_price_update: Option<PythPriceUpdate>,
+) {
+    let keeper_account_data = drift.try_get_account::<User>(&keeper_subaccount);
+    if keeper_account_data.is_err() {
+        log::debug!(target: TARGET, "keeper acc lookup failed={keeper_subaccount:?}");
+        return;
+    }
+    let liquidatee_subaccount_data = drift.try_get_account::<User>(&liquidatee_subaccount);
+    if liquidatee_subaccount_data.is_err() {
+        log::debug!(target: TARGET, "liquidatee acc lookup failed={liquidatee_subaccount:?}");
+        return;
+    }
+
+    let mut tx_builder = TransactionBuilder::new(
+        drift.program_data(),
+        keeper_subaccount,
+        std::borrow::Cow::Owned(keeper_account_data.unwrap()),
+        false,
+    )
+    .with_priority_fee(priority_fee, Some(cu_limit));
+
+    if let Some(ref update) = pyth_price_update {
+        tx_builder = tx_builder.post_pyth_lazer_oracle_update(&[update.feed_id], &update.message);
+    }
+
+    tx_builder = tx_builder.liquidate_perp(
+        market_index,
+        &liquidatee_subaccount_data.unwrap(),
+        base_asset_amount,
+        None,
+    );
+
+    // large accounts list, bump CU limit to compensate
+    if let Some(ix) = tx_builder.ixs().last() {
+        if ix.accounts.len() >= 20 {
+            tx_builder = tx_builder.set_ix(
+                1,
+                ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
+            );
+        }
+    }
+
+    let tx = tx_builder.build();
+
+    tx_sender.send_tx(
+        tx,
+        TxIntent::LiquidatePerp {
+            market_index,
+            liquidatee: liquidatee_subaccount,
+            slot,
+        },
+        cu_limit as u64,
+    );
+}
+
 fn spawn_liquidation_worker(
     tx_sender: TxSender,
     strategy: Arc<dyn LiquidationStrategy + Send + Sync>,
     mut liq_rx: tokio::sync::mpsc::Receiver<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
+    collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
 ) {
     let mut rate_limit = HashMap::<Pubkey, u64>::new();
 
@@ -1297,6 +1459,7 @@ fn spawn_liquidation_worker(
             let liquidatee_clone = liquidatee;
             let user_account_clone = Arc::new(user_account);
             let tx_sender_clone = tx_sender.clone();
+            let collateral_info_clone = Arc::clone(&collateral_info_per_subaccount);
 
             tokio::spawn(async move {
                 let deadline = std::time::Duration::from_millis(LIQUIDATION_DEADLINE_MS);
@@ -1311,6 +1474,7 @@ fn spawn_liquidation_worker(
                         cu_limit,
                         slot,
                         pyth_price_update,
+                        collateral_info_clone,
                     ),
                 )
                 .await;
@@ -1426,6 +1590,7 @@ impl LiquidateWithMatchStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
+        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
     ) {
         let Some(pos) = user_account
             .perp_positions
@@ -1435,6 +1600,33 @@ impl LiquidateWithMatchStrategy {
         else {
             return;
         };
+
+        // Calculate collateral required
+        let Some(collateral_required) = calculate_perp_collateral_requirement(
+            market_state,
+            pos.market_index,
+            pos.base_asset_amount,
+        ) else {
+            log::warn!(target: TARGET, "failed to calculate collateral requirement for market {}", pos.market_index);
+            return;
+        };
+
+        // Check if we have enough collateral
+        let collateral_map = collateral_info_per_subaccount.read().unwrap();
+        let Some(collateral_info) = collateral_map.get(&keeper_subaccount) else {
+            log::warn!(target: TARGET, "no collateral info for keeper subaccount");
+            return;
+        };
+
+        if collateral_info.free < collateral_required as i128 {
+            log::info!(
+                target: TARGET,
+                "insufficient collateral: need {}, have {}",
+                collateral_required,
+                collateral_info.free
+            );
+            return;
+        }
 
         metrics
             .liquidation_attempts
@@ -1458,12 +1650,25 @@ impl LiquidateWithMatchStrategy {
 
         let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
-        try_liquidate_with_match(
+        // try_liquidate_with_match(
+        //     &drift,
+        //     pos.market_index,
+        //     keeper_subaccount,
+        //     liquidatee,
+        //     makers.as_slice(),
+        //     tx_sender,
+        //     priority_fee,
+        //     cu_limit,
+        //     slot,
+        //     pyth_update,
+        // );
+
+        try_liquidate_with_collateral(
             &drift,
             pos.market_index,
             keeper_subaccount,
             liquidatee,
-            makers.as_slice(),
+            pos.base_asset_amount.unsigned_abs(),
             tx_sender,
             priority_fee,
             cu_limit,
@@ -1710,6 +1915,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
+        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
     ) -> futures_util::future::BoxFuture<'a, ()> {
         Self::liquidate_perp(
             &self.drift,
@@ -1724,6 +1930,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             cu_limit,
             slot,
             pyth_price_update,
+            collateral_info_per_subaccount,
         );
 
         if self.use_spot_liquidation {
