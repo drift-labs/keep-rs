@@ -43,6 +43,9 @@ pub struct Config {
     /// Comma-separated list of perp market indices to fill for
     #[clap(long, env = "MARKET_IDS", default_value = "0,1,2")]
     pub market_ids: String,
+    /// Comma-separated list of subaccount IDs to use for liquidations
+    #[clap(long, env = "SUBACCOUNTS", default_value = "0,1,2")]
+    pub subaccounts: String,
     /// Use mainnet (otherwise devnet)
     #[clap(long, env = "MAINNET", default_value = "true")]
     pub mainnet: bool,
@@ -79,6 +82,13 @@ impl Config {
                     .collect(),
             )
         }
+    }
+
+    pub fn get_subaccounts(&self) -> Vec<u16> {
+        self.subaccounts
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect()
     }
 }
 
