@@ -11,7 +11,7 @@ use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -29,7 +29,8 @@ use drift_rs::{
     titan,
     types::{
         accounts::{PerpMarket, SpotMarket, User},
-        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, SpotBalanceType,
+        MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, OrderParams,
+        OrderType, PositionDirection, SpotBalanceType,
     },
     DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder, Wallet,
 };
@@ -474,6 +475,11 @@ impl LiquidatorBot {
             get_collateral_info_per_subaccount(&drift, &config.get_subaccounts()).await,
         ));
 
+        let cu_limit = std::env::var("FILL_CU_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(config.fill_cu_limit);
+
         // start liquidation worker
         let (liq_tx, liq_rx) =
             tokio::sync::mpsc::channel::<(Pubkey, User, u64, u64, Option<PythPriceUpdate>)>(1024);
@@ -489,12 +495,24 @@ impl LiquidatorBot {
                 use_spot_liquidation: config.use_spot_liquidation,
             }),
             liq_rx,
-            std::env::var("FILL_CU_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(config.fill_cu_limit),
+            cu_limit,
             Arc::clone(&priority_fee_subscriber),
             Arc::clone(&collateral_info_per_subaccount),
+        );
+
+        // Spawn derisk loop
+        let subaccounts: Vec<Pubkey> = config
+            .get_subaccounts()
+            .iter()
+            .map(|id| Wallet::derive_user_account(&drift.wallet.authority(), *id))
+            .collect();
+
+        spawn_derisk_loop(
+            drift.clone(),
+            tx_sender.clone(),
+            subaccounts,
+            Arc::clone(&priority_fee_subscriber),
+            cu_limit,
         );
 
         LiquidatorBot {
@@ -1049,6 +1067,81 @@ impl LiquidatorBot {
             }
         }
     }
+}
+
+fn derisk_subaccount(
+    drift: &DriftClient,
+    tx_sender: &TxSender,
+    subaccount: Pubkey,
+    priority_fee: u64,
+    cu_limit: u32,
+) {
+    let user = match drift.try_get_account::<User>(&subaccount) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    for position in user.perp_positions.iter() {
+        if position.base_asset_amount == 0 && position.quote_asset_amount == 0 {
+            continue;
+        }
+
+        let mut tx_builder = TransactionBuilder::new(
+            drift.program_data(),
+            subaccount,
+            std::borrow::Cow::Owned(user.clone()),
+            false,
+        )
+        .with_priority_fee(priority_fee, Some(cu_limit));
+
+        if position.base_asset_amount != 0 {
+            let direction = if position.base_asset_amount > 0 {
+                PositionDirection::Short
+            } else {
+                PositionDirection::Long
+            };
+
+            tx_builder = tx_builder.place_orders(vec![OrderParams {
+                order_type: OrderType::Market,
+                market_type: MarketType::Perp,
+                direction,
+                base_asset_amount: position.base_asset_amount.unsigned_abs(),
+                market_index: position.market_index,
+                reduce_only: true,
+                ..Default::default()
+            }]);
+        } else {
+            tx_builder = tx_builder.settle_pnl(position.market_index, None, None);
+        }
+
+        tx_sender.send_tx(
+            tx_builder.build(),
+            TxIntent::Derisk {
+                market_index: position.market_index,
+                subaccount,
+            },
+            cu_limit as u64,
+        );
+    }
+}
+
+fn spawn_derisk_loop(
+    drift: DriftClient,
+    tx_sender: TxSender,
+    subaccounts: Vec<Pubkey>,
+    priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
+    cu_limit: u32,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let priority_fee = priority_fee_subscriber.priority_fee_nth(0.6);
+            for subaccount in &subaccounts {
+                derisk_subaccount(&drift, &tx_sender, *subaccount, priority_fee, cu_limit);
+            }
+        }
+    });
 }
 
 async fn get_collateral_info_per_subaccount(
@@ -1650,31 +1743,31 @@ impl LiquidateWithMatchStrategy {
 
         let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
-        // try_liquidate_with_match(
-        //     &drift,
-        //     pos.market_index,
-        //     keeper_subaccount,
-        //     liquidatee,
-        //     makers.as_slice(),
-        //     tx_sender,
-        //     priority_fee,
-        //     cu_limit,
-        //     slot,
-        //     pyth_update,
-        // );
-
-        try_liquidate_with_collateral(
+        try_liquidate_with_match(
             &drift,
             pos.market_index,
             keeper_subaccount,
             liquidatee,
-            pos.base_asset_amount.unsigned_abs(),
+            makers.as_slice(),
             tx_sender,
             priority_fee,
             cu_limit,
             slot,
             pyth_update,
         );
+
+        // try_liquidate_with_collateral(
+        //     &drift,
+        //     pos.market_index,
+        //     keeper_subaccount,
+        //     liquidatee,
+        //     pos.base_asset_amount.unsigned_abs(),
+        //     tx_sender,
+        //     priority_fee,
+        //     cu_limit,
+        //     slot,
+        //     pyth_update,
+        // );
     }
 
     /// Attempt spot liquidation with Jupiter swap

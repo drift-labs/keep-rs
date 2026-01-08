@@ -131,6 +131,10 @@ pub enum TxIntent {
         liquidatee: Pubkey,
         slot: u64,
     },
+    Derisk {
+        market_index: u16,
+        subaccount: Pubkey,
+    },
 }
 
 impl TxIntent {
@@ -156,6 +160,7 @@ impl TxIntent {
             TxIntent::LiquidateWithFill { .. } => "liq_with_fill",
             TxIntent::LiquidatePerp { .. } => "liq_perp",
             TxIntent::LiquidateSpot { .. } => "liq_spot",
+            TxIntent::Derisk { .. } => "derisk",
         }
     }
 
@@ -173,6 +178,7 @@ impl TxIntent {
             TxIntent::LiquidateWithFill { .. } => 1,
             TxIntent::LiquidatePerp { .. } => 0,
             TxIntent::LiquidateSpot { .. } => 0,
+            TxIntent::Derisk { .. } => 0,
         }
     }
 
@@ -198,6 +204,7 @@ impl TxIntent {
             Self::LiquidateWithFill { slot, .. } => (vec![], *slot),
             Self::LiquidatePerp { slot, .. } => (vec![], *slot),
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
+            TxIntent::Derisk { .. } => (vec![], 0),
         }
     }
 
