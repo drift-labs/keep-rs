@@ -311,7 +311,7 @@ impl FillerBot {
                         // ghetto rate limit
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
-                                log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_asks.first(), crosses.crossing_bids.first());
+                                log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_bids.first(), crosses.crossing_asks.first());
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
                         }
@@ -692,7 +692,7 @@ fn try_uncross(
     let maker_asks: Vec<User> = crosses
         .crossing_asks
         .iter()
-        .take(5)
+        .take(3)
         .filter_map(|x| {
             let maker = x.user;
             if maker != best_bid.user {
@@ -706,7 +706,7 @@ fn try_uncross(
     let maker_bids: Vec<User> = crosses
         .crossing_bids
         .iter()
-        .take(5)
+        .take(3)
         .filter_map(|x| {
             let maker = x.user;
             if maker != best_ask.user {
@@ -722,12 +722,17 @@ fn try_uncross(
         target: TARGET,
         "X asks: {:?}, X bids: {:?}",
         crosses.crossing_asks,
-        crosses.crossing_bids
+        crosses.crossing_bids,
     );
 
     // try valid combinations of taker/maker with all crossing asks/bids
     for (taker_order, makers) in [(best_ask, maker_bids), (best_bid, maker_asks)] {
         if taker_order.is_post_only() {
+            continue;
+        }
+
+        if makers.is_empty() {
+            log::debug!(target: TARGET, "no makers to uncross");
             continue;
         }
 
