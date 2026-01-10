@@ -1704,27 +1704,34 @@ impl LiquidateWithMatchStrategy {
             return;
         };
 
-        // Check if we have enough collateral
+        // Check available collateral
         let collateral_map = collateral_info_per_subaccount.read().unwrap();
         let Some(collateral_info) = collateral_map.get(&keeper_subaccount) else {
             log::warn!(target: TARGET, "no collateral info for keeper subaccount");
             return;
         };
 
-        if collateral_info.free < collateral_required as i128 {
-            log::info!(
-                target: TARGET,
-                "insufficient collateral: need {}, have {}",
-                collateral_required,
-                collateral_info.free
-            );
-            return;
-        }
+        // Calculate amount to be liquidated (full or partial)
+        let base_asset_amount_to_be_liquidated =
+            if collateral_info.free >= collateral_required as i128 {
+                pos.base_asset_amount.unsigned_abs()
+            } else {
+                // Scale down to 90% of available collateral
+                let scale_factor = (collateral_info.free as f64 / collateral_required as f64) * 0.9;
+                (pos.base_asset_amount.unsigned_abs() as f64 * scale_factor) as u64
+            };
 
         metrics
             .liquidation_attempts
             .with_label_values(&["perp"])
             .inc();
+
+        let oracle_price = market_state
+            .get_perp_oracle_price(pos.market_index)
+            .map(|x| x.price)
+            .unwrap_or(0) as u64;
+
+        let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
         let Some(makers) = Self::find_top_makers(
             drift,
@@ -1733,15 +1740,20 @@ impl LiquidateWithMatchStrategy {
             pos.market_index,
             pos.base_asset_amount,
         ) else {
+            try_liquidate_with_collateral(
+                &drift,
+                pos.market_index,
+                keeper_subaccount,
+                liquidatee,
+                base_asset_amount_to_be_liquidated,
+                tx_sender,
+                priority_fee,
+                cu_limit,
+                slot,
+                pyth_update,
+            );
             return;
         };
-
-        let oracle_price = market_state
-            .get_perp_oracle_price(pos.market_index)
-            .map(|x| x.price)
-            .unwrap_or(0) as u64;
-
-        let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
         try_liquidate_with_match(
             &drift,
@@ -1755,19 +1767,6 @@ impl LiquidateWithMatchStrategy {
             slot,
             pyth_update,
         );
-
-        // try_liquidate_with_collateral(
-        //     &drift,
-        //     pos.market_index,
-        //     keeper_subaccount,
-        //     liquidatee,
-        //     pos.base_asset_amount.unsigned_abs(),
-        //     tx_sender,
-        //     priority_fee,
-        //     cu_limit,
-        //     slot,
-        //     pyth_update,
-        // );
     }
 
     /// Attempt spot liquidation with Jupiter swap
