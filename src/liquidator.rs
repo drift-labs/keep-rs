@@ -22,7 +22,10 @@ use drift_rs::{
     jupiter::SwapMode,
     market_state::MarketStateData,
     math::{
-        constants::{BASE_PRECISION, MARGIN_PRECISION_U128, PRICE_PRECISION, QUOTE_PRECISION},
+        constants::{
+            BASE_PRECISION, BASE_PRECISION_U64, MARGIN_PRECISION_U128, PRICE_PRECISION,
+            QUOTE_PRECISION,
+        },
         liquidation::{calculate_collateral, CollateralInfo},
     },
     priority_fee_subscriber::PriorityFeeSubscriber,
@@ -486,7 +489,7 @@ impl LiquidatorBot {
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
-            Arc::new(LiquidateWithMatchStrategy {
+            Arc::new(PrimaryLiquidationStrategy {
                 dlob,
                 drift: drift.clone(),
                 market_state,
@@ -1607,9 +1610,13 @@ fn spawn_liquidation_worker(
     });
 }
 
-/// Default liquidation strategy that matches against top-of-book makers and
-/// submits liquidate_with_fill
-pub struct LiquidateWithMatchStrategy {
+enum PerpLiquidationMethod {
+    WithFill,
+    Takeover,
+    Skip,
+}
+/// Primary liquidation strategy: Prefers takeover for large positions, uses maker matching for rest
+pub struct PrimaryLiquidationStrategy {
     pub drift: DriftClient,
     pub dlob: &'static DLOB,
     pub market_state: &'static MarketState,
@@ -1618,7 +1625,31 @@ pub struct LiquidateWithMatchStrategy {
     pub use_spot_liquidation: bool,
 }
 
-impl LiquidateWithMatchStrategy {
+impl PrimaryLiquidationStrategy {
+    /// Liquidation policy: Prefer takeover for large positions (≥$10k), use makers for small positions,
+    /// fallback to takeover when no makers available. Skip if no makers and insufficient collateral.
+    fn decide_perp_method(
+        base_asset_amount_to_liquidate: u64,
+        collateral_available: i128,
+        collateral_required: u128,
+        has_makers: bool,
+    ) -> PerpLiquidationMethod {
+        const LARGE_POSITION_THRESHOLD: u64 = 10_000 * BASE_PRECISION_U64;
+
+        let is_large_position = base_asset_amount_to_liquidate >= LARGE_POSITION_THRESHOLD;
+        let can_afford_takeover = collateral_available >= collateral_required as i128;
+
+        if is_large_position && can_afford_takeover {
+            PerpLiquidationMethod::Takeover
+        } else if has_makers {
+            PerpLiquidationMethod::WithFill
+        } else if can_afford_takeover {
+            PerpLiquidationMethod::Takeover
+        } else {
+            PerpLiquidationMethod::Skip
+        }
+    }
+
     /// Find top makers for a perp position
     fn find_top_makers(
         drift: &DriftClient,
@@ -1669,7 +1700,7 @@ impl LiquidateWithMatchStrategy {
         Some(makers)
     }
 
-    /// Attempt perp liquidation with order matching
+    /// Attempt perp liquidation with order matching or collateral
     fn liquidate_perp(
         drift: &DriftClient,
         dlob: &'static DLOB,
@@ -1733,40 +1764,57 @@ impl LiquidateWithMatchStrategy {
 
         let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
-        let Some(makers) = Self::find_top_makers(
+        let makers = Self::find_top_makers(
             drift,
             dlob,
             market_state,
             pos.market_index,
             pos.base_asset_amount,
-        ) else {
-            try_liquidate_with_collateral(
-                &drift,
-                pos.market_index,
-                keeper_subaccount,
-                liquidatee,
-                base_asset_amount_to_be_liquidated,
-                tx_sender,
-                priority_fee,
-                cu_limit,
-                slot,
-                pyth_update,
-            );
-            return;
-        };
-
-        try_liquidate_with_match(
-            &drift,
-            pos.market_index,
-            keeper_subaccount,
-            liquidatee,
-            makers.as_slice(),
-            tx_sender,
-            priority_fee,
-            cu_limit,
-            slot,
-            pyth_update,
         );
+
+        let method = Self::decide_perp_method(
+            base_asset_amount_to_be_liquidated,
+            collateral_info.free,
+            collateral_required,
+            makers.is_some(),
+        );
+
+        match method {
+            PerpLiquidationMethod::WithFill => {
+                try_liquidate_with_match(
+                    &drift,
+                    pos.market_index,
+                    keeper_subaccount,
+                    liquidatee,
+                    makers.unwrap().as_slice(),
+                    tx_sender,
+                    priority_fee,
+                    cu_limit,
+                    slot,
+                    pyth_update,
+                );
+            }
+            PerpLiquidationMethod::Takeover => {
+                try_liquidate_with_collateral(
+                    &drift,
+                    pos.market_index,
+                    keeper_subaccount,
+                    liquidatee,
+                    base_asset_amount_to_be_liquidated,
+                    tx_sender,
+                    priority_fee,
+                    cu_limit,
+                    slot,
+                    pyth_update,
+                );
+            }
+            PerpLiquidationMethod::Skip => {
+                log::info!(
+                    target: TARGET,
+                    "skipping liquidation: insufficient collateral and no makers available"
+                );
+            }
+        }
     }
 
     /// Attempt spot liquidation with Jupiter swap
@@ -1997,7 +2045,7 @@ impl LiquidateWithMatchStrategy {
     }
 }
 
-impl LiquidationStrategy for LiquidateWithMatchStrategy {
+impl LiquidationStrategy for PrimaryLiquidationStrategy {
     fn liquidate_user<'a>(
         &'a self,
         liquidatee: Pubkey,
