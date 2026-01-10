@@ -120,11 +120,20 @@ pub enum TxIntent {
         liquidatee: Pubkey,
         slot: u64,
     },
+    LiquidatePerp {
+        market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
     LiquidateSpot {
         asset_market_index: u16,
         liability_market_index: u16,
         liquidatee: Pubkey,
         slot: u64,
+    },
+    Derisk {
+        market_index: u16,
+        subaccount: Pubkey,
     },
 }
 
@@ -149,7 +158,9 @@ impl TxIntent {
             TxIntent::LimitUncross { .. } => "limit_uncross",
             TxIntent::VAMMTakerFill { .. } => "vamm_taker",
             TxIntent::LiquidateWithFill { .. } => "liq_with_fill",
+            TxIntent::LiquidatePerp { .. } => "liq_perp",
             TxIntent::LiquidateSpot { .. } => "liq_spot",
+            TxIntent::Derisk { .. } => "derisk",
         }
     }
 
@@ -165,7 +176,9 @@ impl TxIntent {
             TxIntent::VAMMTakerFill { .. } => 1,
             TxIntent::LimitUncross { .. } => 1,
             TxIntent::LiquidateWithFill { .. } => 1,
+            TxIntent::LiquidatePerp { .. } => 0,
             TxIntent::LiquidateSpot { .. } => 0,
+            TxIntent::Derisk { .. } => 0,
         }
     }
 
@@ -189,7 +202,9 @@ impl TxIntent {
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),
             Self::LiquidateWithFill { slot, .. } => (vec![], *slot),
+            Self::LiquidatePerp { slot, .. } => (vec![], *slot),
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
+            TxIntent::Derisk { .. } => (vec![], 0),
         }
     }
 
