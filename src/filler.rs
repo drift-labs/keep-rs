@@ -18,8 +18,8 @@ use drift_rs::{
     priority_fee_subscriber::PriorityFeeSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
-        accounts::{User, UserStats},
-        CommitmentConfig, MarketId, MarketPrecision, MarketStatus, MarketType, Order,
+        accounts::{PerpMarket, User, UserStats},
+        CommitmentConfig, FeeTier, MarketId, MarketPrecision, MarketStatus, MarketType, Order,
         OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
         RpcSendTransactionConfig, VersionedMessage, AMM,
     },
@@ -264,7 +264,12 @@ impl FillerBot {
                     }
                 }
                 new_slot = slot_rx.recv() => {
+                    if new_slot.is_none() {
+                        log::error!(target: TARGET, "slot subscriber failed");
+                        break;
+                    }
                     slot = new_slot.expect("got slot update");
+                    log::trace!(target: TARGET, "got slot update: {slot}");
 
                     let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // add entropy to produce unique tx hash on conseuctive tx resubmission
                     let t0 = std::time::SystemTime::now();
@@ -305,6 +310,7 @@ impl FillerBot {
                                 move |maker_cross| {
                                     perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
                                 },
+                                perp_market,
                             ).await;
                         }
 
@@ -370,7 +376,9 @@ fn on_slot_update_fn(
                 .unwrap();
             dlob_notifier.slot_and_oracle_update(*market, new_slot, oracle_price_data.price as u64);
         }
-        slot_tx.try_send(new_slot).expect("sent");
+        if let Err(err) = slot_tx.try_send(new_slot) {
+            log::debug!(target: TARGET, "failed slot update: {err:?}");
+        }
     }
 }
 
@@ -500,6 +508,7 @@ async fn try_auction_fill(
     oracle_update: Option<PythPriceUpdate>,
     trigger_price: u64,
     is_vamm_inactive: impl Fn(&MakerCrosses) -> bool,
+    perp_market: PerpMarket,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
@@ -611,9 +620,41 @@ async fn try_auction_fill(
             })
             .collect();
 
-        if crosses.has_vamm_cross && is_vamm_inactive(&crosses) {
-            log::debug!(target: TARGET, "skip inactive vamm cross: {crosses:?}");
-            return;
+        if crosses.has_vamm_cross {
+            if is_vamm_inactive(&crosses) {
+                log::debug!(target: TARGET, "skip inactive vamm cross: {crosses:?}");
+                return;
+            }
+
+            if let Ok(pos) = taker_account_data.get_perp_position(market_index) {
+                if let Ok((base_asset_amount, _limit_price)) = perp_market
+                    .calculate_base_asset_amount_for_amm_to_fulfill(
+                        &taker_account_data
+                            .orders
+                            .iter()
+                            .find(|o| o.order_id == taker_order.order_id)
+                            .unwrap(),
+                        &perp_market,
+                        None,
+                        None,
+                        pos.base_asset_amount,
+                        &FeeTier::default(),
+                    )
+                {
+                    // if user position is less than min order size, step size is the threshold
+                    let amm_size_threshold = if !taker_order.is_reduce_only()
+                        && pos.base_asset_amount.unsigned_abs() > perp_market.amm.min_order_size
+                    {
+                        perp_market.amm.min_order_size
+                    } else {
+                        perp_market.amm.order_step_size
+                    };
+                    if base_asset_amount < amm_size_threshold {
+                        log::info!(target: TARGET, "skip vamm cross too small: {crosses:?}");
+                        return;
+                    }
+                }
+            }
         }
         if !crosses.has_vamm_cross && maker_accounts.is_empty() {
             log::debug!(target: TARGET, "skip empty maker cross: {crosses:?}");
