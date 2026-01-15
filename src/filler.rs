@@ -187,7 +187,11 @@ impl FillerBot {
                                 oracle_price,
                                 true,
                             );
-                            log::debug!("updated order params");
+                            if order_params.order_type == OrderType::Limit && order_params.post_only != PostOnlyParam::None {
+                                log::warn!(target: TARGET, "swift order limit post only: {signed_order:?}");
+                                // TODO: search for immediate fill
+                                continue;
+                            }
                             let (start_price, end_price, duration) = (order_params.auction_start_price.unwrap_or_default(), order_params.auction_end_price.unwrap_or_default(), order_params.auction_duration.unwrap_or_default());
                             let order = Order {
                                 slot: slot + 1,
@@ -292,7 +296,7 @@ impl FillerBot {
                             }
                         }
 
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), None);
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), trigger_price, None);
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if !crosses_and_top_makers.crosses.is_empty() {
@@ -759,11 +763,11 @@ fn try_uncross(
         .collect();
 
     log::info!(target: TARGET, "try uncross book={market_index},slot={slot}");
-    log::info!(
+    log::debug!(
         target: TARGET,
         "X asks: {:?}, X bids: {:?}",
-        crosses.crossing_asks,
-        crosses.crossing_bids,
+        &crosses.crossing_asks.iter().take(3),
+        &crosses.crossing_bids.iter().take(3),
     );
 
     // try valid combinations of taker/maker with all crossing asks/bids
