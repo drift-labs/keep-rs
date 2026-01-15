@@ -261,7 +261,7 @@ async fn update_dashboard_state(
                 crate::http::MarketType::Spot
             },
             market_index: market_id.index(),
-            price: oracle_meta.price_data.price as i64,
+            price: oracle_meta.price_data.price,
             last_updated_slot: oracle_meta.last_updated_slot,
             last_updated_ms: oracle_meta.last_updated_timestamp_ms,
             age_slots,
@@ -628,14 +628,17 @@ impl LiquidatorBot {
                                 validate_data_freshness(user_meta, &oracle_prices, current_slot)
                             {
                                 match staleness_err {
-                                    StalenessError::UserAccountStale { age_slots } => {
+                                    StalenessError::UserAccountStale { age_slots: _ } => {
                                         // log::debug!(
                                         //     target: TARGET,
                                         //     "Recalculating margin for stale user {:?}: user account {} slots old",
                                         //     pubkey, age_slots
                                         // );
                                     }
-                                    StalenessError::OraclePriceStale { market, age_slots } => {
+                                    StalenessError::OraclePriceStale {
+                                        market: _,
+                                        age_slots: _,
+                                    } => {
                                         // log::debug!(
                                         //     target: TARGET,
                                         //     "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
@@ -729,7 +732,7 @@ impl LiquidatorBot {
             // Only recheck margin for high-risk users on oracle price updates
             // Process in batches to avoid blocking the main event loop
             if oracle_update {
-                let high_risk_count = high_risk.len();
+                let _high_risk_count = high_risk.len();
                 let t0 = current_time_millis();
                 let mut liquidatable_users = Vec::new();
 
@@ -753,14 +756,17 @@ impl LiquidatorBot {
                             validate_data_freshness(user_meta, &oracle_prices, current_slot)
                         {
                             match staleness_err {
-                                StalenessError::UserAccountStale { age_slots } => {
+                                StalenessError::UserAccountStale { age_slots: _ } => {
                                     // log::debug!(
                                     //     target: TARGET,
                                     //     "Recalculating margin for stale user {:?}: user account {} slots old",
                                     //     pubkey, age_slots
                                     // );
                                 }
-                                StalenessError::OraclePriceStale { market, age_slots } => {
+                                StalenessError::OraclePriceStale {
+                                    market: _,
+                                    age_slots: _,
+                                } => {
                                     // log::debug!(
                                     //     target: TARGET,
                                     //     "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
@@ -857,14 +863,17 @@ impl LiquidatorBot {
                             validate_data_freshness(user_meta, &oracle_prices, current_slot)
                         {
                             match staleness_err {
-                                StalenessError::UserAccountStale { age_slots } => {
+                                StalenessError::UserAccountStale { age_slots: _ } => {
                                     // log::debug!(
                                     //     target: TARGET,
                                     //     "Checking stale user {:?} for high-risk status: {} slots old",
                                     //     pubkey, age_slots
                                     // );
                                 }
-                                StalenessError::OraclePriceStale { market, age_slots } => {
+                                StalenessError::OraclePriceStale {
+                                    market: _,
+                                    age_slots: _,
+                                } => {
                                     // log::debug!(
                                     //     target: TARGET,
                                     //     "Checking {:?} with stale oracle {:?}: {} slots old",
@@ -931,14 +940,17 @@ impl LiquidatorBot {
                         validate_data_freshness(user_meta, &oracle_prices, current_slot)
                     {
                         match staleness_err {
-                            StalenessError::UserAccountStale { age_slots } => {
+                            StalenessError::UserAccountStale { age_slots: _ } => {
                                 // log::debug!(
                                 //     target: TARGET,
                                 //     "Recalculating margin for stale user {:?}: user account {} slots old",
                                 //     pubkey, age_slots
                                 // );
                             }
-                            StalenessError::OraclePriceStale { market, age_slots } => {
+                            StalenessError::OraclePriceStale {
+                                market: _,
+                                age_slots: _,
+                            } => {
                                 // log::debug!(
                                 //     target: TARGET,
                                 //     "Recalculating margin for {:?} with stale oracle: {:?} is {} slots old",
@@ -1104,7 +1116,7 @@ async fn setup_grpc(
                     {
                         let tx = tx.clone();
                         move |acc| {
-                            let user: &User = drift_rs::utils::deser_zero_copy(&acc.data);
+                            let user: &User = drift_rs::utils::deser_zero_copy(acc.data);
                             if let Err(err) = tx.try_send(GrpcEvent::UserUpdate {
                                 pubkey: acc.pubkey,
                                 user: user.clone(),
@@ -1573,11 +1585,9 @@ impl LiquidateWithMatchStrategy {
                 .expect("liability spot market");
 
             let in_token_account =
-                drift_rs::Wallet::derive_associated_token_address(&authority, &asset_spot_market);
-            let out_token_account = drift_rs::Wallet::derive_associated_token_address(
-                &authority,
-                &liability_spot_market,
-            );
+                drift_rs::Wallet::derive_associated_token_address(authority, asset_spot_market);
+            let out_token_account =
+                drift_rs::Wallet::derive_associated_token_address(authority, liability_spot_market);
 
             let t0 = std::time::Instant::now();
             let (jupiter_result, titan_result) = tokio::join!(
@@ -1652,8 +1662,8 @@ impl LiquidateWithMatchStrategy {
                 .with_priority_fee(priority_fee, Some(cu_limit))
                 .titan_swap_liquidate(
                     titan_result.unwrap(),
-                    &asset_spot_market,
-                    &liability_spot_market,
+                    asset_spot_market,
+                    liability_spot_market,
                     &in_token_account,
                     &out_token_account,
                     asset_market_index,
@@ -1671,8 +1681,8 @@ impl LiquidateWithMatchStrategy {
                 .with_priority_fee(priority_fee, Some(cu_limit))
                 .jupiter_swap_liquidate(
                     jupiter_result.unwrap(),
-                    &asset_spot_market,
-                    &liability_spot_market,
+                    asset_spot_market,
+                    liability_spot_market,
                     &in_token_account,
                     &out_token_account,
                     asset_market_index,
