@@ -18,8 +18,8 @@ use drift_rs::{
     priority_fee_subscriber::PriorityFeeSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
-        accounts::{User, UserStats},
-        CommitmentConfig, MarketId, MarketPrecision, MarketStatus, MarketType, Order,
+        accounts::{PerpMarket, User, UserStats},
+        CommitmentConfig, FeeTier, MarketId, MarketPrecision, MarketStatus, MarketType, Order,
         OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
         RpcSendTransactionConfig, VersionedMessage, AMM,
     },
@@ -187,7 +187,11 @@ impl FillerBot {
                                 oracle_price,
                                 true,
                             );
-                            log::debug!("updated order params");
+                            if order_params.order_type == OrderType::Limit && order_params.post_only != PostOnlyParam::None {
+                                log::warn!(target: TARGET, "swift order limit post only: {signed_order:?}");
+                                // TODO: search for immediate fill
+                                continue;
+                            }
                             let (start_price, end_price, duration) = (order_params.auction_start_price.unwrap_or_default(), order_params.auction_end_price.unwrap_or_default(), order_params.auction_duration.unwrap_or_default());
                             let order = Order {
                                 slot: slot + 1,
@@ -264,7 +268,12 @@ impl FillerBot {
                     }
                 }
                 new_slot = slot_rx.recv() => {
+                    if new_slot.is_none() {
+                        log::error!(target: TARGET, "slot subscriber failed");
+                        break;
+                    }
                     slot = new_slot.expect("got slot update");
+                    log::trace!(target: TARGET, "got slot update: {slot}");
 
                     let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // add entropy to produce unique tx hash on conseuctive tx resubmission
                     let t0 = std::time::SystemTime::now();
@@ -287,7 +296,7 @@ impl FillerBot {
                             }
                         }
 
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), None);
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), trigger_price, None);
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
 
                         if !crosses_and_top_makers.crosses.is_empty() {
@@ -305,13 +314,14 @@ impl FillerBot {
                                 move |maker_cross| {
                                     perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
                                 },
+                                perp_market,
                             ).await;
                         }
 
                         // ghetto rate limit
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
-                                log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_asks.first(), crosses.crossing_bids.first());
+                                log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_bids.first(), crosses.crossing_asks.first());
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
                             }
                         }
@@ -370,7 +380,9 @@ fn on_slot_update_fn(
                 .unwrap();
             dlob_notifier.slot_and_oracle_update(*market, new_slot, oracle_price_data.price as u64);
         }
-        slot_tx.try_send(new_slot).expect("sent");
+        if let Err(err) = slot_tx.try_send(new_slot) {
+            log::debug!(target: TARGET, "failed slot update: {err:?}");
+        }
     }
 }
 
@@ -500,6 +512,7 @@ async fn try_auction_fill(
     oracle_update: Option<PythPriceUpdate>,
     trigger_price: u64,
     is_vamm_inactive: impl Fn(&MakerCrosses) -> bool,
+    perp_market: PerpMarket,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
@@ -611,9 +624,41 @@ async fn try_auction_fill(
             })
             .collect();
 
-        if crosses.has_vamm_cross && is_vamm_inactive(&crosses) {
-            log::debug!(target: TARGET, "skip inactive vamm cross: {crosses:?}");
-            return;
+        if crosses.has_vamm_cross {
+            if is_vamm_inactive(&crosses) {
+                log::debug!(target: TARGET, "skip inactive vamm cross: {crosses:?}");
+                return;
+            }
+
+            if let Ok(pos) = taker_account_data.get_perp_position(market_index) {
+                if let Ok((base_asset_amount, _limit_price)) = perp_market
+                    .calculate_base_asset_amount_for_amm_to_fulfill(
+                        &taker_account_data
+                            .orders
+                            .iter()
+                            .find(|o| o.order_id == taker_order.order_id)
+                            .unwrap(),
+                        &perp_market,
+                        None,
+                        None,
+                        pos.base_asset_amount,
+                        &FeeTier::default(),
+                    )
+                {
+                    // if user position is less than min order size, step size is the threshold
+                    let amm_size_threshold = if !taker_order.is_reduce_only()
+                        && pos.base_asset_amount.unsigned_abs() > perp_market.amm.min_order_size
+                    {
+                        perp_market.amm.min_order_size
+                    } else {
+                        perp_market.amm.order_step_size
+                    };
+                    if base_asset_amount < amm_size_threshold {
+                        log::info!(target: TARGET, "skip vamm cross too small: {crosses:?}");
+                        return;
+                    }
+                }
+            }
         }
         if !crosses.has_vamm_cross && maker_accounts.is_empty() {
             log::debug!(target: TARGET, "skip empty maker cross: {crosses:?}");
@@ -692,7 +737,7 @@ fn try_uncross(
     let maker_asks: Vec<User> = crosses
         .crossing_asks
         .iter()
-        .take(5)
+        .take(3)
         .filter_map(|x| {
             let maker = x.user;
             if maker != best_bid.user {
@@ -706,7 +751,7 @@ fn try_uncross(
     let maker_bids: Vec<User> = crosses
         .crossing_bids
         .iter()
-        .take(5)
+        .take(3)
         .filter_map(|x| {
             let maker = x.user;
             if maker != best_ask.user {
@@ -718,16 +763,21 @@ fn try_uncross(
         .collect();
 
     log::info!(target: TARGET, "try uncross book={market_index},slot={slot}");
-    log::info!(
+    log::debug!(
         target: TARGET,
         "X asks: {:?}, X bids: {:?}",
-        crosses.crossing_asks,
-        crosses.crossing_bids
+        &crosses.crossing_asks.iter().take(3),
+        &crosses.crossing_bids.iter().take(3),
     );
 
     // try valid combinations of taker/maker with all crossing asks/bids
     for (taker_order, makers) in [(best_ask, maker_bids), (best_bid, maker_asks)] {
         if taker_order.is_post_only() {
+            continue;
+        }
+
+        if makers.is_empty() {
+            log::debug!(target: TARGET, "no makers to uncross");
             continue;
         }
 

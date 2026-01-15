@@ -87,7 +87,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
             }
         }
 
-        return true;
+        true
     }
 }
 
