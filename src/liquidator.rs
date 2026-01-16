@@ -592,7 +592,7 @@ impl LiquidatorBot {
                     // Check margin status and add to high-risk set if needed
                     let status = check_margin_status(&margin_info);
 
-                    if status.is_at_risk(){
+                    if status.is_at_risk() {
                         high_risk.insert(*pubkey);
                         initial_high_risk_count += 1;
                     }
@@ -607,7 +607,13 @@ impl LiquidatorBot {
         let mut oracle_update;
 
         // Pyth Feed
-        let mut pyth_price_feed = self.pyth_price_feed.unwrap();
+        let mut pyth_price_feed = match self.pyth_price_feed {
+            Some(rx) => rx,
+            None => {
+                log::error!(target: TARGET, "pyth price feed not initialized");
+                return;
+            }
+        };
         let mut pyth_perp_prices = BTreeMap::<u16, PythPriceUpdate>::new();
 
         loop {
