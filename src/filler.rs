@@ -19,8 +19,8 @@ use drift_rs::{
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
         accounts::{PerpMarket, User, UserStats},
-        CommitmentConfig, FeeTier, MarketId, MarketPrecision, MarketStatus, MarketType, Order,
-        OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
+        CommitmentConfig, FeatureBitFlags, FeeTier, MarketId, MarketPrecision, MarketStatus,
+        MarketType, Order, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
         RpcSendTransactionConfig, VersionedMessage, AMM,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, TransactionBuilder, Wallet,
@@ -330,7 +330,7 @@ impl FillerBot {
                         if slot % 300 == 0 {
                             use_median_trigger_price = drift
                             .state_account()
-                            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
+                            .map(|s| s.feature_bit_flags & FeatureBitFlags::MedianTriggerPrice as u8 != 0)
                             .unwrap_or(false);
                         }
                     }
