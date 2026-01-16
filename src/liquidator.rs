@@ -1341,7 +1341,7 @@ fn spawn_liquidation_worker(
                 .get(&liquidatee)
                 .is_some_and(|last| slot.abs_diff(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
             {
-                log::info!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
+                log::warn!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
                 continue;
             } else {
                 rate_limit.insert(liquidatee, slot);
