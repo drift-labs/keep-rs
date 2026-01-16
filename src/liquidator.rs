@@ -525,6 +525,8 @@ impl LiquidatorBot {
             Arc::clone(&priority_fee_subscriber),
         );
 
+        log::info!(target: TARGET, "spawned liquidation worker");
+
         LiquidatorBot {
             drift,
             dlob_notifier,
@@ -558,6 +560,9 @@ impl LiquidatorBot {
         // initialize local User storage
         let mut exclude_count = 0;
         let mut initial_high_risk_count = 0;
+
+        log::info!(target: TARGET, "starting user account initialization");
+
         drift
             .backend()
             .account_map()
@@ -599,8 +604,8 @@ impl LiquidatorBot {
                 }
             });
 
-        log::debug!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
-        log::debug!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
+        log::info!(target: TARGET, "filtered #{exclude_count} accounts with dust collateral");
+        log::info!(target: TARGET, "identified #{initial_high_risk_count} high-risk accounts for monitoring");
 
         // main loop
         let mut event_buffer = Vec::<GrpcEvent>::with_capacity(64);
