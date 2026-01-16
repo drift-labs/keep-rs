@@ -630,8 +630,6 @@ impl LiquidatorBot {
             'pyth: loop {
                 match pyth_price_feed.try_recv() {
                     Ok(update) => {
-                        log::info!(target: TARGET, "processing pyth m={}", update.market_id);
-
                         let market_id = update.market_id;
                         let price = update.price;
 
@@ -653,16 +651,11 @@ impl LiquidatorBot {
                         log::error!(target: TARGET, "pyth price feed disconnected");
                         return;
                     }
-                    Err(TryRecvError::Empty) => {
-                        log::info!(target: TARGET, "pyth empty");
-                        break 'pyth;
-                    }
+                    Err(TryRecvError::Empty) => break 'pyth,
                 }
             }
 
-            log::info!(target: TARGET, "calling events_rx.recv_many");
             events_rx.recv_many(&mut event_buffer, 64).await;
-            log::info!(target: TARGET, "got {} events", event_buffer.len());
             for event in event_buffer.drain(..) {
                 match event {
                     GrpcEvent::UserUpdate {
@@ -891,7 +884,7 @@ impl LiquidatorBot {
                     )) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            log::warn!(
+                            log::debug!(
                                 target: TARGET,
                                 "liquidation channel full, dropping liquidation for {:?}",
                                 pubkey
@@ -1069,7 +1062,7 @@ impl LiquidatorBot {
                         )) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                log::warn!(
+                                log::debug!(
                                     target: TARGET,
                                     "liquidation channel full, dropping liquidation for {:?}",
                                     pubkey
@@ -1356,7 +1349,7 @@ fn spawn_liquidation_worker(
                 .get(&liquidatee)
                 .is_some_and(|last| slot.abs_diff(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
             {
-                log::warn!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
+                log::debug!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
                 continue;
             } else {
                 rate_limit.insert(liquidatee, slot);

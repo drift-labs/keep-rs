@@ -235,7 +235,7 @@ impl PendingTxMeta {
 /// let confirmed = buf.confirm(|m| m.signature == sig);
 /// ```
 pub struct PendingTxs<const N: usize> {
-    buffer: [PendingTxMeta; N],
+    buffer: Box<[PendingTxMeta; N]>,
     head: usize,
     tail: usize,
     size: usize,
@@ -244,7 +244,7 @@ pub struct PendingTxs<const N: usize> {
 impl<const N: usize> PendingTxs<N> {
     pub fn new() -> Self {
         Self {
-            buffer: [(); N].map(|_| PendingTxMeta::default()),
+            buffer: Box::new([(); N].map(|_| PendingTxMeta::default())),
             head: 0,
             tail: 0,
             size: 0,
