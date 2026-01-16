@@ -621,6 +621,8 @@ impl LiquidatorBot {
         };
         let mut pyth_perp_prices = BTreeMap::<u16, PythPriceUpdate>::new();
 
+        log::info!(target: TARGET, "entering main event loop");
+
         loop {
             oracle_update = false;
 
@@ -628,6 +630,8 @@ impl LiquidatorBot {
             'pyth: loop {
                 match pyth_price_feed.try_recv() {
                     Ok(update) => {
+                        log::info!(target: TARGET, "processing pyth m={}", update.market_id);
+
                         let market_id = update.market_id;
                         let price = update.price;
 
@@ -652,7 +656,10 @@ impl LiquidatorBot {
                     Err(TryRecvError::Empty) => break 'pyth,
                 }
             }
+
+            log::info!(target: TARGET, "calling events_rx.recv_many");
             events_rx.recv_many(&mut event_buffer, 64).await;
+            log::info!(target: TARGET, "got {} events", event_buffer.len());
             for event in event_buffer.drain(..) {
                 match event {
                     GrpcEvent::UserUpdate {
@@ -1432,7 +1439,7 @@ impl LiquidateWithMatchStrategy {
         market_index: u16,
         base_asset_amount: i64,
     ) -> Option<Vec<User>> {
-        let l3_book = dlob.get_l3_snapshot(market_index, MarketType::Perp);
+        let l3_book = dlob.get_l3_snapshot_safe(market_index, MarketType::Perp)?;
 
         let oracle_price = market_state
             .get_perp_oracle_price(market_index)
