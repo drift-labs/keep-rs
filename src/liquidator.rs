@@ -579,8 +579,8 @@ impl LiquidatorBot {
                     Some(liquidation_margin_buffer_ratio),
                 ) {
                     Ok(info) => info,
-                    Err(e) => {
-                        log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                    Err(_e) => {
+                        log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                         return;
                     }
                 };
@@ -719,8 +719,8 @@ impl LiquidatorBot {
                                     Some(liquidation_margin_buffer_ratio),
                                 ) {
                                 Ok(info) => info,
-                                Err(e) => {
-                                    log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                                Err(_e) => {
+                                    log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                                     continue;
                                 }
                             };
@@ -844,8 +844,8 @@ impl LiquidatorBot {
                                 Some(liquidation_margin_buffer_ratio),
                             ) {
                             Ok(info) => info,
-                            Err(e) => {
-                                log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
+                            Err(_e) => {
+                                log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                                 continue;
                             }
                         };
@@ -1016,19 +1016,18 @@ impl LiquidatorBot {
                         }
                     }
 
-                    let margin_info = match self
-                        .market_state
-                        .calculate_simplified_margin_requirement(
+                    let margin_info =
+                        match self.market_state.calculate_simplified_margin_requirement(
                             &user_meta.user,
                             MarginRequirementType::Maintenance,
                             Some(liquidation_margin_buffer_ratio),
                         ) {
-                        Ok(info) => info,
-                        Err(e) => {
-                            log::warn!(target: TARGET, "margin calc failed for {:?}: {:?}", pubkey, e);
-                            continue;
-                        }
-                    };
+                            Ok(info) => info,
+                            Err(_e) => {
+                                log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
+                                continue;
+                            }
+                        };
 
                     let status = check_margin_status(&margin_info);
 
