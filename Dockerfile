@@ -26,9 +26,10 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates lldb
 COPY --from=builder /usr/local/lib/libdrift_ffi_sys.so /lib/
-COPY --from=builder /app/target/release/keeprs /usr/local/bin/keeprs
+COPY --from=builder /app/target/release/keeprs /usr/local/bin/keeprs-real
+
+RUN echo '#!/bin/bash\nexec lldb -o "run" -o "bt all" -o "quit" -- /usr/local/bin/keeprs-real "$@"' > /usr/local/bin/keeprs && \
+    chmod +x /usr/local/bin/keeprs
 
 EXPOSE 9898
 ENV METRICS_PORT=9898
-
-ENTRYPOINT ["lldb", "-o", "run", "-o", "bt", "-o", "quit", "--", "/usr/local/bin/keeprs"]
