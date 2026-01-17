@@ -794,17 +794,17 @@ impl LiquidatorBot {
                 let mut liquidatable_users = Vec::new();
 
                 // Update dashboard state
-                update_dashboard_state(
-                    drift,
-                    &self.dashboard_state,
-                    &users,
-                    &oracle_prices,
-                    &high_risk,
-                    current_slot,
-                    self.market_state,
-                    liquidation_margin_buffer_ratio,
-                )
-                .await;
+                // update_dashboard_state(
+                //     drift,
+                //     &self.dashboard_state,
+                //     &users,
+                //     &oracle_prices,
+                //     &high_risk,
+                //     current_slot,
+                //     self.market_state,
+                //     liquidation_margin_buffer_ratio,
+                // )
+                // .await;
 
                 for pubkey in &high_risk {
                     if let Some(user_meta) = users.get(&pubkey) {
@@ -971,17 +971,17 @@ impl LiquidatorBot {
                 let mut newly_high_risk = 0;
 
                 // Update dashboard state periodically
-                update_dashboard_state(
-                    drift,
-                    &self.dashboard_state,
-                    &users,
-                    &oracle_prices,
-                    &high_risk,
-                    current_slot,
-                    self.market_state,
-                    liquidation_margin_buffer_ratio,
-                )
-                .await;
+                // update_dashboard_state(
+                //     drift,
+                //     &self.dashboard_state,
+                //     &users,
+                //     &oracle_prices,
+                //     &high_risk,
+                //     current_slot,
+                //     self.market_state,
+                //     liquidation_margin_buffer_ratio,
+                // )
+                // .await;
 
                 for (pubkey, user_meta) in users.iter() {
                     if high_risk.contains(pubkey) {
