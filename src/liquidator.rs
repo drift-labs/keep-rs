@@ -505,7 +505,7 @@ impl LiquidatorBot {
             u64,
             Option<PythPriceUpdate>,
             UserMarginStatus,
-        )>(1024);
+        )>(10240);
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
@@ -783,6 +783,7 @@ impl LiquidatorBot {
             // Process in batches to avoid blocking the main event loop
             if oracle_update {
                 let _high_risk_count = high_risk.len();
+
                 let t0 = current_time_millis();
                 let mut liquidatable_users = Vec::new();
 
@@ -884,7 +885,7 @@ impl LiquidatorBot {
                     )) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            log::debug!(
+                            log::warn!(
                                 target: TARGET,
                                 "liquidation channel full, dropping liquidation for {:?}",
                                 pubkey
@@ -1062,7 +1063,7 @@ impl LiquidatorBot {
                         )) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                log::debug!(
+                                log::warn!(
                                     target: TARGET,
                                     "liquidation channel full, dropping liquidation for {:?}",
                                     pubkey
@@ -1123,7 +1124,7 @@ async fn setup_grpc(
     transaction_tx: TxSender,
     market_ids: Vec<MarketId>,
 ) -> tokio::sync::mpsc::Receiver<GrpcEvent> {
-    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    let (tx, rx) = tokio::sync::mpsc::channel(10240);
 
     let _ = tokio::try_join!(
         crate::filler::sync_stats_accounts(&drift),
@@ -1167,7 +1168,7 @@ async fn setup_grpc(
                                 user: user.clone(),
                                 slot: acc.slot,
                             }) {
-                                log::error!(target: TARGET, "failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward user update event: {err:?}");
                             }
                         }
                     },
@@ -1182,7 +1183,7 @@ async fn setup_grpc(
                                 market: market.clone(),
                                 slot: acc.slot,
                             }) {
-                                log::error!(target: TARGET, "failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward perp market update event: {err:?}");
                             }
                         }
                     },
@@ -1197,7 +1198,7 @@ async fn setup_grpc(
                                 market: market.clone(),
                                 slot: acc.slot,
                             }) {
-                                log::error!(target: TARGET, "failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward spot market update event: {err:?}");
                             }
                         }
                     },
@@ -1231,7 +1232,7 @@ async fn setup_grpc(
                                 market: *market,
                                 slot: acc.slot,
                             }) {
-                                log::error!(target: TARGET, "failed to forward event: {err:?}");
+                                log::error!(target: TARGET, "failed to forward oracle update event: {err:?}");
                             }
                         }
                     }
@@ -1356,7 +1357,6 @@ fn spawn_liquidation_worker(
             }
 
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
-
             let strategy_clone = Arc::clone(&strategy);
             let liquidatee_clone = liquidatee;
             let user_account_clone = Arc::new(user_account);
@@ -1496,9 +1496,11 @@ impl LiquidateWithMatchStrategy {
         // Check isolated liquidations first
         for (market_index, iso_status) in &status.isolated {
             if *iso_status == MarginStatus::Liquidatable {
-                if let Some(pos) = user_account.perp_positions.iter().find(|p| {
-                    p.market_index == *market_index && p.isolated_position_scaled_balance != 0
-                }) {
+                if let Some(pos) = user_account
+                    .perp_positions
+                    .iter()
+                    .find(|p| p.market_index == *market_index && p.base_asset_amount != 0)
+                {
                     metrics
                         .liquidation_attempts
                         .with_label_values(&["perp"])
