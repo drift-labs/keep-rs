@@ -10,7 +10,7 @@ use anchor_lang::Discriminator;
 use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc::error::TryRecvError;
@@ -380,7 +380,7 @@ pub struct LiquidatorBot {
     dlob_notifier: DLOBNotifier,
     config: Config,
     /// stores drift perp+spot market metadata and oracle prices
-    market_state: &'static MarketState,
+    market_state: Arc<RwLock<MarketState>>,
     /// receives new updates from grpc
     events_rx: tokio::sync::mpsc::Receiver<GrpcEvent>,
     /// sends liquidatable accounts to work thread (pubkey, user, slot, timestamp_ms, pyth price)
@@ -488,8 +488,8 @@ impl LiquidatorBot {
                 market_state.set_spot_oracle_price(market.market_index, oracle.data);
             }
         }
-        let market_state: &'static MarketState =
-            Box::leak(Box::new(MarketState::new(market_state)));
+
+        let market_state = Arc::new(RwLock::new(MarketState::new(market_state)));
 
         let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
         let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
@@ -521,7 +521,7 @@ impl LiquidatorBot {
             Arc::new(LiquidateWithMatchStrategy {
                 dlob,
                 drift: drift.clone(),
-                market_state,
+                market_state: Arc::clone(&market_state),
                 keeper_subaccount,
                 metrics: Arc::clone(&metrics),
                 use_spot_liquidation: config.use_spot_liquidation,
@@ -576,11 +576,15 @@ impl LiquidatorBot {
             .backend()
             .account_map()
             .iter_accounts_with::<User>(|pubkey, user, _slot| {
-                let margin_info = match self.market_state.calculate_simplified_margin_requirement(
-                    user,
-                    MarginRequirementType::Maintenance,
-                    Some(liquidation_margin_buffer_ratio),
-                ) {
+                let margin_info = match self
+                    .market_state
+                    .read()
+                    .unwrap()
+                    .calculate_simplified_margin_requirement(
+                        user,
+                        MarginRequirementType::Maintenance,
+                        Some(liquidation_margin_buffer_ratio),
+                    ) {
                     Ok(info) => info,
                     Err(e) => {
                         std::mem::forget(e);
@@ -649,6 +653,8 @@ impl LiquidatorBot {
                                 // Update market state with perp pyth price for margin calculation
                                 if price > 0 {
                                     self.market_state
+                                        .write()
+                                        .unwrap()
                                         .set_perp_pyth_price(market_id, price as i64);
                                 }
                             }
@@ -656,6 +662,8 @@ impl LiquidatorBot {
                                 // Update market state with spot pyth price for margin calculation
                                 if price > 0 {
                                     self.market_state
+                                        .write()
+                                        .unwrap()
                                         .set_spot_pyth_price(market_id, price as i64);
                                 }
                             }
@@ -721,6 +729,8 @@ impl LiquidatorBot {
                             // calculate user margin after update
                             let margin_info = match self
                                 .market_state
+                                .read()
+                                .unwrap()
                                 .calculate_simplified_margin_requirement(
                                     &user,
                                     MarginRequirementType::Maintenance,
@@ -762,11 +772,15 @@ impl LiquidatorBot {
                             if market.is_perp() {
                                 if oracle_price_data.price > 0 {
                                     self.market_state
+                                        .write()
+                                        .unwrap()
                                         .set_perp_oracle_price(market.index(), oracle_price_data);
                                 }
                             } else {
                                 if oracle_price_data.price > 0 {
                                     self.market_state
+                                        .write()
+                                        .unwrap()
                                         .set_spot_oracle_price(market.index(), oracle_price_data);
                                 }
                             }
@@ -785,13 +799,13 @@ impl LiquidatorBot {
                     }
                     GrpcEvent::PerpMarketUpdate { market, slot } => {
                         if slot >= current_slot {
-                            self.market_state.set_perp_market(market);
+                            self.market_state.write().unwrap().set_perp_market(market);
                             current_slot = slot;
                         }
                     }
                     GrpcEvent::SpotMarketUpdate { market, slot } => {
                         if slot >= current_slot {
-                            self.market_state.set_spot_market(market);
+                            self.market_state.write().unwrap().set_spot_market(market);
                             current_slot = slot;
                         }
                     }
@@ -851,6 +865,8 @@ impl LiquidatorBot {
 
                         let margin_info = match self
                             .market_state
+                            .read()
+                            .unwrap()
                             .calculate_simplified_margin_requirement(
                                 &user_meta.user,
                                 MarginRequirementType::Maintenance,
@@ -954,18 +970,21 @@ impl LiquidatorBot {
                             }
                         }
 
-                        let margin_info =
-                            match self.market_state.calculate_simplified_margin_requirement(
+                        let margin_info = match self
+                            .market_state
+                            .read()
+                            .unwrap()
+                            .calculate_simplified_margin_requirement(
                                 &user_meta.user,
                                 MarginRequirementType::Maintenance,
                                 Some(liquidation_margin_buffer_ratio),
                             ) {
-                                Ok(info) => info,
-                                Err(e) => {
-                                    std::mem::forget(e);
-                                    return false;
-                                }
-                            };
+                            Ok(info) => info,
+                            Err(e) => {
+                                std::mem::forget(e);
+                                return false;
+                            }
+                        };
 
                         check_margin_status(&margin_info).is_at_risk()
                     } else {
@@ -1033,19 +1052,22 @@ impl LiquidatorBot {
                         }
                     }
 
-                    let margin_info =
-                        match self.market_state.calculate_simplified_margin_requirement(
+                    let margin_info = match self
+                        .market_state
+                        .read()
+                        .unwrap()
+                        .calculate_simplified_margin_requirement(
                             &user_meta.user,
                             MarginRequirementType::Maintenance,
                             Some(liquidation_margin_buffer_ratio),
                         ) {
-                            Ok(info) => info,
-                            Err(e) => {
-                                std::mem::forget(e);
-                                log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
-                                continue;
-                            }
-                        };
+                        Ok(info) => info,
+                        Err(e) => {
+                            std::mem::forget(e);
+                            log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
+                            continue;
+                        }
+                    };
 
                     let status = check_margin_status(&margin_info);
 
@@ -1443,7 +1465,7 @@ fn spawn_liquidation_worker(
 pub struct LiquidateWithMatchStrategy {
     pub drift: DriftClient,
     pub dlob: &'static DLOB,
-    pub market_state: &'static MarketState,
+    pub market_state: Arc<RwLock<MarketState>>,
     pub keeper_subaccount: Pubkey,
     pub metrics: Arc<Metrics>,
     pub use_spot_liquidation: bool,
@@ -1454,15 +1476,18 @@ impl LiquidateWithMatchStrategy {
     fn find_top_makers(
         drift: &DriftClient,
         dlob: &'static DLOB,
-        market_state: &'static MarketState,
+        market_state: Arc<RwLock<MarketState>>,
         market_index: u16,
         base_asset_amount: i64,
     ) -> Option<Vec<User>> {
         let l3_book = dlob.get_l3_snapshot_safe(market_index, MarketType::Perp)?;
 
-        let oracle_price = match market_state.get_perp_oracle_price(market_index) {
-            Some(data) if data.price > 0 => data.price as u64,
-            _ => return None,
+        let oracle_price = {
+            let state = market_state.read().unwrap();
+            match state.get_perp_oracle_price(market_index) {
+                Some(data) if data.price > 0 => data.price as u64,
+                _ => return None,
+            }
         };
 
         let maker_pubkeys: Vec<Pubkey> = if base_asset_amount >= 0 {
@@ -1504,7 +1529,7 @@ impl LiquidateWithMatchStrategy {
     fn liquidate_perp(
         drift: &DriftClient,
         dlob: &'static DLOB,
-        market_state: &'static MarketState,
+        market_state: Arc<RwLock<MarketState>>,
         metrics: Arc<Metrics>,
         keeper_subaccount: Pubkey,
         liquidatee: Pubkey,
@@ -1538,17 +1563,23 @@ impl LiquidateWithMatchStrategy {
                     let Some(makers) = Self::find_top_makers(
                         drift,
                         dlob,
-                        market_state,
+                        Arc::clone(&market_state),
                         *market_index,
                         pos.base_asset_amount,
                     ) else {
                         return;
                     };
 
-                    let oracle_price = market_state
-                        .get_perp_oracle_price(*market_index)
-                        .map(|x| x.price)
-                        .unwrap_or(0) as u64;
+                    let oracle_price = {
+                        let state = market_state.read().unwrap();
+                        match state.get_perp_oracle_price(pos.market_index) {
+                            Some(data) if data.price > 0 => data.price as u64,
+                            _ => {
+                                log::warn!(target: TARGET, "invalid oracle price for market {}", pos.market_index);
+                                return;
+                            }
+                        }
+                    };
 
                     let pyth_update =
                         pyth_price_update.filter(|update| update.price != oracle_price);
@@ -1592,17 +1623,23 @@ impl LiquidateWithMatchStrategy {
         let Some(makers) = Self::find_top_makers(
             drift,
             dlob,
-            market_state,
+            Arc::clone(&market_state),
             pos.market_index,
             pos.base_asset_amount,
         ) else {
             return;
         };
 
-        let oracle_price = market_state
-            .get_perp_oracle_price(pos.market_index)
-            .map(|x| x.price)
-            .unwrap_or(0) as u64;
+        let oracle_price = {
+            let state = market_state.read().unwrap();
+            match state.get_perp_oracle_price(pos.market_index) {
+                Some(data) if data.price > 0 => data.price as u64,
+                _ => {
+                    log::warn!(target: TARGET, "invalid oracle price for market {}", pos.market_index);
+                    return;
+                }
+            }
+        };
 
         let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
@@ -1624,7 +1661,7 @@ impl LiquidateWithMatchStrategy {
     async fn liquidate_spot(
         drift: DriftClient,
         metrics: Arc<Metrics>,
-        market_state: Arc<MarketStateData>,
+        market_state: Arc<RwLock<MarketState>>,
         keeper_subaccount: Pubkey,
         liquidatee: Pubkey,
         user_account: Arc<User>,
@@ -1640,11 +1677,16 @@ impl LiquidateWithMatchStrategy {
             .iter()
             .filter(|p| matches!(p.balance_type, SpotBalanceType::Borrow) && !p.is_available())
         {
-            let Some(spot_market) = market_state.spot_markets.get(&pos.market_index) else {
-                continue;
+            let spot_market = {
+                let state = market_state.read().unwrap();
+                let state_data = state.load();
+                match state_data.spot_markets.get(&pos.market_index) {
+                    Some(m) => *m,
+                    None => continue,
+                }
             };
 
-            let token_amount = match pos.get_token_amount(spot_market) {
+            let token_amount = match pos.get_token_amount(&spot_market) {
                 Ok(amount) => amount as u64,
                 Err(_) => continue,
             };
@@ -1861,7 +1903,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
         Self::liquidate_perp(
             &self.drift,
             self.dlob,
-            self.market_state,
+            Arc::clone(&self.market_state),
             Arc::clone(&self.metrics),
             self.keeper_subaccount,
             liquidatee,
@@ -1878,7 +1920,7 @@ impl LiquidationStrategy for LiquidateWithMatchStrategy {
             Self::liquidate_spot(
                 self.drift.clone(),
                 Arc::clone(&self.metrics),
-                self.market_state.load(),
+                Arc::clone(&self.market_state),
                 self.keeper_subaccount,
                 liquidatee,
                 user_account,
