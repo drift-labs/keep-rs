@@ -218,11 +218,17 @@ async fn update_dashboard_state(
                     // Note: base_asset_amount calculation would require spot market access
                     // which isn't directly available from MarketState in this context.
                     // We'll calculate an approximation using scaled_balance and oracle price.
-                    let spot_market = drift.try_get_spot_market_account(pos.market_index).unwrap();
+                    let spot_market = match drift.try_get_spot_market_account(pos.market_index) {
+                        Ok(market) => market,
+                        Err(_) => continue,
+                    };
                     let (base, quote) = if let Some(oracle_meta) =
                         oracle_prices.get(&MarketId::spot(pos.market_index))
                     {
-                        let base = pos.get_signed_token_amount(&spot_market).unwrap();
+                        let base = match pos.get_signed_token_amount(&spot_market) {
+                            Ok(amount) => amount,
+                            Err(_) => continue,
+                        };
                         (base, base * oracle_meta.price_data.price as i128)
                     } else {
                         (0, 0) // No oracle price available
