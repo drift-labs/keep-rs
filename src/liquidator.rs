@@ -514,7 +514,7 @@ impl LiquidatorBot {
             u64,
             Option<PythPriceUpdate>,
             UserMarginStatus,
-        )>(10240);
+        )>(102400);
         spawn_liquidation_worker(
             tx_sender.clone(),
             // TODO: apply your own liquidation strategy here
@@ -1147,7 +1147,7 @@ async fn setup_grpc(
     transaction_tx: TxSender,
     market_ids: Vec<MarketId>,
 ) -> tokio::sync::mpsc::Receiver<GrpcEvent> {
-    let (tx, rx) = tokio::sync::mpsc::channel(10240);
+    let (tx, rx) = tokio::sync::mpsc::channel(102400);
 
     let _ = tokio::try_join!(
         crate::filler::sync_stats_accounts(&drift),
