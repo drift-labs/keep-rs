@@ -1544,11 +1544,9 @@ impl LiquidateWithMatchStrategy {
         // Check isolated liquidations first
         for (market_index, iso_status) in &status.isolated {
             if *iso_status == MarginStatus::Liquidatable {
-                if let Some(pos) = user_account
-                    .perp_positions
-                    .iter()
-                    .find(|p| p.market_index == *market_index && p.base_asset_amount != 0)
-                {
+                if let Some(pos) = user_account.perp_positions.iter().find(|p| {
+                    p.market_index == *market_index && p.isolated_position_scaled_balance != 0
+                }) {
                     metrics
                         .liquidation_attempts
                         .with_label_values(&["perp"])
