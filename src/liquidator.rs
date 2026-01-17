@@ -182,7 +182,10 @@ async fn update_dashboard_state(
                 Some(liquidation_margin_buffer_ratio),
             ) {
                 Ok(info) => info,
-                Err(_) => continue,
+                Err(e) => {
+                    std::mem::forget(e);
+                    continue;
+                }
             };
 
             let free_margin = margin_info.total_collateral - margin_info.margin_requirement as i128;
@@ -579,7 +582,8 @@ impl LiquidatorBot {
                     Some(liquidation_margin_buffer_ratio),
                 ) {
                     Ok(info) => info,
-                    Err(_e) => {
+                    Err(e) => {
+                        std::mem::forget(e);
                         log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                         return;
                     }
@@ -719,7 +723,8 @@ impl LiquidatorBot {
                                     Some(liquidation_margin_buffer_ratio),
                                 ) {
                                 Ok(info) => info,
-                                Err(_e) => {
+                                Err(e) => {
+                                    std::mem::forget(e);
                                     log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                                     continue;
                                 }
@@ -844,7 +849,8 @@ impl LiquidatorBot {
                                 Some(liquidation_margin_buffer_ratio),
                             ) {
                             Ok(info) => info,
-                            Err(_e) => {
+                            Err(e) => {
+                                std::mem::forget(e);
                                 log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                                 continue;
                             }
@@ -947,7 +953,10 @@ impl LiquidatorBot {
                                 Some(liquidation_margin_buffer_ratio),
                             ) {
                                 Ok(info) => info,
-                                Err(_) => return false,
+                                Err(e) => {
+                                    std::mem::forget(e);
+                                    return false;
+                                }
                             };
 
                         check_margin_status(&margin_info).is_at_risk()
@@ -1023,7 +1032,8 @@ impl LiquidatorBot {
                             Some(liquidation_margin_buffer_ratio),
                         ) {
                             Ok(info) => info,
-                            Err(_e) => {
+                            Err(e) => {
+                                std::mem::forget(e);
                                 log::warn!(target: TARGET, "margin calc failed for {:?}", pubkey);
                                 continue;
                             }
