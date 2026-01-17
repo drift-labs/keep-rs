@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install jq -y && rustup component add rustfmt
 
 # install libdrift
 RUN SO_URL=$(curl -s https://api.github.com/repos/drift-labs/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url') &&\
-  curl -L -o libdrift_ffi_sys.so "$SO_URL" &&\
-  cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
+    curl -L -o libdrift_ffi_sys.so "$SO_URL" &&\
+    cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
 
 # 2. Copy actual code and rebuild
 # TODO: docker layer cache
@@ -24,11 +24,11 @@ RUN cargo build --release
 
 # ---- Runtime Stage ----
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates
+RUN apt-get update && apt-get install -y ca-certificates lldb
 COPY --from=builder /usr/local/lib/libdrift_ffi_sys.so /lib/
 COPY --from=builder /app/target/release/keeprs /usr/local/bin/keeprs
 
 EXPOSE 9898
 ENV METRICS_PORT=9898
 
-ENTRYPOINT ["./keeprs"] 
+ENTRYPOINT ["lldb", "-o", "run", "-o", "bt", "-o", "quit", "--", "/usr/local/bin/keeprs"]
