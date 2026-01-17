@@ -1460,10 +1460,10 @@ impl LiquidateWithMatchStrategy {
     ) -> Option<Vec<User>> {
         let l3_book = dlob.get_l3_snapshot_safe(market_index, MarketType::Perp)?;
 
-        let oracle_price = market_state
-            .get_perp_oracle_price(market_index)
-            .map(|x| x.price)
-            .unwrap_or(0) as u64;
+        let oracle_price = match market_state.get_perp_oracle_price(market_index) {
+            Some(data) if data.price > 0 => data.price as u64,
+            _ => return None,
+        };
 
         let maker_pubkeys: Vec<Pubkey> = if base_asset_amount >= 0 {
             // only want maker orders so don't pass vamm or trigger price
