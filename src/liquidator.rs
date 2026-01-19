@@ -1656,24 +1656,25 @@ fn try_liquidate_perp_pnl_for_deposit(
         tx_builder = tx_builder.post_pyth_lazer_oracle_update(&[update.feed_id], &update.message);
     }
 
-    // tx_builder = tx_builder.liquidate_perp_pnl_for_deposit(
-    //     liability.market_index,
-    //     asset.market_index,
-    //     &liquidatee_account,
-    // );
+    tx_builder = tx_builder.liquidate_perp_pnl_for_deposit(
+        &liquidatee_account,
+        asset.market_index,
+        liability.market_index,
+        base_asset_amount,
+    );
 
-    // let tx = tx_builder.build();
+    let tx = tx_builder.build();
 
-    // tx_sender.send_tx(
-    //     tx,
-    //     TxIntent::LiquidatePerpPnlForDeposit {
-    //         perp_market_index: liability.market_index,
-    //         spot_market_index: asset.market_index,
-    //         liquidatee,
-    //         slot,
-    //     },
-    //     cu_limit as u64,
-    // );
+    tx_sender.send_tx(
+        tx,
+        TxIntent::LiquidatePerpPnlForDeposit {
+            perp_market_index: liability.market_index,
+            spot_market_index: asset.market_index,
+            liquidatee,
+            slot,
+        },
+        cu_limit as u64,
+    );
 }
 
 fn spawn_liquidation_worker(
