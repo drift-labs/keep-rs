@@ -136,12 +136,7 @@ async fn main() {
     .expect("loaded BOT_PRIVATE_KEY")
     .into();
 
-    let keeper_subaccount = wallet.default_sub_account();
-    log::info!(
-        "bot started: authority={:?}, subaccount={:?}",
-        wallet.authority(),
-        keeper_subaccount
-    );
+    log::info!("bot started: authority={:?}", wallet.authority(),);
     log::info!("mainnet={}, markets={}", config.mainnet, config.all_markets);
 
     let context = if config.mainnet {
