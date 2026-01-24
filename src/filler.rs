@@ -1065,6 +1065,28 @@ impl TxWorker {
         }
 
         rt.spawn(async move {
+            // simulate first
+            match drift.simulate_tx(tx.clone()).await {
+                Ok(sim_result) => {
+                    if let Some(err) = sim_result.err {
+                        log::debug!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
+                        metrics
+                            .tx_failed
+                            .with_label_values(&[intent_label, "sim_failed"])
+                            .inc();
+                        return;
+                    }
+                }
+                Err(err) => {
+                    log::warn!(target: TARGET, "sim rpc error: {err}, skipping tx");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "sim_rpc_error"])
+                        .inc();
+                    return;
+                }
+            }
+
             match drift
                 .sign_and_send_with_config(
                     tx,
