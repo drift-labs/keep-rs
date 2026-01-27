@@ -7,6 +7,7 @@
 //! The default strategy tries to liquidate perp positions against resting orders
 //!
 use anchor_lang::Discriminator;
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -359,7 +360,7 @@ pub trait LiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
-        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+        collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
         status: UserMarginStatus,
     ) -> futures_util::future::BoxFuture<'a, ()>;
 }
@@ -406,7 +407,7 @@ pub struct LiquidatorBot {
     /// Dashboard state for HTTP API
     dashboard_state: DashboardStateRef,
     /// Track collateral info per subaccount
-    collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+    collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
 }
 
 impl LiquidatorBot {
@@ -523,9 +524,8 @@ impl LiquidatorBot {
 
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
-        let collateral_info_per_subaccount = Arc::new(RwLock::new(
-            get_collateral_info_per_subaccount(&drift, &config.get_subaccounts()).await,
-        ));
+        let collateral_info_per_subaccount =
+            Arc::new(get_collateral_info_per_subaccount(&drift, &config.get_subaccounts()).await);
 
         let cu_limit = std::env::var("FILL_CU_LIMIT")
             .ok()
@@ -723,7 +723,13 @@ impl LiquidatorBot {
                         let new_collateral =
                             get_collateral_info_per_subaccount(&drift, &config.get_subaccounts())
                                 .await;
-                        *self.collateral_info_per_subaccount.write().unwrap() = new_collateral;
+
+                        self.collateral_info_per_subaccount.clear();
+
+                        for (subaccount, collateral_info) in new_collateral {
+                            self.collateral_info_per_subaccount
+                                .insert(subaccount, collateral_info);
+                        }
 
                         let old_user = users.get(&pubkey).map(|m| &m.user);
                         dlob_notifier.user_update(pubkey, old_user, &user, update_slot);
@@ -1214,20 +1220,30 @@ fn derisk_subaccount(
                 base_asset_amount: position.base_asset_amount.unsigned_abs(),
                 market_index: position.market_index,
                 reduce_only: true,
+                max_ts: Some((current_time_millis() / 1000 + 5) as i64), // ~5s
                 ..Default::default()
             }]);
+
+            tx_sender.send_tx(
+                tx_builder.build(),
+                TxIntent::Derisk {
+                    market_index: position.market_index,
+                    subaccount,
+                },
+                cu_limit as u64,
+            );
         } else {
             tx_builder = tx_builder.settle_pnl(position.market_index, None, None);
-        }
 
-        tx_sender.send_tx(
-            tx_builder.build(),
-            TxIntent::Derisk {
-                market_index: position.market_index,
-                subaccount,
-            },
-            cu_limit as u64,
-        );
+            tx_sender.send_tx(
+                tx_builder.build(),
+                TxIntent::SettlePnl {
+                    market_index: position.market_index,
+                    subaccount,
+                },
+                cu_limit as u64,
+            );
+        }
     }
 
     // TODO: Add spot derisking, swap any position back to USDC using jupiter/titan
@@ -1255,8 +1271,8 @@ fn spawn_derisk_loop(
 async fn get_collateral_info_per_subaccount(
     drift: &DriftClient,
     subaccounts: &[u16],
-) -> HashMap<Pubkey, CollateralInfo> {
-    let mut collateral_info_per_subaccount = HashMap::<Pubkey, CollateralInfo>::new();
+) -> DashMap<Pubkey, CollateralInfo> {
+    let collateral_info_per_subaccount = DashMap::<Pubkey, CollateralInfo>::new();
     for subaccount in subaccounts {
         let subaccount_pubkey = Wallet::derive_user_account(&drift.wallet.authority(), *subaccount);
         match drift.get_user_account(&subaccount_pubkey).await {
@@ -1728,7 +1744,7 @@ fn spawn_liquidation_worker(
     )>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
-    collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+    collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
 ) {
     let mut rate_limit = HashMap::<Pubkey, u64>::new();
 
@@ -1852,15 +1868,14 @@ impl PrimaryLiquidationStrategy {
     /// Liquidation policy: Prefer takeover for large positions (≥$10k), use makers for small positions,
     /// fallback to takeover when no makers available. Skip if no makers and insufficient collateral.
     fn decide_perp_method(
-        base_asset_amount: u64,
-        oracle_price: u64,
+        quote_asset_amount: u64,
         collateral_available: i128,
         collateral_required: u128,
         has_makers: bool,
     ) -> LiquidationType {
         const POSITION_AMOUNT_THRESHOLD: u64 = 1_000 * BASE_PRECISION_U64;
 
-        let is_small_position = base_asset_amount * oracle_price <= POSITION_AMOUNT_THRESHOLD;
+        let is_small_position = quote_asset_amount <= POSITION_AMOUNT_THRESHOLD;
         let can_afford_takeover = collateral_available >= collateral_required as i128;
 
         if is_small_position && can_afford_takeover {
@@ -1916,12 +1931,11 @@ impl PrimaryLiquidationStrategy {
         Some(collateral)
     }
 
-    fn calculate_net_collateral_requirement(
-        liability_size: u128,
+    fn extract_collateral_params(
+        market_state: Arc<RwLock<MarketState>>,
         liability: &PositionInfo,
         asset: &PositionInfo,
-        market_state: Arc<RwLock<MarketState>>,
-    ) -> i128 {
+    ) -> (i64, u128, u128, u128, i64, u128, u128, u128) {
         let state = market_state.read().unwrap().load();
 
         let (liability_oracle, liability_precision) = if liability.market_type == MarketType::Spot {
@@ -1933,10 +1947,20 @@ impl PrimaryLiquidationStrategy {
                 .spot_markets
                 .get(&liability.market_index)
                 .expect("liability market");
-            (oracle, 10_u128.pow(market.decimals))
+            (oracle.price, 10_u128.pow(market.decimals))
         } else {
             let oracle = state.spot_oracle_prices.get(&0).expect("USDC oracle");
-            (oracle, QUOTE_PRECISION)
+            (oracle.price, QUOTE_PRECISION)
+        };
+
+        let liability_weight = if liability.market_type == MarketType::Spot {
+            let market = state
+                .spot_markets
+                .get(&liability.market_index)
+                .expect("liability spot market");
+            market.initial_liability_weight as u128
+        } else {
+            1u128
         };
 
         let (asset_oracle, asset_precision) = if asset.market_type == MarketType::Spot {
@@ -1948,33 +1972,58 @@ impl PrimaryLiquidationStrategy {
                 .spot_markets
                 .get(&asset.market_index)
                 .expect("asset market");
-            (oracle, 10_u128.pow(market.decimals))
+            (oracle.price, 10_u128.pow(market.decimals))
         } else {
             let oracle = state.spot_oracle_prices.get(&0).expect("USDC oracle");
-            (oracle, QUOTE_PRECISION)
+            (oracle.price, QUOTE_PRECISION)
         };
 
-        let asset_amount_back_in_tokens = liability_size
-            .saturating_mul(liability_oracle.price as u128)
-            .saturating_div(asset_oracle.price as u128)
-            .saturating_mul(asset_precision)
-            .saturating_div(liability_precision);
-
         let (asset_weight, asset_weight_precision) = if asset.market_type == MarketType::Spot {
-            let spot_market = state
+            let market = state
                 .spot_markets
                 .get(&asset.market_index)
                 .expect("asset spot market");
             (
-                spot_market.initial_asset_weight as u128,
+                market.initial_asset_weight as u128,
                 SPOT_WEIGHT_PRECISION_U128,
             )
         } else {
             (SPOT_WEIGHT_PRECISION_U128, SPOT_WEIGHT_PRECISION_U128)
         };
 
+        (
+            liability_oracle,
+            liability_precision,
+            liability_weight,
+            SPOT_WEIGHT_PRECISION_U128,
+            asset_oracle,
+            asset_precision,
+            asset_weight,
+            asset_weight_precision,
+        )
+    }
+
+    fn calculate_net_collateral_requirement_with_params(
+        liability_size: u128,
+        liability: &PositionInfo,
+        asset: &PositionInfo,
+        liability_oracle_price: i64,
+        liability_precision: u128,
+        liability_weight: u128,
+        liability_weight_precision: u128,
+        asset_oracle_price: i64,
+        asset_precision: u128,
+        asset_weight: u128,
+        asset_weight_precision: u128,
+    ) -> i128 {
+        let asset_amount_back_in_tokens = liability_size
+            .saturating_mul(liability_oracle_price as u128)
+            .saturating_div(asset_oracle_price as u128)
+            .saturating_mul(asset_precision)
+            .saturating_div(liability_precision);
+
         let asset_amount_back_in_collateral = asset_amount_back_in_tokens
-            .saturating_mul(asset_oracle.price as u128)
+            .saturating_mul(asset_oracle_price as u128)
             .saturating_mul(QUOTE_PRECISION)
             .saturating_mul(asset_weight)
             .saturating_div(asset_weight_precision)
@@ -1982,17 +2031,13 @@ impl PrimaryLiquidationStrategy {
             .saturating_div(PRICE_PRECISION);
 
         let liability_collateral_impact = if liability.market_type == MarketType::Spot {
-            let spot_market = state
-                .spot_markets
-                .get(&liability.market_index)
-                .expect("liability spot market");
             liability_size
-                .saturating_mul(liability_oracle.price as u128)
+                .saturating_mul(liability_oracle_price as u128)
                 .saturating_div(PRICE_PRECISION)
                 .saturating_mul(QUOTE_PRECISION)
                 .saturating_div(liability_precision)
-                .saturating_mul(spot_market.initial_liability_weight as u128)
-                .saturating_div(SPOT_WEIGHT_PRECISION_U128)
+                .saturating_mul(liability_weight)
+                .saturating_div(liability_weight_precision)
         } else {
             liability
                 .collateral_required
@@ -2005,6 +2050,30 @@ impl PrimaryLiquidationStrategy {
         );
 
         net_impact as i128
+    }
+
+    fn calculate_net_collateral_requirement(
+        liability_size: u128,
+        liability: &PositionInfo,
+        asset: &PositionInfo,
+        market_state: Arc<RwLock<MarketState>>,
+    ) -> i128 {
+        let (l_oracle, l_prec, l_weight, l_weight_prec, a_oracle, a_prec, a_weight, a_weight_prec) =
+            Self::extract_collateral_params(market_state, liability, asset);
+
+        Self::calculate_net_collateral_requirement_with_params(
+            liability_size,
+            liability,
+            asset,
+            l_oracle,
+            l_prec,
+            l_weight,
+            l_weight_prec,
+            a_oracle,
+            a_prec,
+            a_weight,
+            a_weight_prec,
+        )
     }
 
     /// finds the max liquidation amount whose collateral impact fits within available collateral,
@@ -2151,18 +2220,19 @@ impl PrimaryLiquidationStrategy {
     }
 
     // Port of  https://github.com/drift-labs/protocol-v2/blob/master/sdk/src/user.ts#L3941-L3971
-    fn get_safest_tiers(user_account: &User, market_state: Arc<RwLock<MarketState>>) -> (u8, u8) {
+    fn get_safest_tiers(user_account: &User, drift: &DriftClient) -> (u8, u8) {
         let mut safest_perp_tier = 4;
         let mut safest_spot_tier = 4;
-
-        let state = market_state.read().unwrap().load();
 
         for perp_position in user_account
             .perp_positions
             .iter()
             .filter(|p| !p.is_available())
         {
-            if let Some(perp_market) = state.perp_markets.get(&perp_position.market_index) {
+            if let Some(perp_market) = drift
+                .program_data()
+                .perp_market_config_by_index(perp_position.market_index)
+            {
                 safest_perp_tier = safest_perp_tier.min(perp_market.contract_tier.to_number());
             }
         }
@@ -2172,7 +2242,10 @@ impl PrimaryLiquidationStrategy {
             .iter()
             .filter(|p| !p.is_available() && p.balance_type != SpotBalanceType::Deposit)
         {
-            if let Some(spot_market) = state.spot_markets.get(&spot_position.market_index) {
+            if let Some(spot_market) = drift
+                .program_data()
+                .spot_market_config_by_index(spot_position.market_index)
+            {
                 safest_spot_tier = safest_spot_tier.min(spot_market.asset_tier.to_number());
             }
         }
@@ -2190,19 +2263,11 @@ impl PrimaryLiquidationStrategy {
     ) -> Option<(PositionInfo, Option<PositionInfo>)> {
         let state = market_state.read().unwrap().load();
 
-        let mut liabilities: Vec<PositionInfo> = perp_positions
+        let (mut liabilities, mut assets): (Vec<PositionInfo>, Vec<PositionInfo>) = perp_positions
             .iter()
             .chain(spot_positions)
-            .filter(|p| !p.is_asset)
             .cloned()
-            .collect();
-
-        let mut assets: Vec<PositionInfo> = perp_positions
-            .iter()
-            .chain(spot_positions)
-            .filter(|p| p.is_asset)
-            .cloned()
-            .collect();
+            .partition(|p| !p.is_asset);
 
         liabilities.sort_by(|a, b| {
             b.collateral_required
@@ -2242,7 +2307,7 @@ impl PrimaryLiquidationStrategy {
         subaccounts: &[Pubkey],
         needs_perp_room: bool,
         needs_spot_room: bool,
-        collateral_info_per_subaccount: &HashMap<Pubkey, CollateralInfo>,
+        collateral_info_per_subaccount: &DashMap<Pubkey, CollateralInfo>,
         min_collateral_required: u128,
     ) -> Option<Pubkey> {
         let mut candidates: Vec<(Pubkey, i128)> = subaccounts
@@ -2360,7 +2425,7 @@ impl PrimaryLiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
-        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+        collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
         status: &UserMarginStatus,
     ) {
         let Some(subaccount) = subaccounts.first() else {
@@ -2451,7 +2516,7 @@ impl PrimaryLiquidationStrategy {
         };
 
         // Check available collateral
-        let collateral_map = collateral_info_per_subaccount.read().unwrap();
+        let collateral_map = collateral_info_per_subaccount;
         let Some(collateral_info) = collateral_map.get(&subaccount) else {
             log::warn!(target: TARGET, "no collateral info for keeper subaccount");
             return;
@@ -2481,8 +2546,7 @@ impl PrimaryLiquidationStrategy {
         let pyth_update = pyth_price_update.filter(|update| update.price != oracle_price);
 
         let method = Self::decide_perp_method(
-            pos.base_asset_amount.try_into().unwrap(),
-            oracle_price,
+            pos.quote_asset_amount.try_into().unwrap(),
             collateral_info.free,
             collateral_required,
             makers.is_some(),
@@ -2800,23 +2864,23 @@ impl PrimaryLiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
-        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+        collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
     ) {
-        let full_net_req = Self::calculate_net_collateral_requirement(
+        let net_collateral_req = Self::calculate_net_collateral_requirement(
             liability.collateral_required.unsigned_abs(),
             &liability,
             &asset,
             Arc::clone(&market_state),
         );
 
-        let collateral_map = collateral_info_per_subaccount.read().unwrap();
+        let collateral_map = collateral_info_per_subaccount;
         let Some(subaccount) = Self::find_best_subaccount_for_liquidation(
             drift,
             subaccounts,
             false,
             true,
             &collateral_map,
-            full_net_req.max(0) as u128,
+            net_collateral_req.max(0) as u128,
         ) else {
             return;
         };
@@ -2828,7 +2892,9 @@ impl PrimaryLiquidationStrategy {
         let available = collateral_info.free;
         let tolerance = available / 10;
 
-        let liq_amount = if full_net_req <= available {
+        let params = Self::extract_collateral_params(Arc::clone(&market_state), &liability, &asset);
+
+        let liq_amount = if net_collateral_req <= available {
             liability.collateral_required.unsigned_abs()
         } else {
             Self::find_max_liq_amount(
@@ -2836,11 +2902,9 @@ impl PrimaryLiquidationStrategy {
                 available,
                 tolerance,
                 |size| {
-                    Self::calculate_net_collateral_requirement(
-                        size,
-                        &liability,
-                        &asset,
-                        Arc::clone(&market_state),
+                    Self::calculate_net_collateral_requirement_with_params(
+                        size, &liability, &asset, params.0, params.1, params.2, params.3, params.4,
+                        params.5, params.6, params.7,
                     )
                 },
             )
@@ -2878,7 +2942,7 @@ impl PrimaryLiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
-        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+        collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
     ) {
         let net_collateral_req = Self::calculate_net_collateral_requirement(
             liability.base_amount.unsigned_abs() as u128,
@@ -2887,7 +2951,7 @@ impl PrimaryLiquidationStrategy {
             Arc::clone(&market_state),
         );
 
-        let collateral_map = collateral_info_per_subaccount.read().unwrap();
+        let collateral_map = collateral_info_per_subaccount;
         let Some(subaccount) = Self::find_best_subaccount_for_liquidation(
             drift,
             subaccounts,
@@ -2903,21 +2967,25 @@ impl PrimaryLiquidationStrategy {
         let available = collateral_info.free;
         let tolerance = available / 10;
 
-        let max_liq_amount = Self::find_max_liq_amount(
-            liability.base_amount.unsigned_abs() as u128,
-            available,
-            tolerance,
-            |size| {
-                Self::calculate_net_collateral_requirement(
-                    size,
-                    &liability,
-                    &asset,
-                    Arc::clone(&market_state),
-                )
-            },
-        );
+        let params = Self::extract_collateral_params(Arc::clone(&market_state), &liability, &asset);
 
-        if max_liq_amount == 0 {
+        let liq_amount = if net_collateral_req <= available {
+            liability.collateral_required.unsigned_abs()
+        } else {
+            Self::find_max_liq_amount(
+                liability.collateral_required.unsigned_abs(),
+                available,
+                tolerance,
+                |size| {
+                    Self::calculate_net_collateral_requirement_with_params(
+                        size, &liability, &asset, params.0, params.1, params.2, params.3, params.4,
+                        params.5, params.6, params.7,
+                    )
+                },
+            )
+        };
+
+        if liq_amount == 0 {
             return;
         }
 
@@ -2927,7 +2995,7 @@ impl PrimaryLiquidationStrategy {
             liquidatee,
             &liability,
             &asset,
-            max_liq_amount,
+            liq_amount,
             tx_sender,
             priority_fee,
             cu_limit,
@@ -2947,7 +3015,7 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
         cu_limit: u32,
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
-        collateral_info_per_subaccount: Arc<RwLock<HashMap<Pubkey, CollateralInfo>>>,
+        collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
         status: UserMarginStatus,
     ) -> futures_util::future::BoxFuture<'a, ()> {
         let perp_positions = Self::get_perp_positions_info(
@@ -2961,7 +3029,7 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
         );
 
         let (safest_perp_tier, safest_spot_tier) =
-            Self::get_safest_tiers(&user_account, Arc::clone(&self.market_state));
+            Self::get_safest_tiers(&user_account, &self.drift);
 
         let Some((liability, asset)) = Self::pick_best_asset_liability_combo(
             Arc::clone(&self.market_state),

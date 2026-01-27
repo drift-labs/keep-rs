@@ -32,6 +32,7 @@ solana-sdk = "2.3"
 solana-transaction-status = "2.3"
 solana-transaction-status-client-types = "2.3"
 tokio = "1.48"
+dashmap = "6.1.0"
 
 [[bin]]
 name = "tx_history"

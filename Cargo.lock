@@ -2443,6 +2443,7 @@ dependencies = [
  "axum",
  "clap",
  "crossbeam",
+ "dashmap",
  "dotenv",
  "drift-rs",
  "env_logger 0.11.8",

@@ -147,6 +147,10 @@ pub enum TxIntent {
         market_index: u16,
         subaccount: Pubkey,
     },
+    SettlePnl {
+        market_index: u16,
+        subaccount: Pubkey,
+    },
 }
 
 impl TxIntent {
@@ -175,6 +179,7 @@ impl TxIntent {
             TxIntent::LiquidateBorrowForPerpPnl { .. } => "liq_borrow_for_perp_pnl",
             TxIntent::LiquidateSpot { .. } => "liq_spot",
             TxIntent::Derisk { .. } => "derisk",
+            TxIntent::SettlePnl { .. } => "settle_pnl",
         }
     }
 
@@ -195,6 +200,7 @@ impl TxIntent {
             TxIntent::LiquidateBorrowForPerpPnl { .. } => 0,
             TxIntent::LiquidateSpot { .. } => 0,
             TxIntent::Derisk { .. } => 0,
+            TxIntent::SettlePnl { .. } => 0,
         }
     }
 
@@ -223,6 +229,7 @@ impl TxIntent {
             Self::LiquidateBorrowForPerpPnl { slot, .. } => (vec![], *slot),
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
             TxIntent::Derisk { .. } => (vec![], 0),
+            TxIntent::SettlePnl { .. } => (vec![], 0),
         }
     }
 
