@@ -1069,7 +1069,7 @@ impl TxWorker {
             match drift.simulate_tx(tx.clone()).await {
                 Ok(sim_result) => {
                     if let Some(err) = sim_result.err {
-                        log::debug!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
+                        log::warn!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
                         metrics
                             .tx_failed
                             .with_label_values(&[intent_label, "sim_failed"])
