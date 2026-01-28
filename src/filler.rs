@@ -901,6 +901,7 @@ pub async fn sync_stats_accounts(
                     rent_epoch: u64::MAX,
                     executable: false,
                     slot: 0,
+                    write_version: 0,
                 });
             }
             log::info!(target: "dlob", "syncd stats accounts");
@@ -948,6 +949,7 @@ pub async fn sync_user_accounts(
                     rent_epoch: u64::MAX,
                     executable: false,
                     slot: 0,
+                    write_version: 0,
                 });
             }
             log::info!(target: "dlob", "synced initial orders");
