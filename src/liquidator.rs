@@ -1865,7 +1865,7 @@ pub struct PrimaryLiquidationStrategy {
 }
 
 impl PrimaryLiquidationStrategy {
-    /// Liquidation policy: Prefer takeover for large positions (≥$10k), use makers for small positions,
+    /// Liquidation policy: Prefer takeover for small positions (<=$5k), use makers for large positions,
     /// fallback to takeover when no makers available. Skip if no makers and insufficient collateral.
     fn decide_perp_method(
         quote_asset_amount: u64,
