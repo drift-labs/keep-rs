@@ -300,23 +300,22 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginS
 
     // Check isolated positions
     for calc in &margin_info.isolated_margin_calculations {
-        if !calc.is_empty() {
-            let buffered_iso_margin_req =
-                (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
-            if calc.total_collateral < buffered_iso_margin_req {
-                log::info!(
-                    target: TARGET,
-                    "found liquidatable isolated position user: {:?}",
-                    calc
-                );
-                isolated.push((calc.market_index, MarginStatus::Liquidatable));
-            } else {
-                let free_margin = calc.total_collateral - calc.margin_requirement as i128;
-                if calc.margin_requirement > 0 && free_margin > 0 {
-                    let free_margin_ratio = free_margin as f64 / calc.margin_requirement as f64;
-                    if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
-                        isolated.push((calc.market_index, MarginStatus::HighRisk));
-                    }
+        if calc.is_empty() {
+            continue;
+        }
+
+        if calc.total_collateral <= 0 {
+            continue;
+        }
+        let buffered_iso_margin_req = (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
+        if calc.total_collateral < buffered_iso_margin_req {
+            isolated.push((calc.market_index, MarginStatus::Liquidatable));
+        } else {
+            let free_margin = calc.total_collateral - calc.margin_requirement as i128;
+            if calc.margin_requirement > 0 && free_margin > 0 {
+                let free_margin_ratio = free_margin as f64 / calc.margin_requirement as f64;
+                if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
+                    isolated.push((calc.market_index, MarginStatus::HighRisk));
                 }
             }
         }
