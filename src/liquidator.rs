@@ -768,6 +768,7 @@ impl LiquidatorBot {
                         market,
                         slot,
                     } => {
+                        log::debug!(target: TARGET, "oracle update received: market={:?}, slot={}", market, slot);
                         if slot >= current_slot {
                             if market.is_perp() {
                                 if oracle_price_data.price > 0 {
@@ -1184,6 +1185,8 @@ async fn setup_grpc(
             .and_modify(|f| f.push((*market, *source)))
             .or_insert(vec![(*market, *source)]);
     }
+
+    log::info!(target: TARGET, "oracle map has {} oracles", oracle_to_market.len());
 
     let _res = drift
         .grpc_subscribe(
