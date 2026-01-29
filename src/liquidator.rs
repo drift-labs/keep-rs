@@ -304,6 +304,11 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginS
             let buffered_iso_margin_req =
                 (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
             if calc.total_collateral < buffered_iso_margin_req {
+                log::info!(
+                    target: TARGET,
+                    "found liquidatable isolated position user: {:?}",
+                    calc
+                );
                 isolated.push((calc.market_index, MarginStatus::Liquidatable));
             } else {
                 let free_margin = calc.total_collateral - calc.margin_requirement as i128;
