@@ -1873,7 +1873,7 @@ impl PrimaryLiquidationStrategy {
         collateral_required: u128,
         has_makers: bool,
     ) -> LiquidationType {
-        const POSITION_AMOUNT_THRESHOLD: u64 = 1_000 * BASE_PRECISION_U64;
+        const POSITION_AMOUNT_THRESHOLD: u64 = 5_000 * BASE_PRECISION_U64;
 
         let is_small_position = quote_asset_amount <= POSITION_AMOUNT_THRESHOLD;
         let can_afford_takeover = collateral_available >= collateral_required as i128;
