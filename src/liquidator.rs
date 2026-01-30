@@ -307,6 +307,7 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginS
         if calc.total_collateral <= 0 {
             continue;
         }
+
         let buffered_iso_margin_req = (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
         if calc.total_collateral < buffered_iso_margin_req {
             isolated.push((calc.market_index, MarginStatus::Liquidatable));

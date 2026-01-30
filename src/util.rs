@@ -21,7 +21,7 @@ use pyth_lazer_protocol::{
         Channel, DeliveryFormat, FixedRate, Format, JsonBinaryEncoding, PriceFeedId,
         PriceFeedProperty, SubscriptionParams, SubscriptionParamsRepr, TimestampUs,
     },
-    subscription::{SubscribeRequest, SubscriptionId},
+    subscription::{Response, SubscribeRequest, SubscriptionId},
 };
 use solana_sdk::signature::Signature;
 
@@ -459,7 +459,11 @@ pub fn subscribe_price_feeds(
                         }
                     }
                     _other => {
-                        log::warn!(target: "pyth", "unknown msg: {_other:?}");
+                        if let Ok(AnyResponse::Json(Response::Subscribed(sub))) = _other {
+                            log::info!(target: "pyth", "subscribed feed {}", sub.subscription_id.0);
+                        } else {
+                            log::warn!(target: "pyth", "unknown msg: {_other:?}");
+                        }
                     }
                 }
             }
