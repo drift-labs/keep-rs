@@ -1,11 +1,12 @@
 //! Filler Bot
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anchor_lang::Discriminator;
+use dashmap::DashMap;
 use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
@@ -21,7 +22,7 @@ use drift_rs::{
         accounts::{PerpMarket, User, UserStats},
         CommitmentConfig, FeatureBitFlags, FeeTier, MarketId, MarketPrecision, MarketStatus,
         MarketType, Order, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
-        RpcSendTransactionConfig, VersionedMessage, AMM,
+        RpcSendTransactionConfig, VersionedMessage, VersionedTransaction, AMM,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, TransactionBuilder, Wallet,
 };
@@ -61,7 +62,7 @@ pub struct FillerBot {
 impl FillerBot {
     pub async fn new(config: Config, drift: DriftClient, metrics: Arc<Metrics>) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry);
+        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry, None, None, None);
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
 
@@ -322,7 +323,7 @@ impl FillerBot {
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
                                 log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_bids.first(), crosses.crossing_asks.first());
-                                try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
+                                try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref).await;
                             }
                         }
 
@@ -489,13 +490,15 @@ async fn try_swift_fill(
     }
     let tx = tx_builder.build();
 
-    tx_worker_ref.send_tx(
-        tx,
-        TxIntent::SwiftFill {
-            maker_crosses: crosses,
-        },
-        cu_limit as u64,
-    );
+    tx_worker_ref
+        .send_tx(
+            tx,
+            TxIntent::SwiftFill {
+                maker_crosses: crosses,
+            },
+            cu_limit as u64,
+        )
+        .await;
 }
 
 /// Try to fill an auction order
@@ -695,22 +698,24 @@ async fn try_auction_fill(
 
         let tx = tx_builder.build();
 
-        tx_worker_ref.send_tx(
-            tx,
-            TxIntent::AuctionFill {
-                taker_order_id: taker_order.order_id,
-                maker_crosses: crosses,
-                has_trigger: taker_is_trigger,
-            },
-            cu_limit as u64,
-        );
+        tx_worker_ref
+            .send_tx(
+                tx,
+                TxIntent::AuctionFill {
+                    taker_order_id: taker_order.order_id,
+                    maker_crosses: crosses,
+                    has_trigger: taker_is_trigger,
+                },
+                cu_limit as u64,
+            )
+            .await;
     }
 }
 
 /// Try to uncross top of book
 ///
 /// - `crosses` list of one or more crosses to fill
-fn try_uncross(
+async fn try_uncross(
     drift: &DriftClient,
     slot: u64,
     priority_fee: u64,
@@ -824,16 +829,18 @@ fn try_uncross(
         }
         let tx = tx_builder.build();
 
-        tx_worker_ref.send_tx(
-            tx,
-            TxIntent::LimitUncross {
-                slot,
-                market_index,
-                taker_order_id,
-                maker_order_id: 0,
-            },
-            cu_limit as u64,
-        );
+        tx_worker_ref
+            .send_tx(
+                tx,
+                TxIntent::LimitUncross {
+                    slot,
+                    market_index,
+                    taker_order_id,
+                    maker_order_id: 0,
+                },
+                cu_limit as u64,
+            )
+            .await;
     }
 }
 
@@ -998,7 +1005,7 @@ async fn subscribe_grpc(
 
 pub enum TxWork {
     Send {
-        tx: VersionedMessage,
+        tx: VersionedTransaction,
         ts: u64,
         intent: TxIntent,
         cu_limit: u64,
@@ -1014,19 +1021,34 @@ pub struct TxWorker {
     pending_txs: Arc<RwLock<PendingTxs<1024>>>,
     metrics: Arc<Metrics>,
     dry_run: bool,
+    txs_in_flight: Option<Arc<DashMap<Pubkey, HashSet<Signature>>>>,
+    tx_sig_to_collateral: Option<Arc<DashMap<Signature, u128>>>,
+    free_collateral_per_subaccount: Option<Arc<DashMap<Pubkey, u128>>>,
 }
 
 impl TxWorker {
-    pub fn new(drift: DriftClient, metrics: Arc<Metrics>, dry_run: bool) -> Self {
+    pub fn new(
+        drift: DriftClient,
+        metrics: Arc<Metrics>,
+        dry_run: bool,
+        txs_in_flight: Option<Arc<DashMap<Pubkey, HashSet<Signature>>>>,
+        tx_sig_to_collateral: Option<Arc<DashMap<Signature, u128>>>,
+        free_collateral_per_subaccount: Option<Arc<DashMap<Pubkey, u128>>>,
+    ) -> Self {
         Self {
             drift: Box::leak(Box::new(drift)),
             pending_txs: Arc::new(RwLock::new(PendingTxs::new())),
             metrics,
             dry_run,
+            txs_in_flight,
+            tx_sig_to_collateral,
+            free_collateral_per_subaccount,
         }
     }
+
     pub fn run(self, rt: tokio::runtime::Handle) -> TxSender {
         let (tx, rx) = crossbeam::channel::bounded(1024);
+        let drift = self.drift;
         std::thread::spawn(move || {
             let _ = env_logger::try_init();
             while let Ok(work) = rx.recv() {
@@ -1049,14 +1071,22 @@ impl TxWorker {
                 }
             }
         });
-        TxSender(tx)
+        TxSender { tx, drift }
     }
-    fn send_tx(&self, rt: &Handle, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
+
+    fn send_tx(
+        &self,
+        rt: &Handle,
+        signed_tx: VersionedTransaction,
+        intent: TxIntent,
+        cu_limit: u64,
+    ) {
         log::debug!(target: TARGET, "txworker send tx: {intent:?}");
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
         let intent_label = intent.label();
+
         metrics.tx_sent.with_label_values(&[intent_label]).inc();
         metrics
             .fill_expected
@@ -1067,16 +1097,37 @@ impl TxWorker {
         }
 
         rt.spawn(async move {
+            // simulate first
+            match drift.simulate_tx(signed_tx.message.clone()).await {
+                Ok(sim_result) => {
+                    if let Some(err) = sim_result.err {
+                        log::warn!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
+                        metrics
+                            .tx_failed
+                            .with_label_values(&[intent_label, "sim_failed"])
+                            .inc();
+                        return;
+                    }
+                }
+                Err(err) => {
+                    log::warn!(target: TARGET, "sim rpc error: {err}, skipping tx");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "sim_rpc_error"])
+                        .inc();
+                    return;
+                }
+            }
+
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                max_retries: Some(0),
+                ..Default::default()
+            };
+
             match drift
-                .sign_and_send_with_config(
-                    tx,
-                    None,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        max_retries: Some(0),
-                        ..Default::default()
-                    },
-                )
+                .rpc()
+                .send_transaction_with_config(&signed_tx, config)
                 .await
             {
                 Ok(sig) => {
@@ -1100,12 +1151,18 @@ impl TxWorker {
             }
         });
     }
+
     fn confirm_tx(&self, rt: &Handle, tx: Signature) {
         // TODO: if CU limit is too low send it again with higher amount
         log::debug!(target: TARGET, "txworker confirm tx: {tx:?}");
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
+
+        let txs_in_flight = self.txs_in_flight.clone();
+        let tx_sig_to_collateral = self.tx_sig_to_collateral.clone();
+        let free_collateral = self.free_collateral_per_subaccount.clone();
+
         rt.spawn(async move {
             let pending_tx_meta = {
                 let mut pending = pending_txs.write().await;
@@ -1115,11 +1172,12 @@ impl TxWorker {
                 return;
             }
             let PendingTxMeta {
-                signature: _,
+                signature,
                 intent,
                 cu_limit: sent_cu_limit,
                 ts: _,
             } = pending_tx_meta.unwrap();
+
             let intent_label = intent.label();
             let expected_fill_count = intent.expected_fill_count();
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1261,16 +1319,34 @@ impl TxWorker {
                         .inc();
                 }
             }
+
+            if let (Some(tx_sig_map), Some(txs_map), Some(free_map)) =
+                (&tx_sig_to_collateral, &txs_in_flight, &free_collateral)
+            {
+                if let Some((_, collateral)) = tx_sig_map.remove(&signature) {
+                    for mut entry in txs_map.iter_mut() {
+                        if entry.value_mut().remove(&signature) {
+                            if let Some(mut free) = free_map.get_mut(entry.key()) {
+                                *free = free.saturating_add(collateral);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         });
     }
 }
 
 #[derive(Clone)]
-pub struct TxSender(crossbeam::channel::Sender<TxWork>);
+pub struct TxSender {
+    tx: crossbeam::channel::Sender<TxWork>,
+    drift: &'static DriftClient,
+}
 
 impl TxSender {
     pub fn confirm_tx(&self, tx: Signature) {
-        self.0
+        self.tx
             .send(TxWork::Confirm {
                 tx,
                 ts: SystemTime::now()
@@ -1280,10 +1356,20 @@ impl TxSender {
             })
             .expect("sent");
     }
-    pub fn send_tx(&self, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
-        self.0
+
+    pub async fn send_tx(
+        &self,
+        tx: VersionedMessage,
+        intent: TxIntent,
+        cu_limit: u64,
+    ) -> Option<Signature> {
+        let blockhash = self.drift.get_latest_blockhash().await.unwrap();
+        let signed_tx = self.drift.wallet().sign_tx(tx, blockhash).ok()?;
+        let sig = signed_tx.signatures[0];
+
+        self.tx
             .send(TxWork::Send {
-                tx,
+                tx: signed_tx,
                 ts: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -1291,6 +1377,8 @@ impl TxSender {
                 intent,
                 cu_limit,
             })
-            .expect("sent");
+            .ok()?;
+
+        Some(sig)
     }
 }
