@@ -1022,7 +1022,7 @@ pub struct TxWorker {
     metrics: Arc<Metrics>,
     dry_run: bool,
     txs_in_flight: Option<Arc<DashMap<Pubkey, HashSet<Signature>>>>,
-    tx_sig_to_collateral: Option<Arc<DashMap<Signature, u128>>>,
+    tx_sig_to_collateral: Option<Arc<DashMap<Signature, (u128, u64)>>>,
     free_collateral_per_subaccount: Option<Arc<DashMap<Pubkey, u128>>>,
 }
 
@@ -1032,7 +1032,7 @@ impl TxWorker {
         metrics: Arc<Metrics>,
         dry_run: bool,
         txs_in_flight: Option<Arc<DashMap<Pubkey, HashSet<Signature>>>>,
-        tx_sig_to_collateral: Option<Arc<DashMap<Signature, u128>>>,
+        tx_sig_to_collateral: Option<Arc<DashMap<Signature, (u128, u64)>>>,
         free_collateral_per_subaccount: Option<Arc<DashMap<Pubkey, u128>>>,
     ) -> Self {
         Self {
@@ -1301,6 +1301,21 @@ impl TxWorker {
                                     }
                                     _ => {}
                                 }
+
+                                if let (Some(tx_sig_map), Some(txs_map), Some(free_map)) =
+                                    (&tx_sig_to_collateral, &txs_in_flight, &free_collateral)
+                                {
+                                    if let Some((_sig, (collateral, _ts))) = tx_sig_map.remove(&signature) {
+                                        for mut entry in txs_map.iter_mut() {
+                                            if entry.value_mut().remove(&signature) {
+                                                if let Some(mut free) = free_map.get_mut(entry.key()) {
+                                                    *free = free.saturating_add(collateral);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -1317,21 +1332,6 @@ impl TxWorker {
                         .tx_failed
                         .with_label_values(&[intent_label, "confirmation_failed"])
                         .inc();
-                }
-            }
-
-            if let (Some(tx_sig_map), Some(txs_map), Some(free_map)) =
-                (&tx_sig_to_collateral, &txs_in_flight, &free_collateral)
-            {
-                if let Some((_, collateral)) = tx_sig_map.remove(&signature) {
-                    for mut entry in txs_map.iter_mut() {
-                        if entry.value_mut().remove(&signature) {
-                            if let Some(mut free) = free_map.get_mut(entry.key()) {
-                                *free = free.saturating_add(collateral);
-                            }
-                            break;
-                        }
-                    }
                 }
             }
         });

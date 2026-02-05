@@ -37,7 +37,7 @@ use drift_rs::{
         MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, OrderParams,
         OrderType, PerpPosition, PositionDirection, SpotBalanceType, SpotPosition,
     },
-    DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder, Wallet,
+    DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
 };
 use drift_rs::{jupiter::JupiterSwapApi, titan::TitanSwapApi};
 use solana_sdk::{
@@ -412,7 +412,8 @@ pub struct LiquidatorBot {
     collateral_info_per_subaccount: Arc<DashMap<Pubkey, CollateralInfo>>,
     /// In flight txs tracking
     txs_in_flight: Arc<DashMap<Pubkey, HashSet<Signature>>>,
-    tx_sig_to_collateral: Arc<DashMap<Signature, u128>>,
+    // Map(Signature,(collateral, ts))
+    tx_sig_to_collateral: Arc<DashMap<Signature, (u128, u64)>>,
     free_collateral_per_subaccount: Arc<DashMap<Pubkey, u128>>,
 }
 
@@ -497,7 +498,7 @@ impl LiquidatorBot {
             (Arc::new(txs), Arc::new(free))
         };
 
-        let tx_sig_to_collateral = Arc::new(DashMap::new());
+        let tx_sig_to_collateral: Arc<DashMap<Signature, (u128, u64)>> = Arc::new(DashMap::new());
 
         let tx_worker = TxWorker::new(
             drift.clone(),
@@ -607,6 +608,22 @@ impl LiquidatorBot {
         );
 
         log::info!(target: TARGET, "spawned derisk worker");
+
+        let tx_sig_to_collateral_clone = Arc::clone(&tx_sig_to_collateral);
+        let txs_in_flight_clone = Arc::clone(&txs_in_flight);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                clean_stale_in_flight_txs(
+                    Arc::clone(&tx_sig_to_collateral_clone),
+                    Arc::clone(&txs_in_flight_clone),
+                );
+            }
+        });
+
+        log::info!(target: TARGET, "spawned stale in flight txs cleanup worker");
 
         LiquidatorBot {
             drift,
@@ -783,7 +800,7 @@ impl LiquidatorBot {
                             if let Some(in_flight) = self.txs_in_flight.get(subaccount_pubkey) {
                                 for sig in in_flight.value().iter() {
                                     if let Some(reserved) = self.tx_sig_to_collateral.get(sig) {
-                                        free = free.saturating_sub(*reserved.value() as i128);
+                                        free = free.saturating_sub(reserved.value().0 as i128);
                                     }
                                 }
                             }
@@ -1241,6 +1258,24 @@ impl LiquidatorBot {
     }
 }
 
+fn clean_stale_in_flight_txs(
+    tx_sig_to_collateral: Arc<DashMap<Signature, (u128, u64)>>,
+    txs_in_flight: Arc<DashMap<Pubkey, HashSet<Signature>>>,
+) {
+    let now = current_time_millis();
+    let timeout_ms = 60_000;
+
+    tx_sig_to_collateral.retain(|sig, (_, ts)| {
+        let is_stale = now.saturating_sub(*ts) > timeout_ms;
+        if is_stale {
+            for mut entry in txs_in_flight.iter_mut() {
+                entry.value_mut().remove(sig);
+            }
+        }
+        !is_stale
+    });
+}
+
 async fn derisk_subaccount(
     drift: &DriftClient,
     tx_sender: &TxSender,
@@ -1662,7 +1697,8 @@ pub struct PrimaryLiquidationStrategy {
     pub metrics: Arc<Metrics>,
     pub use_spot_liquidation: bool,
     pub txs_in_flight: Arc<DashMap<Pubkey, HashSet<Signature>>>,
-    pub tx_sig_to_collateral: Arc<DashMap<Signature, u128>>,
+    // Map(Signature,(collateral, ts))
+    pub tx_sig_to_collateral: Arc<DashMap<Signature, (u128, u64)>>,
     pub free_collateral_per_subaccount: Arc<DashMap<Pubkey, u128>>,
 }
 
@@ -2370,7 +2406,7 @@ impl PrimaryLiquidationStrategy {
                     .insert(sig);
 
                 self.tx_sig_to_collateral
-                    .insert(sig, base_asset_amount as u128);
+                    .insert(sig, (base_asset_amount as u128, current_time_millis()));
 
                 if let Some(mut free) = self.free_collateral_per_subaccount.get_mut(&subaccount) {
                     *free = free.saturating_sub(base_asset_amount as u128);
@@ -2899,7 +2935,8 @@ impl PrimaryLiquidationStrategy {
                     .or_insert_with(HashSet::new)
                     .insert(sig);
 
-                self.tx_sig_to_collateral.insert(sig, liq_amount);
+                self.tx_sig_to_collateral
+                    .insert(sig, (liq_amount, current_time_millis()));
 
                 if let Some(mut free) = self.free_collateral_per_subaccount.get_mut(&subaccount) {
                     *free = free.saturating_sub(liq_amount);
@@ -3060,7 +3097,8 @@ impl PrimaryLiquidationStrategy {
                     .or_insert_with(HashSet::new)
                     .insert(sig);
 
-                self.tx_sig_to_collateral.insert(sig, liq_amount);
+                self.tx_sig_to_collateral
+                    .insert(sig, (liq_amount, current_time_millis()));
 
                 if let Some(mut free) = self.free_collateral_per_subaccount.get_mut(&subaccount) {
                     *free = free.saturating_sub(liq_amount);
