@@ -25,7 +25,7 @@ use drift_rs::{
     math::{
         constants::{
             BASE_PRECISION, BASE_PRECISION_U64, MARGIN_PRECISION_U128, PRICE_PRECISION,
-            QUOTE_PRECISION, SPOT_WEIGHT_PRECISION_U128,
+            QUOTE_PRECISION, QUOTE_PRECISION_U64, SPOT_WEIGHT_PRECISION_U128,
         },
         liquidation::{calculate_collateral, CollateralInfo},
         tiers::perp_tier_is_as_safe_as,
@@ -611,6 +611,7 @@ impl LiquidatorBot {
 
         let tx_sig_to_collateral_clone = Arc::clone(&tx_sig_to_collateral);
         let txs_in_flight_clone = Arc::clone(&txs_in_flight);
+        let free_collateral_per_subaccount_clone = Arc::clone(&free_collateral_per_subaccount);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -619,6 +620,7 @@ impl LiquidatorBot {
                 clean_stale_in_flight_txs(
                     Arc::clone(&tx_sig_to_collateral_clone),
                     Arc::clone(&txs_in_flight_clone),
+                    Arc::clone(&free_collateral_per_subaccount_clone),
                 );
             }
         });
@@ -1261,19 +1263,33 @@ impl LiquidatorBot {
 fn clean_stale_in_flight_txs(
     tx_sig_to_collateral: Arc<DashMap<Signature, (u128, u64)>>,
     txs_in_flight: Arc<DashMap<Pubkey, HashSet<Signature>>>,
+    free_collateral_per_subaccount: Arc<DashMap<Pubkey, u128>>,
 ) {
     let now = current_time_millis();
     let timeout_ms = 60_000;
 
-    tx_sig_to_collateral.retain(|sig, (_, ts)| {
-        let is_stale = now.saturating_sub(*ts) > timeout_ms;
-        if is_stale {
-            for mut entry in txs_in_flight.iter_mut() {
-                entry.value_mut().remove(sig);
+    let stale: Vec<(Signature, u128)> = tx_sig_to_collateral
+        .iter()
+        .filter_map(|entry| {
+            if now.saturating_sub(entry.value().1) > timeout_ms {
+                Some((*entry.key(), entry.value().0))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (sig, collateral) in stale {
+        tx_sig_to_collateral.remove(&sig);
+        for mut entry in txs_in_flight.iter_mut() {
+            if entry.value_mut().remove(&sig) {
+                if let Some(mut free) = free_collateral_per_subaccount.get_mut(entry.key()) {
+                    *free = free.saturating_add(collateral);
+                }
+                break;
             }
         }
-        !is_stale
-    });
+    }
 }
 
 async fn derisk_subaccount(
@@ -1711,7 +1727,7 @@ impl PrimaryLiquidationStrategy {
         collateral_required: u128,
         has_makers: bool,
     ) -> LiquidationType {
-        const POSITION_AMOUNT_THRESHOLD: u64 = 5_000 * BASE_PRECISION_U64;
+        const POSITION_AMOUNT_THRESHOLD: u64 = 5_000 * QUOTE_PRECISION_U64;
 
         let is_small_position = quote_asset_amount <= POSITION_AMOUNT_THRESHOLD;
         let can_afford_takeover = collateral_available >= collateral_required;
