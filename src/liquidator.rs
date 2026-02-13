@@ -18,7 +18,10 @@ use tokio::sync::mpsc::error::TryRecvError;
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
     ffi::{OraclePriceData, SimplifiedMarginCalculation},
-    grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
+    grpc::{
+        grpc_subscriber::{AccountFilter, GrpcConnectionOpts},
+        TransactionUpdate,
+    },
     jupiter::SwapMode,
     market_state::MarketStateData,
     priority_fee_subscriber::PriorityFeeSubscriber,
@@ -1200,6 +1203,7 @@ async fn setup_grpc(
                 .into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
+                .connection_opts(GrpcConnectionOpts::default().enable_compression())
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))

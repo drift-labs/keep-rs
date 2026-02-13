@@ -14,7 +14,10 @@ use drift_rs::{
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
-    grpc::{grpc_subscriber::AccountFilter, AccountUpdate, TransactionUpdate},
+    grpc::{
+        grpc_subscriber::{AccountFilter, GrpcConnectionOpts},
+        AccountUpdate, TransactionUpdate,
+    },
     priority_fee_subscriber::PriorityFeeSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
@@ -1001,6 +1004,7 @@ async fn subscribe_grpc(
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
+                .connection_opts(GrpcConnectionOpts::default().enable_compression())
                 .usermap_on()
                 .statsmap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
