@@ -269,6 +269,7 @@ impl FillerBot {
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
                         let chain_oracle_data = drift.try_get_mmoracle_for_perp_market(market_index, slot).expect("got oracle price");
                         log::debug!(target: "oracle", "oracle price: delay:{:?},market:{:?},oracle:{:?},amm:{:?}", chain_oracle_data.delay, market, chain_oracle_data.price, perp_market.amm.mm_oracle_price);
+                        log::debug!(target: TARGET, "oracle_stale_for_amm={} (delay={}, market={})", chain_oracle_data.delay > 10, chain_oracle_data.delay, market_index);
                         let mut oracle_price = chain_oracle_data.price as u64;
                         let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
                         let mut pyth_update = None;
