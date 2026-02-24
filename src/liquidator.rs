@@ -1419,7 +1419,7 @@ async fn get_collateral_info_per_subaccount(
                 ) {
                     Ok(collateral_info) => {
                         collateral_info_per_subaccount.insert(subaccount_pubkey, collateral_info);
-                        log::info!(
+                        log::debug!(
                             target: TARGET,
                             "Subaccount {}: free_collateral = {}, total_collateral = {}",
                             subaccount_pubkey,
