@@ -674,6 +674,9 @@ impl LiquidatorBot {
         let mut exclude_count = 0;
         let mut initial_high_risk_count = 0;
 
+        let mut last_collateral_refresh_ms: u64 = 0;
+        const COLLATERAL_REFRESH_INTERVAL_MS: u64 = 5_000;
+
         log::info!(target: TARGET, "starting user account initialization");
 
         drift
@@ -789,33 +792,42 @@ impl LiquidatorBot {
                         user,
                         slot: update_slot,
                     } => {
-                        // Update collaterals
-                        let new_collateral =
-                            get_collateral_info_per_subaccount(&drift, &self.subaccount_pubkeys)
-                                .await;
+                        let now_ms = current_time_millis();
+                        if now_ms.saturating_sub(last_collateral_refresh_ms)
+                            >= COLLATERAL_REFRESH_INTERVAL_MS
+                        {
+                            last_collateral_refresh_ms = now_ms;
 
-                        self.collateral_info_per_subaccount.clear();
+                            // Update collaterals
+                            let new_collateral = get_collateral_info_per_subaccount(
+                                &drift,
+                                &self.subaccount_pubkeys,
+                            )
+                            .await;
 
-                        for (subaccount_pubkey, collateral_info) in new_collateral {
-                            self.collateral_info_per_subaccount
-                                .insert(subaccount_pubkey, collateral_info);
-                        }
+                            self.collateral_info_per_subaccount.clear();
 
-                        // Update free collateral accounting for in flight txs
-                        for entry in self.collateral_info_per_subaccount.iter() {
-                            let subaccount_pubkey = entry.key();
-                            let collateral_info = entry.value();
-                            let mut free = collateral_info.free;
+                            for (subaccount_pubkey, collateral_info) in new_collateral {
+                                self.collateral_info_per_subaccount
+                                    .insert(subaccount_pubkey, collateral_info);
+                            }
 
-                            if let Some(in_flight) = self.txs_in_flight.get(subaccount_pubkey) {
-                                for sig in in_flight.value().iter() {
-                                    if let Some(reserved) = self.tx_sig_to_collateral.get(sig) {
-                                        free = free.saturating_sub(reserved.value().0 as i128);
+                            // Update free collateral accounting for in flight txs
+                            for entry in self.collateral_info_per_subaccount.iter() {
+                                let subaccount_pubkey = entry.key();
+                                let collateral_info = entry.value();
+                                let mut free = collateral_info.free;
+
+                                if let Some(in_flight) = self.txs_in_flight.get(subaccount_pubkey) {
+                                    for sig in in_flight.value().iter() {
+                                        if let Some(reserved) = self.tx_sig_to_collateral.get(sig) {
+                                            free = free.saturating_sub(reserved.value().0 as i128);
+                                        }
                                     }
                                 }
+                                self.free_collateral_per_subaccount
+                                    .insert(*subaccount_pubkey, free.max(0) as u128);
                             }
-                            self.free_collateral_per_subaccount
-                                .insert(*subaccount_pubkey, free.max(0) as u128);
                         }
 
                         let old_user = users.get(&pubkey).map(|m| &m.user);
