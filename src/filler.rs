@@ -1126,7 +1126,7 @@ impl TxWorker {
 
         rt.spawn(async move {
             // simulate first
-            match drift.simulate_tx(tx.clone()).await {
+            match drift.simulate_tx(signed_tx.message.clone()).await {
                 Ok(sim_result) => {
                     if let Some(err) = sim_result.err {
                         log::warn!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
@@ -1146,6 +1146,12 @@ impl TxWorker {
                     return;
                 }
             }
+
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                max_retries: Some(0),
+                ..Default::default()
+            };
 
             match drift
                 .rpc()

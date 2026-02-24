@@ -18,7 +18,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
-    ffi::{OraclePriceData, SimplifiedMarginCalculation},
+    ffi::{calculate_claimable_pnl, OraclePriceData, SimplifiedMarginCalculation},
     grpc::{
         grpc_subscriber::{AccountFilter, GrpcConnectionOpts},
         TransactionUpdate,
@@ -27,8 +27,8 @@ use drift_rs::{
     market_state::MarketStateData,
     math::{
         constants::{
-            BASE_PRECISION, BASE_PRECISION_U64, MARGIN_PRECISION_U128, PRICE_PRECISION,
-            QUOTE_PRECISION, QUOTE_PRECISION_U64, SPOT_WEIGHT_PRECISION_U128,
+            BASE_PRECISION, MARGIN_PRECISION_U128, PRICE_PRECISION, QUOTE_PRECISION,
+            SPOT_WEIGHT_PRECISION_U128,
         },
         liquidation::{calculate_collateral, CollateralInfo},
         tiers::perp_tier_is_as_safe_as,
@@ -1731,7 +1731,7 @@ pub struct PrimaryLiquidationStrategy {
 }
 
 impl PrimaryLiquidationStrategy {
-    /// Liquidation policy: Prefer takeover for small positions (<=$5k), use makers for large positions,
+    /// Liquidation policy: Prefer takeover for small positions, use makers for large positions,
     /// fallback to takeover when no makers available. Skip if no makers and insufficient collateral.
     fn decide_perp_method(
         quote_asset_amount: u64,
@@ -1739,20 +1739,23 @@ impl PrimaryLiquidationStrategy {
         collateral_required: u128,
         has_makers: bool,
     ) -> LiquidationType {
-        const POSITION_AMOUNT_THRESHOLD: u64 = 5_000 * QUOTE_PRECISION_U64;
+        // const POSITION_AMOUNT_THRESHOLD: u64 = 5_000 * QUOTE_PRECISION_U64;
 
-        let is_small_position = quote_asset_amount <= POSITION_AMOUNT_THRESHOLD;
-        let can_afford_takeover = collateral_available >= collateral_required;
+        // let is_small_position = quote_asset_amount <= POSITION_AMOUNT_THRESHOLD;
+        // let can_afford_takeover = collateral_available >= collateral_required;
 
-        if is_small_position && can_afford_takeover {
-            LiquidationType::PerpTakeover
-        } else if has_makers {
-            LiquidationType::PerpWithFill
-        } else if can_afford_takeover {
-            LiquidationType::PerpTakeover
-        } else {
-            LiquidationType::Skip
-        }
+        // if is_small_position && can_afford_takeover {
+        //     LiquidationType::PerpTakeover
+        // } else if has_makers {
+        //     LiquidationType::PerpWithFill
+        // } else if can_afford_takeover {
+        //     LiquidationType::PerpTakeover
+        // } else {
+        //     LiquidationType::Skip
+        // }
+
+        // For testing just use Fill
+        LiquidationType::PerpWithFill
     }
 
     fn decide_liquidation_type(
@@ -3314,24 +3317,24 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
 
         async move {
             match liq_type {
-                LiquidationType::SettlePnl => {
-                    let markets: Vec<u16> = perp_positions
-                        .iter()
-                        .filter(|p| p.base_amount == 0 && p.quote_amount != 0 && p.is_asset)
-                        .map(|p| p.market_index)
-                        .collect();
+                // LiquidationType::SettlePnl => {
+                //     let markets: Vec<u16> = perp_positions
+                //         .iter()
+                //         .filter(|p| p.base_amount == 0 && p.quote_amount != 0 && p.is_asset)
+                //         .map(|p| p.market_index)
+                //         .collect();
 
-                    Self::settle_perp_pnl(
-                        &self.drift,
-                        self.subaccounts[0],
-                        liquidatee,
-                        &markets,
-                        tx_sender,
-                        priority_fee,
-                        cu_limit,
-                    )
-                    .await;
-                }
+                //     Self::settle_perp_pnl(
+                //         &self.drift,
+                //         self.subaccounts[0],
+                //         liquidatee,
+                //         &markets,
+                //         tx_sender,
+                //         priority_fee,
+                //         cu_limit,
+                //     )
+                //     .await;
+                // }
                 LiquidationType::PerpTakeover | LiquidationType::PerpWithFill => {
                     Self::liquidate_perp(
                         &self,
@@ -3348,7 +3351,8 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
                         slot,
                         pyth_price_update,
                         &status,
-                    ).await;
+                    )
+                    .await;
                 }
                 LiquidationType::SpotForSpot => {
                     if self.use_spot_liquidation {
@@ -3363,51 +3367,54 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
                             priority_fee,
                             400_000,
                             slot,
-                        ).await;
-                    }
-                }
-                LiquidationType::PerpPnlForDeposit => {
-                    if let Some(asset) = asset {
-                        Self::liquidate_perp_pnl_for_deposit(
-                            &self,
-                            &self.drift,
-                            Arc::clone(&self.market_state),
-                            self.subaccounts.as_slice(),
-                            liquidatee,
-                            liability,
-                            asset,
-                            tx_sender,
-                            priority_fee,
-                            cu_limit,
-                            slot,
-                            pyth_price_update,
                         )
                         .await;
                     }
                 }
-                LiquidationType::BorrowForPerpPnl => {
-                    if let Some(asset) = asset {
-                        Self::liquidate_borrow_for_perp_pnl(
-                            &self,
-                            &self.drift,
-                            Arc::clone(&self.market_state),
-                            self.subaccounts.as_slice(),
-                            liquidatee,
-                            liability,
-                            asset,
-                            tx_sender,
-                            priority_fee,
-                            cu_limit,
-                            slot,
-                            pyth_price_update,
-                        )
-                        .await;
-                    }
-                }
-                LiquidationType::Skip => {
-                    log::info!(target: TARGET, "skipping liquidation for {:?}: insufficient collateral", liquidatee);
-                }
+                // LiquidationType::PerpPnlForDeposit => {
+                //     if let Some(asset) = asset {
+                //         Self::liquidate_perp_pnl_for_deposit(
+                //             &self,
+                //             &self.drift,
+                //             Arc::clone(&self.market_state),
+                //             self.subaccounts.as_slice(),
+                //             liquidatee,
+                //             liability,
+                //             asset,
+                //             tx_sender,
+                //             priority_fee,
+                //             cu_limit,
+                //             slot,
+                //             pyth_price_update,
+                //         )
+                //         .await;
+                //     }
+                // }
+                // LiquidationType::BorrowForPerpPnl => {
+                //     if let Some(asset) = asset {
+                //         Self::liquidate_borrow_for_perp_pnl(
+                //             &self,
+                //             &self.drift,
+                //             Arc::clone(&self.market_state),
+                //             self.subaccounts.as_slice(),
+                //             liquidatee,
+                //             liability,
+                //             asset,
+                //             tx_sender,
+                //             priority_fee,
+                //             cu_limit,
+                //             slot,
+                //             pyth_price_update,
+                //         )
+                //         .await;
+                //     }
+                // }
+                // LiquidationType::Skip => {
+                //     log::info!(target: TARGET, "skipping liquidation for {:?}: insufficient collateral", liquidatee);
+                // }
+                _ => {}
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
