@@ -607,13 +607,13 @@ impl LiquidatorBot {
 
         log::info!(target: TARGET, "spawned liquidation worker");
 
-        spawn_derisk_loop(
-            drift.clone(),
-            tx_sender.clone(),
-            subaccounts,
-            Arc::clone(&priority_fee_subscriber),
-            cu_limit,
-        );
+        // spawn_derisk_loop(
+        //     drift.clone(),
+        //     tx_sender.clone(),
+        //     subaccounts,
+        //     Arc::clone(&priority_fee_subscriber),
+        //     cu_limit,
+        // );
 
         log::info!(target: TARGET, "spawned derisk worker");
 
