@@ -2381,6 +2381,7 @@ impl PrimaryLiquidationStrategy {
         subaccount: Pubkey,
         liquidatee_subaccount: Pubkey,
         base_asset_amount: u64,
+        collateral_required: u128,
         tx_sender: TxSender,
         priority_fee: u64,
         cu_limit: u32,
@@ -2452,7 +2453,7 @@ impl PrimaryLiquidationStrategy {
                     .insert(sig, (base_asset_amount as u128, current_time_millis()));
 
                 if let Some(mut free) = self.free_collateral_per_subaccount.get_mut(&subaccount) {
-                    *free = free.saturating_sub(base_asset_amount as u128);
+                    *free = free.saturating_sub(collateral_required);
                 }
             }
             None => return,
@@ -2655,6 +2656,7 @@ impl PrimaryLiquidationStrategy {
                     subaccount,
                     liquidatee,
                     base_amount_to_liquidate,
+                    collateral_required,
                     tx_sender,
                     priority_fee,
                     cu_limit,
