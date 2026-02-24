@@ -91,7 +91,7 @@ impl<const N: usize> OrderSlotLimiter<N> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default, Debug)]
 pub enum TxIntent {
     #[default]
     None,
@@ -120,11 +120,36 @@ pub enum TxIntent {
         liquidatee: Pubkey,
         slot: u64,
     },
+    LiquidatePerp {
+        market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
+    LiquidatePerpPnlForDeposit {
+        perp_market_index: u16,
+        spot_market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
+    LiquidateBorrowForPerpPnl {
+        perp_market_index: u16,
+        spot_market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
     LiquidateSpot {
         asset_market_index: u16,
         liability_market_index: u16,
         liquidatee: Pubkey,
         slot: u64,
+    },
+    Derisk {
+        market_index: u16,
+        subaccount: Pubkey,
+    },
+    SettlePnl {
+        market_index: u16,
+        subaccount: Pubkey,
     },
 }
 
@@ -149,7 +174,12 @@ impl TxIntent {
             TxIntent::LimitUncross { .. } => "limit_uncross",
             TxIntent::VAMMTakerFill { .. } => "vamm_taker",
             TxIntent::LiquidateWithFill { .. } => "liq_with_fill",
+            TxIntent::LiquidatePerp { .. } => "liq_perp",
+            TxIntent::LiquidatePerpPnlForDeposit { .. } => "liq_perp_pnl_for_deposit",
+            TxIntent::LiquidateBorrowForPerpPnl { .. } => "liq_borrow_for_perp_pnl",
             TxIntent::LiquidateSpot { .. } => "liq_spot",
+            TxIntent::Derisk { .. } => "derisk",
+            TxIntent::SettlePnl { .. } => "settle_pnl",
         }
     }
 
@@ -165,7 +195,12 @@ impl TxIntent {
             TxIntent::VAMMTakerFill { .. } => 1,
             TxIntent::LimitUncross { .. } => 1,
             TxIntent::LiquidateWithFill { .. } => 1,
+            TxIntent::LiquidatePerp { .. } => 0,
+            TxIntent::LiquidatePerpPnlForDeposit { .. } => 0,
+            TxIntent::LiquidateBorrowForPerpPnl { .. } => 0,
             TxIntent::LiquidateSpot { .. } => 0,
+            TxIntent::Derisk { .. } => 0,
+            TxIntent::SettlePnl { .. } => 0,
         }
     }
 
@@ -189,7 +224,12 @@ impl TxIntent {
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),
             Self::LiquidateWithFill { slot, .. } => (vec![], *slot),
+            Self::LiquidatePerp { slot, .. } => (vec![], *slot),
+            Self::LiquidatePerpPnlForDeposit { slot, .. } => (vec![], *slot),
+            Self::LiquidateBorrowForPerpPnl { slot, .. } => (vec![], *slot),
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
+            TxIntent::Derisk { .. } => (vec![], 0),
+            TxIntent::SettlePnl { .. } => (vec![], 0),
         }
     }
 
@@ -198,6 +238,9 @@ impl TxIntent {
             Self::VAMMTakerFill { slot, .. }
             | Self::LimitUncross { slot, .. }
             | Self::LiquidateWithFill { slot, .. }
+            | Self::LiquidatePerp { slot, .. }
+            | Self::LiquidatePerpPnlForDeposit { slot, .. }
+            | Self::LiquidateBorrowForPerpPnl { slot, .. }
             | Self::LiquidateSpot { slot, .. } => Some(*slot),
             _ => None,
         }

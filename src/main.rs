@@ -43,6 +43,9 @@ pub struct Config {
     /// Comma-separated list of perp market indices to fill for
     #[clap(long, env = "MARKET_IDS", default_value = "0,1,2")]
     pub market_ids: String,
+    /// Comma-separated list of subaccount IDs to use for liquidations
+    #[clap(long, env = "SUBACCOUNTS", default_value = "0")]
+    pub subaccounts: String,
     /// Use mainnet (otherwise devnet)
     #[clap(long, env = "MAINNET", default_value = "true")]
     pub mainnet: bool,
@@ -55,7 +58,7 @@ pub struct Config {
     #[clap(long, env = "DRY_RUN", default_value = "false")]
     pub dry: bool,
     #[clap(long, default_value = "0")]
-    pub sub_account_id: u16,
+    pub sub_account_id: u16, // Redundant but used by filler bot currently
     /// Disable Pyth price feed subscription
     #[clap(long, default_value = "false")]
     pub no_pyth: bool,
@@ -79,6 +82,13 @@ impl Config {
                     .collect(),
             )
         }
+    }
+
+    pub fn get_subaccounts(&self) -> Vec<u16> {
+        self.subaccounts
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect()
     }
 }
 
@@ -126,12 +136,7 @@ async fn main() {
     .expect("loaded BOT_PRIVATE_KEY")
     .into();
 
-    let keeper_subaccount = wallet.default_sub_account();
-    log::info!(
-        "bot started: authority={:?}, subaccount={:?}",
-        wallet.authority(),
-        keeper_subaccount
-    );
+    log::info!("bot started: authority={:?}", wallet.authority(),);
     log::info!("mainnet={}, markets={}", config.mainnet, config.all_markets);
 
     let context = if config.mainnet {
