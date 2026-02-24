@@ -15,7 +15,10 @@ use drift_rs::{
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
-    grpc::{grpc_subscriber::AccountFilter, AccountUpdate, TransactionUpdate},
+    grpc::{
+        grpc_subscriber::{AccountFilter, GrpcConnectionOpts},
+        AccountUpdate, TransactionUpdate,
+    },
     priority_fee_subscriber::PriorityFeeSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
@@ -169,12 +172,18 @@ impl FillerBot {
         let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<PythPriceUpdate>(1);
         let mut pyth_price_feed = self.pyth_price_feed.unwrap_or(dummy_rx);
 
+        // Swift retry mechanism
+        const MAX_SWIFT_RECONNECT_RETRIES: u32 = 10;
+        let mut retries = 0u32;
         loop {
             tokio::select! {
                 biased;
                 swift_order = swift_order_stream.next() => {
                     match swift_order {
                         Some(signed_order) => {
+                            // reset
+                            retries = 0;
+
                             // try swift fill against resting liquidity
                             let mut order_params = signed_order.order_params();
                             log::info!(target: TARGET, "new swift order. uuid={}, market={}", signed_order.order_uuid_str(), order_params.market_index);
@@ -263,8 +272,26 @@ impl FillerBot {
                             }
                         }
                         None => {
-                            log::error!(target: TARGET, "swift order stream finished");
-                            break;
+                            retries += 1;
+                            if retries <= MAX_SWIFT_RECONNECT_RETRIES {
+                                    let backoff = 2u64.pow(retries).min(30);
+                                    log::warn!(target: "swift", "feed disconnected, retry {retries}/{MAX_SWIFT_RECONNECT_RETRIES} in {backoff}s");
+                                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+                                    match drift
+                                        .subscribe_swift_orders(&market_ids, Some(true), None, None)
+                                        .await
+                                    {
+                                        Ok(stream) => swift_order_stream = stream,
+                                        Err(e) => {
+                                            log::error!(target: "swift", "resubscribe failed: {e:?}");
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    log::error!(target: TARGET, "swift order stream finished after {MAX_SWIFT_RECONNECT_RETRIES} retries");
+                                    break;
+                                }
                         }
                     }
                 }
@@ -984,6 +1011,7 @@ async fn subscribe_grpc(
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
+                .connection_opts(GrpcConnectionOpts::default().enable_compression())
                 .usermap_on()
                 .statsmap_on()
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
@@ -1098,7 +1126,7 @@ impl TxWorker {
 
         rt.spawn(async move {
             // simulate first
-            match drift.simulate_tx(signed_tx.message.clone()).await {
+            match drift.simulate_tx(tx.clone()).await {
                 Ok(sim_result) => {
                     if let Some(err) = sim_result.err {
                         log::warn!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
@@ -1118,12 +1146,6 @@ impl TxWorker {
                     return;
                 }
             }
-
-            let config = RpcSendTransactionConfig {
-                skip_preflight: true,
-                max_retries: Some(0),
-                ..Default::default()
-            };
 
             match drift
                 .rpc()

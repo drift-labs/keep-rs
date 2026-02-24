@@ -18,8 +18,11 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use drift_rs::{
     dlob::{DLOBNotifier, DLOB},
-    ffi::{calculate_claimable_pnl, OraclePriceData, SimplifiedMarginCalculation},
-    grpc::{grpc_subscriber::AccountFilter, TransactionUpdate},
+    ffi::{OraclePriceData, SimplifiedMarginCalculation},
+    grpc::{
+        grpc_subscriber::{AccountFilter, GrpcConnectionOpts},
+        TransactionUpdate,
+    },
     jupiter::SwapMode,
     market_state::MarketStateData,
     math::{
@@ -312,18 +315,23 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginS
 
     // Check isolated positions
     for calc in &margin_info.isolated_margin_calculations {
-        if !calc.is_empty() {
-            let buffered_iso_margin_req =
-                (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
-            if calc.total_collateral < buffered_iso_margin_req {
-                isolated.push((calc.market_index, MarginStatus::Liquidatable));
-            } else {
-                let free_margin = calc.total_collateral - calc.margin_requirement as i128;
-                if calc.margin_requirement > 0 && free_margin > 0 {
-                    let free_margin_ratio = free_margin as f64 / calc.margin_requirement as f64;
-                    if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
-                        isolated.push((calc.market_index, MarginStatus::HighRisk));
-                    }
+        if calc.is_empty() {
+            continue;
+        }
+
+        if calc.total_collateral <= 0 {
+            continue;
+        }
+
+        let buffered_iso_margin_req = (calc.margin_requirement as f64 * LIQUIDATION_BUFFER) as i128;
+        if calc.total_collateral < buffered_iso_margin_req {
+            isolated.push((calc.market_index, MarginStatus::Liquidatable));
+        } else {
+            let free_margin = calc.total_collateral - calc.margin_requirement as i128;
+            if calc.margin_requirement > 0 && free_margin > 0 {
+                let free_margin_ratio = free_margin as f64 / calc.margin_requirement as f64;
+                if free_margin_ratio < HIGH_RISK_FREE_MARGIN_RATIO {
+                    isolated.push((calc.market_index, MarginStatus::HighRisk));
                 }
             }
         }
@@ -893,6 +901,7 @@ impl LiquidatorBot {
                         market,
                         slot,
                     } => {
+                        log::debug!(target: TARGET, "oracle update received: market={:?}, slot={}", market, slot);
                         if slot >= current_slot {
                             if market.is_perp() {
                                 if oracle_price_data.price > 0 {
@@ -1479,6 +1488,8 @@ async fn setup_grpc(
             .or_insert(vec![(*market, *source)]);
     }
 
+    log::info!(target: TARGET, "oracle map has {} oracles", oracle_to_market.len());
+
     let _res = drift
         .grpc_subscribe(
             std::env::var("GRPC_ENDPOINT")
@@ -1486,6 +1497,7 @@ async fn setup_grpc(
                 .into(),
             std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
             GrpcSubscribeOpts::default()
+                .connection_opts(GrpcConnectionOpts::default().enable_compression())
                 .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
                 .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
                 .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
