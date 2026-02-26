@@ -78,6 +78,9 @@ const MAX_ORACLE_AGE_SLOTS: u64 = 50;
 /// Maximum age for Pyth prices in milliseconds before considering stale
 const MAX_PYTH_AGE_MS: u64 = 5000;
 
+/// Permanently blocked spot markets (untradable tokens)
+const BLOCKED_SPOT_MARKETS: &[u16] = &[40];
+
 /// Metadata tracking for user accounts to detect staleness
 #[derive(Clone, Debug)]
 struct UserAccountMetadata {
@@ -2695,6 +2698,11 @@ impl PrimaryLiquidationStrategy {
             .iter()
             .filter(|p| matches!(p.balance_type, SpotBalanceType::Borrow) && !p.is_available())
         {
+            // skip permanently blocked markets
+            if BLOCKED_SPOT_MARKETS.contains(&pos.market_index) {
+                continue;
+            }
+
             let spot_market = {
                 let state = market_state.read().unwrap();
                 let state_data = state.load();
