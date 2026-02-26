@@ -3318,8 +3318,28 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
             safest_perp_tier,
             safest_spot_tier,
         ) else {
-            log::warn!(target: TARGET, "no liquidatable positions for {:?}", liquidatee);
-            return async {}.boxed();
+            // Possibility of PerpWithFill still exists since doesn't depend on best asset/liability
+            // Attempt liquidation, if none exist it will guard and fail internally
+            return async move {
+                Self::liquidate_perp(
+                    &self,
+                    &self.drift,
+                    self.dlob,
+                    Arc::clone(&self.market_state),
+                    Arc::clone(&self.metrics),
+                    self.subaccounts.as_slice(),
+                    liquidatee,
+                    Arc::clone(&user_account),
+                    tx_sender,
+                    priority_fee,
+                    cu_limit,
+                    slot,
+                    pyth_price_update,
+                    &status,
+                )
+                .await;
+            }
+            .boxed();
         };
 
         let has_pnl_only = perp_positions
