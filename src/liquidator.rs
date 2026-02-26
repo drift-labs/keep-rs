@@ -2819,7 +2819,7 @@ impl PrimaryLiquidationStrategy {
                 metrics.jupiter_quote_failures.inc();
                 metrics.titan_quote_failures.inc();
                 log::warn!(target: TARGET, "both quotes failed after {}ms", quote_latency_ms);
-                return;
+                continue;
             }
 
             let use_titan = match (&jupiter_result, &titan_result) {
