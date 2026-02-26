@@ -2741,7 +2741,7 @@ impl PrimaryLiquidationStrategy {
                 continue;
             };
 
-            log::debug!(
+            log::info!(
                 target: TARGET,
                 "attempting spot liquidation: user={:?}, asset_market={}, liability_market={}, amount={}",
                 liquidatee,
