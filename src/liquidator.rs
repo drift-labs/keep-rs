@@ -2498,8 +2498,10 @@ impl PrimaryLiquidationStrategy {
 
                     log::info!(
                         target: TARGET,
-                        "try liquidate [ISOLATED]: https://app.drift.trade/?userAccount={liquidatee:?}, market={}",
-                        market_index
+                        "attempting perp liquidation (isolated): user={:?}, market={}, base_asset_amount={}",
+                        liquidatee,
+                        market_index,
+                        pos.base_asset_amount,
                     );
 
                     let Some(makers) = Self::find_top_makers(
@@ -2557,6 +2559,15 @@ impl PrimaryLiquidationStrategy {
         else {
             return;
         };
+
+        log::info!(
+            target: TARGET,
+            "attempting perp liquidation: user={:?}, market={}, base_asset_amount={}, quote_asset_amount={}",
+            liquidatee,
+            pos.market_index,
+            pos.base_asset_amount,
+            pos.quote_asset_amount,
+        );
 
         // Calculate collateral required
         let Some(collateral_required) = Self::calculate_perp_collateral_requirement(
