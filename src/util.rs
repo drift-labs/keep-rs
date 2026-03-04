@@ -393,11 +393,17 @@ pub fn subscribe_price_feeds(
                     retries += 1;
 
                     if retries >= MAX_RETRIES {
-                        log::error!(target: "pyth", "feed connection failed after {MAX_RETRIES} attempts, shutting down");
+                        log::error!(
+                            target: "pyth",
+                            "FATAL: feed connection failed after {MAX_RETRIES} attempts; closing price feed channel"
+                        );
                         return;
                     } else {
                         let backoff = 2u64.pow(retries).min(30); // 2^retries seconds, capped at 30s
-                        log::warn!(target: "pyth", "feed connection failed: {err:?}, retry {retries}/{MAX_RETRIES} in {backoff}s");
+                        log::warn!(
+                            target: "pyth",
+                            "feed connection failed: {err:?}, retry {retries}/{MAX_RETRIES} in {backoff}s"
+                        );
                         tokio::time::sleep(Duration::from_secs(backoff)).await;
                         continue;
                     }
@@ -429,7 +435,7 @@ pub fn subscribe_price_feeds(
                     ))
                     .await
                 {
-                    log::error!(target: "filler", "pyth feed subscribe failed: {err:?}");
+                    log::error!(target: "pyth", "pyth feed subscribe failed: {err:?}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -501,23 +507,43 @@ pub fn subscribe_price_feeds(
                             }
                         }
                     }
-                    _other => {
-                        if let Ok(AnyResponse::Json(Response::Subscribed(sub))) = _other {
-                            log::info!(target: "pyth", "subscribed feed {}", sub.subscription_id.0);
-                        } else {
-                            log::warn!(target: "pyth", "unknown msg: {_other:?}");
+                    other => match other {
+                        Ok(AnyResponse::Json(Response::Subscribed(sub))) => {
+                            log::info!(
+                                target: "pyth",
+                                "subscribed feed {}",
+                                sub.subscription_id.0
+                            );
                         }
-                    }
+                        Ok(AnyResponse::Json(msg)) => {
+                            log::info!(target: "pyth", "control msg: {msg:?}");
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                target: "pyth",
+                                "websocket error from pyth stream: {err:?}"
+                            );
+                        }
+                        Ok(other_ok) => {
+                            log::info!(target: "pyth", "non-binary msg: {other_ok:?}");
+                        }
+                    },
                 }
             }
             // stream ended, will retry
             retries += 1;
             if retries >= MAX_RETRIES {
-                log::error!(target: "pyth", "feed disconnected after {MAX_RETRIES} attempts, shutting down");
+                log::error!(
+                    target: "pyth",
+                    "FATAL: feed disconnected after {MAX_RETRIES} attempts; closing price feed channel"
+                );
                 return;
             }
             let backoff = 2u64.pow(retries).min(30);
-            log::warn!(target: "pyth", "feed disconnected, retry {retries}/{MAX_RETRIES} in {backoff}s");
+            log::warn!(
+                target: "pyth",
+                "feed disconnected, retry {retries}/{MAX_RETRIES} in {backoff}s"
+            );
             tokio::time::sleep(Duration::from_secs(backoff)).await;
         }
     });
