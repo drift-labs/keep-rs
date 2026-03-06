@@ -166,6 +166,10 @@ impl FillerBot {
             .state_account()
             .map(|s| s.has_median_trigger_price_feature())
             .unwrap_or(false);
+        let mut slots_before_stale_for_amm = drift
+            .state_account()
+            .map(|s| s.oracle_guard_rails.validity.slots_before_stale_for_amm)
+            .unwrap_or(10);
         let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
 
         // Create a dummy receiver that never sends when pyth is disabled
@@ -258,6 +262,13 @@ impl FillerBot {
                             let taker_order = TakerOrder::from_order_params(order_params, price);
                             let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(&perp_market), None);
                             if !crosses.is_empty() {
+                                // skip vAMM-only swift fills when oracle is stale
+                                if crosses.orders.is_empty() && crosses.has_vamm_cross {
+                                    if oracle_price_data.delay > slots_before_stale_for_amm {
+                                        log::info!(target: TARGET, "skip swift vAMM fill: oracle stale (delay={})", oracle_price_data.delay);
+                                        continue;
+                                    }
+                                }
                                 log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
                                 let pf = priority_fee_subscriber.priority_fee_nth(0.6);
                                 try_swift_fill(
@@ -314,6 +325,8 @@ impl FillerBot {
                         let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
                         let chain_oracle_data = drift.try_get_mmoracle_for_perp_market(market_index, slot).expect("got oracle price");
                         log::debug!(target: "oracle", "oracle price: delay:{:?},market:{:?},oracle:{:?},amm:{:?}", chain_oracle_data.delay, market, chain_oracle_data.price, perp_market.amm.mm_oracle_price);
+                        let oracle_stale_for_amm = chain_oracle_data.delay > slots_before_stale_for_amm;
+                        log::debug!(target: TARGET, "oracle_stale_for_amm={} (delay={}, market={})", oracle_stale_for_amm, chain_oracle_data.delay, market_index);
                         let mut oracle_price = chain_oracle_data.price as u64;
                         let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
                         let mut pyth_update = None;
@@ -343,6 +356,7 @@ impl FillerBot {
                                     perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
                                 },
                                 perp_market,
+                                oracle_stale_for_amm,
                             ).await;
                         }
 
@@ -357,9 +371,13 @@ impl FillerBot {
                         // check state config ~every minute
                         if slot % 300 == 0 {
                             use_median_trigger_price = drift
-                            .state_account()
-                            .map(|s| s.feature_bit_flags & FeatureBitFlags::MedianTriggerPrice as u8 != 0)
-                            .unwrap_or(false);
+                                .state_account()
+                                .map(|s| s.feature_bit_flags & FeatureBitFlags::MedianTriggerPrice as u8 != 0)
+                                .unwrap_or(false);
+                            slots_before_stale_for_amm = drift
+                                .state_account()
+                                .map(|s| s.oracle_guard_rails.validity.slots_before_stale_for_amm)
+                                .unwrap_or(10);
                         }
                     }
                     let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
@@ -543,6 +561,7 @@ async fn try_auction_fill(
     trigger_price: u64,
     is_vamm_inactive: impl Fn(&MakerCrosses) -> bool,
     perp_market: PerpMarket,
+    oracle_stale_for_amm: bool,
 ) {
     let filler_account_data = drift
         .try_get_account::<User>(&filler_subaccount)
@@ -654,7 +673,8 @@ async fn try_auction_fill(
             })
             .collect();
 
-        if crosses.has_vamm_cross {
+        let effective_vamm_cross = crosses.has_vamm_cross && !oracle_stale_for_amm;
+        if effective_vamm_cross {
             if is_vamm_inactive(&crosses) {
                 log::debug!(target: TARGET, "skip inactive vamm cross: {crosses:?}");
                 return;
@@ -690,8 +710,12 @@ async fn try_auction_fill(
                 }
             }
         }
-        if !crosses.has_vamm_cross && maker_accounts.is_empty() {
-            log::debug!(target: TARGET, "skip empty maker cross: {crosses:?}");
+        if !effective_vamm_cross && maker_accounts.is_empty() {
+            if oracle_stale_for_amm && crosses.has_vamm_cross {
+                log::info!(target: TARGET, "skip vAMM fill: oracle stale for AMM (market={market_index})");
+            } else {
+                log::debug!(target: TARGET, "skip empty maker cross: {crosses:?}");
+            }
             return;
         }
 
