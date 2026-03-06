@@ -1355,7 +1355,7 @@ async fn derisk_subaccount(
                 base_asset_amount: position.base_asset_amount.unsigned_abs(),
                 market_index: position.market_index,
                 reduce_only: true,
-                max_ts: Some((current_time_millis() / 1000 + 5) as i64), // ~5s
+                max_ts: Some((current_time_millis() / 1000 + 15) as i64), // ~15s
                 ..Default::default()
             }]);
 
