@@ -610,13 +610,13 @@ impl LiquidatorBot {
 
         log::info!(target: TARGET, "spawned liquidation worker");
 
-        // spawn_derisk_loop(
-        //     drift.clone(),
-        //     tx_sender.clone(),
-        //     subaccounts,
-        //     Arc::clone(&priority_fee_subscriber),
-        //     cu_limit,
-        // );
+        spawn_derisk_loop(
+            drift.clone(),
+            tx_sender.clone(),
+            subaccounts,
+            Arc::clone(&priority_fee_subscriber),
+            cu_limit,
+        );
 
         log::info!(target: TARGET, "spawned derisk worker");
 
@@ -1396,7 +1396,7 @@ fn spawn_derisk_loop(
     cu_limit: u32,
 ) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             let priority_fee = priority_fee_subscriber.priority_fee_nth(0.6);
