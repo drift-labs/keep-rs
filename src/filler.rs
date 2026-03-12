@@ -10,8 +10,8 @@ use dashmap::DashMap;
 use drift_rs::{
     constants::PROGRAM_ID,
     dlob::{
-        CrossesAndTopMakers, CrossingRegion, DLOBNotifier, MakerCrosses, OrderKind, TakerOrder,
-        DLOB,
+        CrossesAndTopMakers, CrossingRegion, DLOBNotifier, L3Order, MakerCrosses, OrderKind,
+        TakerOrder, DLOB,
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
@@ -24,8 +24,8 @@ use drift_rs::{
     types::{
         accounts::{PerpMarket, User, UserStats},
         CommitmentConfig, FeatureBitFlags, FeeTier, MarketId, MarketPrecision, MarketStatus,
-        MarketType, Order, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
-        RpcSendTransactionConfig, VersionedMessage, VersionedTransaction, AMM,
+        MarketType, Order, OrderStatus, OrderTriggerCondition, OrderType, PositionDirection,
+        PostOnlyParam, RpcSendTransactionConfig, VersionedMessage, VersionedTransaction, AMM,
     },
     DriftClient, GrpcSubscribeOpts, Pubkey, TransactionBuilder, Wallet,
 };
@@ -47,6 +47,35 @@ use crate::{
 };
 
 const TARGET: &str = "filler";
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VAMMTakerSide {
+    Bid,
+    Ask,
+}
+
+impl VAMMTakerSide {
+    fn taker_direction(self) -> PositionDirection {
+        match self {
+            Self::Bid => PositionDirection::Long,
+            Self::Ask => PositionDirection::Short,
+        }
+    }
+
+    fn still_crosses(self, maker_price: u64, perp_market: &PerpMarket) -> bool {
+        match self {
+            Self::Bid => perp_market.bid_price(None) > maker_price,
+            Self::Ask => perp_market.ask_price(None) < maker_price,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bid => "bid",
+            Self::Ask => "ask",
+        }
+    }
+}
 
 pub struct FillerBot {
     drift: DriftClient,
@@ -339,6 +368,8 @@ impl FillerBot {
 
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), trigger_price, None);
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
+                        let vamm_taker_bid = crosses_and_top_makers.vamm_taker_bid.clone();
+                        let vamm_taker_ask = crosses_and_top_makers.vamm_taker_ask.clone();
 
                         if !crosses_and_top_makers.crosses.is_empty() {
                             log::info!(target: TARGET, "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
@@ -350,7 +381,7 @@ impl FillerBot {
                                 filler_subaccount,
                                 crosses_and_top_makers,
                                 tx_worker_ref.clone(),
-                                pyth_update,
+                                pyth_update.clone(),
                                 trigger_price,
                                 move |maker_cross| {
                                     perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
@@ -365,6 +396,33 @@ impl FillerBot {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
                                 log::info!(target: TARGET, "found limit crosses (market: {market_index}), top bid: {:?}, top ask: {:?}", crosses.crossing_bids.first(), crosses.crossing_asks.first());
                                 try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref).await;
+                            } else if config.enable_vamm_taker {
+                                for (side, candidate) in [
+                                    (VAMMTakerSide::Bid, vamm_taker_bid.as_ref()),
+                                    (VAMMTakerSide::Ask, vamm_taker_ask.as_ref()),
+                                ] {
+                                    let Some(candidate) = candidate else {
+                                        continue;
+                                    };
+                                    if !limiter.allow_event(slot, candidate.order_id) {
+                                        continue;
+                                    }
+                                    try_vamm_taker_fill(
+                                        drift,
+                                        priority_fee,
+                                        config.fill_cu_limit,
+                                        market_index,
+                                        filler_subaccount,
+                                        slot,
+                                        candidate.clone(),
+                                        side,
+                                        &tx_worker_ref,
+                                        &perp_market,
+                                        oracle_stale_for_amm,
+                                        pyth_update.clone(),
+                                    )
+                                    .await;
+                                }
                             }
                         }
 
@@ -761,6 +819,171 @@ async fn try_auction_fill(
             )
             .await;
     }
+}
+
+async fn try_vamm_taker_fill(
+    drift: &'static DriftClient,
+    priority_fee: u64,
+    cu_limit: u32,
+    market_index: u16,
+    filler_subaccount: Pubkey,
+    slot: u64,
+    maker_order: L3Order,
+    side: VAMMTakerSide,
+    tx_worker_ref: &TxSender,
+    perp_market: &PerpMarket,
+    oracle_stale_for_amm: bool,
+    oracle_update: Option<PythPriceUpdate>,
+) {
+    if oracle_stale_for_amm {
+        log::info!(
+            target: TARGET,
+            "skip vamm taker {}: oracle stale for AMM (market={market_index})",
+            side.label()
+        );
+        return;
+    }
+
+    if perp_market.has_too_much_drawdown()
+        && amm_wants_to_jit_make(&perp_market.amm, side.taker_direction())
+    {
+        log::debug!(
+            target: TARGET,
+            "skip vamm taker {}: AMM wants to jit make (market={market_index}, maker_order_id={})",
+            side.label(),
+            maker_order.order_id,
+        );
+        return;
+    }
+
+    if maker_order.user == filler_subaccount {
+        log::debug!(
+            target: TARGET,
+            "skip vamm taker {}: filler owns maker order {}",
+            side.label(),
+            maker_order.order_id,
+        );
+        return;
+    }
+
+    if maker_order.size < perp_market.amm.min_order_size {
+        log::debug!(
+            target: TARGET,
+            "skip vamm taker {}: maker order {} below min order size",
+            side.label(),
+            maker_order.order_id,
+        );
+        return;
+    }
+
+    if !side.still_crosses(maker_order.price, perp_market) {
+        log::debug!(
+            target: TARGET,
+            "skip vamm taker {}: maker order {} no longer crosses vAMM",
+            side.label(),
+            maker_order.order_id,
+        );
+        return;
+    }
+
+    let filler_account_data = drift
+        .try_get_account::<User>(&filler_subaccount)
+        .expect("filler account");
+    let maker_account = match drift.try_get_account::<User>(&maker_order.user) {
+        Ok(user) => user,
+        Err(err) => {
+            log::warn!(
+                target: TARGET,
+                "skip vamm taker {}: missing maker account {}: {err:?}",
+                side.label(),
+                maker_order.user
+            );
+            return;
+        }
+    };
+    let maker_stats = match drift
+        .try_get_account::<UserStats>(&Wallet::derive_stats_account(&maker_account.authority))
+    {
+        Ok(stats) => stats,
+        Err(err) => {
+            log::warn!(
+                target: TARGET,
+                "skip vamm taker {}: missing maker stats {}: {err:?}",
+                side.label(),
+                maker_order.user
+            );
+            return;
+        }
+    };
+
+    let Some(live_order) = maker_account
+        .orders
+        .iter()
+        .find(|order| order.order_id == maker_order.order_id)
+    else {
+        log::debug!(
+            target: TARGET,
+            "skip vamm taker {}: maker order {} no longer exists",
+            side.label(),
+            maker_order.order_id,
+        );
+        return;
+    };
+
+    if live_order.status != OrderStatus::Open || !live_order.post_only {
+        log::debug!(
+            target: TARGET,
+            "skip vamm taker {}: maker order {} is not open post-only",
+            side.label(),
+            maker_order.order_id,
+        );
+        return;
+    }
+
+    let mut tx_builder = TransactionBuilder::new(
+        drift.program_data(),
+        filler_subaccount,
+        std::borrow::Cow::Borrowed(&filler_account_data),
+        false,
+    )
+    .with_priority_fee(priority_fee, Some(cu_limit));
+
+    if let Some(ref update_msg) = oracle_update {
+        tx_builder =
+            tx_builder.post_pyth_lazer_oracle_update(&[update_msg.feed_id], &update_msg.message);
+    }
+
+    tx_builder = tx_builder.fill_perp_order(
+        market_index,
+        maker_order.user,
+        &maker_account,
+        &maker_stats,
+        Some(maker_order.order_id),
+        &[],
+        None,
+    );
+
+    let tx = tx_builder.build();
+
+    log::info!(
+        target: TARGET,
+        "try vamm taker {} fill: market={}, maker={}, maker_order_id={}",
+        side.label(),
+        market_index,
+        maker_order.user,
+        maker_order.order_id,
+    );
+    tx_worker_ref
+        .send_tx(
+            tx,
+            TxIntent::VAMMTakerFill {
+                slot,
+                market_index,
+                maker_order_id: maker_order.order_id,
+            },
+            cu_limit as u64,
+        )
+        .await;
 }
 
 /// Try to uncross top of book
@@ -1432,5 +1655,23 @@ impl TxSender {
             .ok()?;
 
         Some(sig)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VAMMTakerSide;
+    use drift_rs::types::PositionDirection;
+
+    #[test]
+    fn vamm_taker_side_maps_to_expected_direction() {
+        assert_eq!(
+            VAMMTakerSide::Bid.taker_direction(),
+            PositionDirection::Long
+        );
+        assert_eq!(
+            VAMMTakerSide::Ask.taker_direction(),
+            PositionDirection::Short
+        );
     }
 }
