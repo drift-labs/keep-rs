@@ -245,6 +245,30 @@ impl TxIntent {
             _ => None,
         }
     }
+
+    /// Returns the liquidatee pubkey if this is a liquidation intent
+    pub fn liquidatee(&self) -> Option<Pubkey> {
+        match self {
+            Self::LiquidateWithFill { liquidatee, .. }
+            | Self::LiquidatePerp { liquidatee, .. }
+            | Self::LiquidatePerpPnlForDeposit { liquidatee, .. }
+            | Self::LiquidateBorrowForPerpPnl { liquidatee, .. }
+            | Self::LiquidateSpot { liquidatee, .. } => Some(*liquidatee),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this intent is a liquidation type
+    pub fn is_liquidation(&self) -> bool {
+        matches!(
+            self,
+            Self::LiquidateWithFill { .. }
+                | Self::LiquidatePerp { .. }
+                | Self::LiquidatePerpPnlForDeposit { .. }
+                | Self::LiquidateBorrowForPerpPnl { .. }
+                | Self::LiquidateSpot { .. }
+        )
+    }
 }
 
 #[derive(Clone, Default, Debug)]

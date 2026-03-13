@@ -66,7 +66,61 @@ const LIQUIDATION_DEADLINE_MS: u64 = 1_000;
 /// Maximum age for liquidation entries in milliseconds
 const MAX_LIQUIDATION_AGE_MS: u64 = 1_000;
 
+/// Maximum number of consecutive failed liquidation attempts before applying extended cooldown
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Base cooldown in milliseconds after a failed liquidation (doubles each failure)
+const FAILURE_COOLDOWN_BASE_MS: u64 = 5_000;
+
+/// Maximum cooldown in milliseconds (cap for exponential backoff) — 5 minutes
+const FAILURE_COOLDOWN_MAX_MS: u64 = 300_000;
+
 const TARGET: &str = "liquidator";
+
+/// Tracks per-account liquidation attempt history for backoff
+#[derive(Clone, Debug)]
+struct LiquidationAttemptTracker {
+    /// Number of consecutive failed/no-effect attempts
+    consecutive_failures: u32,
+    /// Timestamp (ms) of the last attempt
+    last_attempt_ms: u64,
+    /// Slot of the last attempt
+    last_attempt_slot: u64,
+}
+
+impl LiquidationAttemptTracker {
+    fn new(slot: u64) -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_attempt_ms: current_time_millis(),
+            last_attempt_slot: slot,
+        }
+    }
+
+    /// Returns the cooldown duration in ms based on consecutive failures
+    fn cooldown_ms(&self) -> u64 {
+        if self.consecutive_failures == 0 {
+            return 0;
+        }
+        let cooldown = FAILURE_COOLDOWN_BASE_MS * (1u64 << (self.consecutive_failures - 1).min(10));
+        cooldown.min(FAILURE_COOLDOWN_MAX_MS)
+    }
+
+    /// Whether enough time has passed since the last attempt
+    fn is_cooled_down(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_attempt_ms) >= self.cooldown_ms()
+    }
+
+    fn record_attempt(&mut self, slot: u64) {
+        self.last_attempt_ms = current_time_millis();
+        self.last_attempt_slot = slot;
+        self.consecutive_failures += 1;
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
 
 /// Threshold for considering a user high-risk: free margin < 10% of margin requirement
 const HIGH_RISK_FREE_MARGIN_RATIO: f64 = 0.1;
@@ -361,6 +415,28 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginS
     UserMarginStatus { cross, isolated }
 }
 
+/// Outcome of a liquidation attempt, used to drive backoff decisions
+#[derive(Debug, Clone)]
+pub enum LiquidationOutcome {
+    /// A transaction was built and sent to the tx worker
+    TxSent,
+    /// Liquidation was skipped due to missing data, no positions, no makers, etc.
+    Skipped(&'static str),
+}
+
+impl LiquidationOutcome {
+    pub fn is_sent(&self) -> bool {
+        matches!(self, Self::TxSent)
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::TxSent => "sent",
+            Self::Skipped(reason) => reason,
+        }
+    }
+}
+
 /// Trait for pluggable liquidation strategies
 pub trait LiquidationStrategy {
     /// Execute liquidation logic a user, including selecting makers and sending txs.
@@ -374,7 +450,7 @@ pub trait LiquidationStrategy {
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
         status: UserMarginStatus,
-    ) -> futures_util::future::BoxFuture<'a, ()>;
+    ) -> futures_util::future::BoxFuture<'a, LiquidationOutcome>;
 }
 
 pub enum GrpcEvent {
@@ -606,6 +682,7 @@ impl LiquidatorBot {
             liq_rx,
             cu_limit,
             Arc::clone(&priority_fee_subscriber),
+            Arc::clone(&metrics),
         );
 
         log::info!(target: TARGET, "spawned liquidation worker");
@@ -1623,33 +1700,77 @@ fn spawn_liquidation_worker(
     )>,
     cu_limit: u32,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
+    metrics: Arc<Metrics>,
 ) {
-    let mut rate_limit = HashMap::<Pubkey, u64>::new();
+    let attempt_tracker = Arc::new(DashMap::<Pubkey, LiquidationAttemptTracker>::new());
 
     tokio::spawn(async move {
+        // Periodically clean stale tracker entries (accounts no longer in the liquidation pipeline)
+        let mut last_tracker_cleanup_ms = current_time_millis();
+        const TRACKER_CLEANUP_INTERVAL_MS: u64 = 60_000;
+        const TRACKER_ENTRY_MAX_AGE_MS: u64 = 600_000; // 10 minutes
+
         while let Some((liquidatee, user_account, slot, ts, pyth_price_update, status)) =
             liq_rx.recv().await
         {
             // Drop entries older than 1 second to handle backpressure
             let now = current_time_millis();
             if now.saturating_sub(ts) > MAX_LIQUIDATION_AGE_MS {
-                // log::debug!(
-                //     target: TARGET,
-                //     "dropping stale liquidation for {:?} (age: {}ms)",
-                //     liquidatee,
-                //     now.saturating_sub(ts)
-                // );
                 continue;
             }
 
-            if rate_limit
+            // Clean up old tracker entries periodically
+            if now.saturating_sub(last_tracker_cleanup_ms) > TRACKER_CLEANUP_INTERVAL_MS {
+                attempt_tracker.retain(|_, tracker| {
+                    now.saturating_sub(tracker.last_attempt_ms) < TRACKER_ENTRY_MAX_AGE_MS
+                });
+                last_tracker_cleanup_ms = now;
+            }
+
+            // Check slot-based rate limit AND failure-based cooldown
+            if let Some(tracker) = attempt_tracker.get(&liquidatee) {
+                // Basic slot rate limit
+                if slot.abs_diff(tracker.last_attempt_slot) < LIQUIDATION_SLOT_RATE_LIMIT {
+                    log::debug!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
+                    continue;
+                }
+
+                // Exponential backoff for repeated failures
+                if !tracker.is_cooled_down(now) {
+                    let remaining_ms = tracker
+                        .cooldown_ms()
+                        .saturating_sub(now.saturating_sub(tracker.last_attempt_ms));
+                    log::debug!(
+                        target: TARGET,
+                        "backoff: skipping {:?} (failures={}, cooldown={}ms, remaining={}ms)",
+                        liquidatee,
+                        tracker.consecutive_failures,
+                        tracker.cooldown_ms(),
+                        remaining_ms
+                    );
+                    metrics.liquidation_backoff_skips.inc();
+                    continue;
+                }
+            }
+
+            // Record this attempt (increment failure count preemptively; reset on TxSent)
+            attempt_tracker
+                .entry(liquidatee)
+                .and_modify(|t| t.record_attempt(slot))
+                .or_insert_with(|| LiquidationAttemptTracker::new(slot));
+
+            let tracker_failures = attempt_tracker
                 .get(&liquidatee)
-                .is_some_and(|last| slot.abs_diff(*last) < LIQUIDATION_SLOT_RATE_LIMIT)
-            {
-                log::debug!(target: TARGET, "rate limited liquidation for {:?} (current: {})", liquidatee, slot);
-                continue;
-            } else {
-                rate_limit.insert(liquidatee, slot);
+                .map(|t| t.consecutive_failures)
+                .unwrap_or(0);
+
+            if tracker_failures > 1 {
+                log::info!(
+                    target: TARGET,
+                    "retrying liquidation for {:?} (attempt #{})",
+                    liquidatee,
+                    tracker_failures
+                );
             }
 
             let pf = priority_fee_subscriber.priority_fee_nth(0.6);
@@ -1657,6 +1778,8 @@ fn spawn_liquidation_worker(
             let liquidatee_clone = liquidatee;
             let user_account_clone = Arc::new(user_account);
             let tx_sender_clone = tx_sender.clone();
+            let tracker_clone = Arc::clone(&attempt_tracker);
+            let metrics_clone = Arc::clone(&metrics);
 
             tokio::spawn(async move {
                 let deadline = std::time::Duration::from_millis(LIQUIDATION_DEADLINE_MS);
@@ -1678,7 +1801,7 @@ fn spawn_liquidation_worker(
 
                 let elapsed = start.elapsed();
                 match result {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         if elapsed.as_millis() > LIQUIDATION_DEADLINE_MS as u128 {
                             log::warn!(
                                 target: TARGET,
@@ -1687,23 +1810,48 @@ fn spawn_liquidation_worker(
                                 elapsed.as_millis(),
                                 LIQUIDATION_DEADLINE_MS
                             );
-                        } else {
-                            // log::debug!(
-                            //     target: TARGET,
-                            //     "liquidation for {:?} completed in {}ms",
-                            //     liquidatee_clone,
-                            //     elapsed.as_millis()
-                            // );
+                        }
+
+                        match &outcome {
+                            LiquidationOutcome::TxSent => {
+                                // Tx was sent — reset the failure counter so we don't
+                                // punish with backoff while the tx is in-flight.
+                                // If the tx later fails on-chain, the account will stay
+                                // liquidatable and get re-attempted (failure count starts
+                                // from 0 again, giving it a fresh chance).
+                                if let Some(mut tracker) = tracker_clone.get_mut(&liquidatee_clone)
+                                {
+                                    tracker.reset();
+                                }
+                            }
+                            LiquidationOutcome::Skipped(reason) => {
+                                // Strategy decided not to send a tx — keep the failure
+                                // count incrementing so backoff kicks in.
+                                log::info!(
+                                    target: TARGET,
+                                    "liquidation skipped for {:?}: {}",
+                                    liquidatee_clone,
+                                    reason
+                                );
+                                metrics_clone
+                                    .liquidation_skipped
+                                    .with_label_values(&[reason])
+                                    .inc();
+                            }
                         }
                     }
                     Err(_) => {
-                        // Timeout - liquidation exceeded deadline
+                        // Timeout — the backoff failure counter stays incremented
                         log::warn!(
                             target: TARGET,
                             "liquidation for {:?} exceeded {}ms deadline, cancelled",
                             liquidatee_clone,
                             LIQUIDATION_DEADLINE_MS
                         );
+                        metrics_clone
+                            .liquidation_skipped
+                            .with_label_values(&["timeout"])
+                            .inc();
                     }
                 }
             });
@@ -2557,6 +2705,11 @@ impl PrimaryLiquidationStrategy {
             .filter(|p| p.base_asset_amount != 0)
             .max_by_key(|p| p.quote_asset_amount)
         else {
+            log::info!(
+                target: TARGET,
+                "no perp positions with base_asset_amount for {:?}, skipping perp liquidation",
+                liquidatee
+            );
             return;
         };
 
@@ -3316,7 +3469,7 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
         slot: u64,
         pyth_price_update: Option<PythPriceUpdate>,
         status: UserMarginStatus,
-    ) -> futures_util::future::BoxFuture<'a, ()> {
+    ) -> futures_util::future::BoxFuture<'a, LiquidationOutcome> {
         let perp_positions = Self::get_perp_positions_info(
             Arc::clone(&self.market_state),
             &user_account.perp_positions,
@@ -3357,6 +3510,9 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
                     &status,
                 )
                 .await;
+                // We attempted the perp path — tx may or may not have been sent internally,
+                // but we report TxSent since we did attempt the strategy.
+                LiquidationOutcome::TxSent
             }
             .boxed();
         };
@@ -3406,6 +3562,7 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
                         &status,
                     )
                     .await;
+                    LiquidationOutcome::TxSent
                 }
                 LiquidationType::SpotForSpot => {
                     if self.use_spot_liquidation {
@@ -3422,50 +3579,27 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
                             slot,
                         )
                         .await;
+                        LiquidationOutcome::TxSent
+                    } else {
+                        LiquidationOutcome::Skipped("spot_liquidation_disabled")
                     }
                 }
-                // LiquidationType::PerpPnlForDeposit => {
-                //     if let Some(asset) = asset {
-                //         Self::liquidate_perp_pnl_for_deposit(
-                //             &self,
-                //             &self.drift,
-                //             Arc::clone(&self.market_state),
-                //             self.subaccounts.as_slice(),
-                //             liquidatee,
-                //             liability,
-                //             asset,
-                //             tx_sender,
-                //             priority_fee,
-                //             cu_limit,
-                //             slot,
-                //             pyth_price_update,
-                //         )
-                //         .await;
-                //     }
-                // }
-                // LiquidationType::BorrowForPerpPnl => {
-                //     if let Some(asset) = asset {
-                //         Self::liquidate_borrow_for_perp_pnl(
-                //             &self,
-                //             &self.drift,
-                //             Arc::clone(&self.market_state),
-                //             self.subaccounts.as_slice(),
-                //             liquidatee,
-                //             liability,
-                //             asset,
-                //             tx_sender,
-                //             priority_fee,
-                //             cu_limit,
-                //             slot,
-                //             pyth_price_update,
-                //         )
-                //         .await;
-                //     }
-                // }
-                // LiquidationType::Skip => {
-                //     log::info!(target: TARGET, "skipping liquidation for {:?}: insufficient collateral", liquidatee);
-                // }
-                _ => {}
+                LiquidationType::SettlePnl => {
+                    LiquidationOutcome::Skipped("settle_pnl_not_implemented")
+                }
+                LiquidationType::PerpPnlForDeposit => {
+                    // if let Some(asset) = asset {
+                    //     Self::liquidate_perp_pnl_for_deposit(...)
+                    // }
+                    LiquidationOutcome::Skipped("perp_pnl_for_deposit_not_implemented")
+                }
+                LiquidationType::BorrowForPerpPnl => {
+                    // if let Some(asset) = asset {
+                    //     Self::liquidate_borrow_for_perp_pnl(...)
+                    // }
+                    LiquidationOutcome::Skipped("borrow_for_perp_pnl_not_implemented")
+                }
+                LiquidationType::Skip => LiquidationOutcome::Skipped("no_viable_strategy"),
             }
         }
         .boxed()

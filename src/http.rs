@@ -66,6 +66,8 @@ pub struct Metrics {
     pub liquidation_attempts: IntCounterVec,
     pub liquidation_success: IntCounterVec,
     pub liquidation_failed: IntCounterVec,
+    pub liquidation_skipped: IntCounterVec,
+    pub liquidation_backoff_skips: IntCounter,
     pub swap_quote_latency_ms: IntGauge,
     pub jupiter_quote_failures: IntCounter,
     pub titan_quote_failures: IntCounter,
@@ -165,6 +167,27 @@ impl Metrics {
             .register(Box::new(liquidation_failed.clone()))
             .unwrap();
 
+        let liquidation_skipped = IntCounterVec::new(
+            prometheus::Opts::new(
+                "rfb_liquidation_skipped_total",
+                "Number of liquidations skipped by reason",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(liquidation_skipped.clone()))
+            .unwrap();
+
+        let liquidation_backoff_skips = IntCounter::new(
+            "rfb_liquidation_backoff_skips_total",
+            "Number of liquidation attempts skipped due to exponential backoff",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(liquidation_backoff_skips.clone()))
+            .unwrap();
+
         let swap_quote_latency_ms = IntGauge::new(
             "rfb_swap_quote_latency_ms",
             "Swap quote request latency in milliseconds",
@@ -220,6 +243,8 @@ impl Metrics {
             liquidation_attempts,
             liquidation_success,
             liquidation_failed,
+            liquidation_skipped,
+            liquidation_backoff_skips,
             swap_quote_latency_ms,
             jupiter_quote_failures,
             titan_quote_failures,

@@ -1153,7 +1153,22 @@ impl TxWorker {
             match drift.simulate_tx(signed_tx.message.clone()).await {
                 Ok(sim_result) => {
                     if let Some(err) = sim_result.err {
-                        log::warn!(target: TARGET, "sim failed: {err:?}, intent: {intent_label}");
+                        log::warn!(
+                            target: TARGET,
+                            "sim failed: {err:?}, intent: {intent_label}, liquidatee: {:?}, slot: {:?}",
+                            intent.liquidatee(),
+                            intent.slot()
+                        );
+                        // Log simulation logs for liquidation intents to help diagnose failures
+                        if intent.is_liquidation() {
+                            if let Some(logs) = sim_result.logs {
+                                for log_line in &logs {
+                                    if log_line.contains("Error") || log_line.contains("error") || log_line.contains("failed") || log_line.contains("Program log:") {
+                                        log::warn!(target: TARGET, "  sim log: {}", log_line);
+                                    }
+                                }
+                            }
+                        }
                         metrics
                             .tx_failed
                             .with_label_values(&[intent_label, "sim_failed"])
@@ -1162,7 +1177,11 @@ impl TxWorker {
                     }
                 }
                 Err(err) => {
-                    log::warn!(target: TARGET, "sim rpc error: {err}, skipping tx");
+                    log::warn!(
+                        target: TARGET,
+                        "sim rpc error: {err}, intent: {intent_label}, liquidatee: {:?}",
+                        intent.liquidatee()
+                    );
                     metrics
                         .tx_failed
                         .with_label_values(&[intent_label, "sim_rpc_error"])
@@ -1335,7 +1354,22 @@ impl TxWorker {
                                     .inc();
                             }
                             Some(err) => {
-                                log::warn!(target: TARGET, "tx failed: {err:?}");
+                                log::warn!(
+                                    target: TARGET,
+                                    "tx failed: {err:?}, intent: {intent_label}, liquidatee: {:?}, sig: {signature}",
+                                    intent.liquidatee()
+                                );
+                                // Log program logs from failed liquidation txs
+                                if intent.is_liquidation() {
+                                    let logs: Option<Vec<String>> = meta.log_messages.clone().into();
+                                    if let Some(logs) = logs {
+                                        for log_line in &logs {
+                                            if log_line.contains("Error") || log_line.contains("error") || log_line.contains("failed") || log_line.contains("Program log:") {
+                                                log::warn!(target: TARGET, "  tx log: {}", log_line);
+                                            }
+                                        }
+                                    }
+                                }
                                 // tx failed with error
                                 metrics
                                     .tx_failed
