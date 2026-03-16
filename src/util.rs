@@ -12,16 +12,16 @@ use drift_rs::{
     types::{MarketId, MarketType},
     Pubkey,
 };
-use futures_util::StreamExt;
-use pyth_lazer_client::AnyResponse;
+use pyth_lazer_client::ws_connection::AnyResponse;
 use pyth_lazer_protocol::{
+    api::{
+        Channel, DeliveryFormat, Format, JsonBinaryEncoding, MarketSession, SubscribeRequest,
+        SubscriptionId, SubscriptionParams, SubscriptionParamsRepr, WsResponse,
+    },
     message::Message,
     payload::{PayloadData, PayloadPropertyValue},
-    router::{
-        Channel, DeliveryFormat, FixedRate, Format, JsonBinaryEncoding, PriceFeedId,
-        PriceFeedProperty, SubscriptionParams, SubscriptionParamsRepr, TimestampUs,
-    },
-    subscription::{Response, SubscribeRequest, SubscriptionId},
+    time::{FixedRate, TimestampUs},
+    PriceFeedId, PriceFeedProperty,
 };
 use solana_sdk::signature::Signature;
 
@@ -358,8 +358,8 @@ pub struct PythPriceUpdate {
 fn fixed_rate(feed_id: u32) -> FixedRate {
     match feed_id {
         1 | 2 | 6 => FixedRate::MIN,
-        10 => FixedRate::from_ms(50).unwrap(),
-        _ => FixedRate::from_ms(200).unwrap(),
+        10 => FixedRate::RATE_50_MS,
+        _ => FixedRate::RATE_200_MS,
     }
 }
 
@@ -384,7 +384,7 @@ fn to_price_precision(price: u64, feed_id: u32, market_type: MarketType) -> u64 
 }
 
 pub fn subscribe_price_feeds(
-    mut cli: pyth_lazer_client::LazerClient,
+    mut cli: pyth_lazer_client::stream_client::PythLazerStreamClient,
     perp_market_ids: &[MarketId],
     spot_market_ids: &[MarketId],
 ) -> tokio::sync::mpsc::Receiver<PythPriceUpdate> {
@@ -435,31 +435,32 @@ pub fn subscribe_price_feeds(
             };
 
             // sub per feed
-            let mut sub_id = 0;
+            let mut sub_id = 0u64;
             for feed_id in feed_ids.iter() {
                 let subscribe_request = SubscribeRequest {
                     subscription_id: SubscriptionId(sub_id),
                     params: SubscriptionParams::new(SubscriptionParamsRepr {
-                        price_feed_ids: vec![*feed_id],
+                        price_feed_ids: Some(vec![*feed_id]),
+                        symbols: None,
                         // drift program requires exponent field to verify the message
-                        properties: vec![PriceFeedProperty::Price, PriceFeedProperty::Exponent],
+                        properties: vec![
+                            PriceFeedProperty::Price,
+                            PriceFeedProperty::Exponent,
+                            PriceFeedProperty::FeedUpdateTimestamp,
+                        ],
                         delivery_format: DeliveryFormat::Binary,
                         json_binary_encoding: JsonBinaryEncoding::Hex,
                         parsed: false,
                         channel: Channel::FixedRate(fixed_rate(feed_id.0)),
                         formats: vec![Format::Solana],
-                        ignore_invalid_feed_ids: false,
+                        ignore_invalid_feeds: false,
+                        market_sessions: vec![MarketSession::Regular],
                     })
                     .expect("invalid subscription params"),
                 };
                 sub_id += 1;
-                if let Err(err) = cli
-                    .subscribe(pyth_lazer_protocol::subscription::Request::Subscribe(
-                        subscribe_request,
-                    ))
-                    .await
-                {
-                    log::error!(target: "pyth", "pyth feed subscribe failed: {err:?}");
+                if let Err(err) = cli.subscribe(subscribe_request).await {
+                    log::error!(target: "filler", "pyth feed subscribe failed: {err:?}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -467,10 +468,10 @@ pub fn subscribe_price_feeds(
 
             retries = 0u32; // retry on successful connect
 
-            let mut stream = pyth_lazer_stream.boxed();
-            while let Some(update) = stream.next().await {
+            let mut stream = pyth_lazer_stream;
+            while let Some(update) = stream.recv().await {
                 match update {
-                    Ok(AnyResponse::Binary(outer)) => {
+                    AnyResponse::Binary(outer) => {
                         for message in outer.messages {
                             match message {
                                 Message::Solana(solana) => {
@@ -486,7 +487,8 @@ pub fn subscribe_price_feeds(
                                             {
                                                 // TODO: bulk msg to avoid bouncing around tokio, bucket in some way, one message updates multiple markets...
                                                 let feed_id = f.feed_id.0;
-                                                let price: u64 = new_price.0.unsigned_abs().into();
+                                                let price: u64 =
+                                                    new_price.mantissa_i64().unsigned_abs();
 
                                                 if let Some(market_id) =
                                                     pyth_lazer_feed_id_to_perp_market_index(feed_id)
@@ -532,24 +534,18 @@ pub fn subscribe_price_feeds(
                         }
                     }
                     other => match other {
-                        Ok(AnyResponse::Json(Response::Subscribed(sub))) => {
+                        AnyResponse::Json(WsResponse::Subscribed(sub)) => {
                             log::info!(
                                 target: "pyth",
                                 "subscribed feed {}",
                                 sub.subscription_id.0
                             );
                         }
-                        Ok(AnyResponse::Json(msg)) => {
+                        AnyResponse::Json(msg) => {
                             log::info!(target: "pyth", "control msg: {msg:?}");
                         }
-                        Err(err) => {
-                            log::warn!(
-                                target: "pyth",
-                                "websocket error from pyth stream: {err:?}"
-                            );
-                        }
-                        Ok(other_ok) => {
-                            log::info!(target: "pyth", "non-binary msg: {other_ok:?}");
+                        AnyResponse::Binary(_) => {
+                            // already handled above; only Json variants reach this branch
                         }
                     },
                 }
