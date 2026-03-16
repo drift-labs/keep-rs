@@ -146,8 +146,7 @@ fn validate_data_freshness(
 /// Validate Pyth price freshness
 fn validate_pyth_price_freshness(pyth_update: &PythPriceUpdate) -> Result<(), StalenessError> {
     let now_ms = current_time_millis();
-    // Pyth timestamp is in microseconds, convert to milliseconds
-    let pyth_ts_ms = pyth_update.ts.0 / 1000;
+    let pyth_ts_ms = pyth_update.ts.as_millis();
     let age_ms = now_ms.saturating_sub(pyth_ts_ms);
 
     if age_ms > MAX_PYTH_AGE_MS {
@@ -483,11 +482,10 @@ impl LiquidatorBot {
             Box::leak(Box::new(MarketState::new(market_state)));
 
         let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
-        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
-            "wss://pyth-lazer.dourolabs.app/v1/stream",
-            pyth_access_token.as_str(),
-        )
-        .expect("pyth price feed connects");
+        let pyth_feed_cli =
+            pyth_lazer_client::stream_client::PythLazerStreamClientBuilder::new(pyth_access_token)
+                .build()
+                .expect("pyth price feed connects");
 
         let pyth_price_feed: tokio::sync::mpsc::Receiver<_> = if config.use_spot_liquidation {
             crate::util::subscribe_price_feeds(pyth_feed_cli, &perp_market_ids, &spot_market_ids)

@@ -118,11 +118,10 @@ impl FillerBot {
 
         // pyth disabled for now
         let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
-        let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
-            "wss://pyth-lazer.dourolabs.app/v1/stream",
-            pyth_access_token.as_str(),
-        )
-        .expect("pyth price feed connects");
+        let pyth_feed_cli =
+            pyth_lazer_client::stream_client::PythLazerStreamClientBuilder::new(pyth_access_token)
+                .build()
+                .expect("pyth price feed connects");
         let pyth_price_feed = crate::util::subscribe_price_feeds(pyth_feed_cli, &market_ids, &[]);
         log::info!(target: TARGET, "subscribed pyth price feeds");
 
