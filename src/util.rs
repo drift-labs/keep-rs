@@ -454,7 +454,6 @@ pub fn subscribe_price_feeds(
                         channel: Channel::FixedRate(fixed_rate(feed_id.0)),
                         formats: vec![Format::Solana],
                         ignore_invalid_feeds: false,
-                        market_sessions: vec![MarketSession::Regular],
                     })
                     .expect("invalid subscription params"),
                 };
