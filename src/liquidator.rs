@@ -2921,7 +2921,7 @@ impl PrimaryLiquidationStrategy {
             );
 
             // Fetch accounts once
-            let keeper_account_data = match drift.try_get_account::<User>(&subaccount) {
+            let keeper_account_data = match drift.get_user_account(&subaccount).await {
                 Ok(data) => data,
                 Err(_) => {
                     log::info!(target: TARGET, "keeper account not found: {:?}", &subaccount);
