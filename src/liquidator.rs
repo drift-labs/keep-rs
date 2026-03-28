@@ -2860,13 +2860,6 @@ impl PrimaryLiquidationStrategy {
             .iter()
             .filter(|p| matches!(p.balance_type, SpotBalanceType::Borrow) && !p.is_available())
         {
-            // skip permanently blocked markets
-            if BLOCKED_SPOT_MARKETS.contains(&pos.market_index)
-                || BLOCKED_SPOT_MARKETS.contains(&asset_market_index)
-            {
-                continue;
-            }
-
             let spot_market = {
                 let state = market_state.read().unwrap();
                 let state_data = state.load();
@@ -2912,6 +2905,13 @@ impl PrimaryLiquidationStrategy {
                 );
                 continue;
             };
+
+            // skip permanently blocked markets
+            if BLOCKED_SPOT_MARKETS.contains(&pos.market_index)
+                || BLOCKED_SPOT_MARKETS.contains(&asset_market_index)
+            {
+                continue;
+            }
 
             log::info!(
                 target: TARGET,
