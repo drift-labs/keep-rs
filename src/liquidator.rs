@@ -2861,7 +2861,9 @@ impl PrimaryLiquidationStrategy {
             .filter(|p| matches!(p.balance_type, SpotBalanceType::Borrow) && !p.is_available())
         {
             // skip permanently blocked markets
-            if BLOCKED_SPOT_MARKETS.contains(&pos.market_index) {
+            if BLOCKED_SPOT_MARKETS.contains(&pos.market_index)
+                || BLOCKED_SPOT_MARKETS.contains(&asset_market_index)
+            {
                 continue;
             }
 
