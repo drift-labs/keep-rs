@@ -133,7 +133,7 @@ const MAX_ORACLE_AGE_SLOTS: u64 = 50;
 const MAX_PYTH_AGE_MS: u64 = 5000;
 
 /// Permanently blocked spot markets (untradable tokens)
-const BLOCKED_SPOT_MARKETS: &[u16] = &[40];
+const BLOCKED_SPOT_MARKETS: &[u16] = &[40, 26];
 
 /// Metadata tracking for user accounts to detect staleness
 #[derive(Clone, Debug)]
