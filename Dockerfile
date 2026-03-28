@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-FROM rust:1.87.0 AS builder
+FROM rust:1.88.0 AS builder
 WORKDIR /app
 
 ENV CARGO_DRIFT_FFI_PATH="/usr/local/lib"
