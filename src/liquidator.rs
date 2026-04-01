@@ -6,17 +6,19 @@
 //!
 //! The default strategy tries to liquidate perp positions against resting orders
 //!
-use anchor_lang::Discriminator;
+use anchor_lang::{Discriminator, InstructionData};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc::error::TryRecvError;
 
 use drift_rs::{
+    build_accounts,
+    constants::{self, state_account},
     dlob::{DLOBNotifier, DLOB},
     ffi::{calculate_claimable_pnl, OraclePriceData, SimplifiedMarginCalculation},
     grpc::{
@@ -40,11 +42,15 @@ use drift_rs::{
         MarginRequirementType, MarketId, MarketStatus, MarketType, OracleSource, OrderParams,
         OrderType, PerpPosition, PositionDirection, SpotBalanceType, SpotPosition,
     },
-    DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder,
+    DriftClient, GrpcSubscribeOpts, MarketState, Pubkey, TransactionBuilder, Wallet,
 };
 use drift_rs::{jupiter::JupiterSwapApi, titan::TitanSwapApi};
 use solana_sdk::{
-    account::Account, clock::Slot, compute_budget::ComputeBudgetInstruction, signature::Signature,
+    account::Account,
+    clock::Slot,
+    compute_budget::ComputeBudgetInstruction,
+    instruction::{AccountMeta, Instruction},
+    signature::Signature,
 };
 
 use crate::{
@@ -412,6 +418,14 @@ fn check_margin_status(margin_info: &SimplifiedMarginCalculation) -> UserMarginS
     };
 
     UserMarginStatus { cross, isolated }
+}
+
+fn user_needs_bankruptcy_resolution(user: &User) -> bool {
+    user.is_bankrupt()
+        || user
+            .perp_positions
+            .iter()
+            .any(|position| position.is_isolated_position() && (position.position_flag & 0b00000100) > 0)
 }
 
 /// Outcome of a liquidation attempt, used to drive backoff decisions
@@ -975,7 +989,7 @@ impl LiquidatorBot {
                                 users.remove(&pubkey);
                             } else {
                                 let status = check_margin_status(&margin_info);
-                                if status.is_liquidatable() {
+                                if status.is_liquidatable() || user_needs_bankruptcy_resolution(&user) {
                                     // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                                     high_risk.insert(pubkey);
                                 } else if status.is_at_risk() {
@@ -1105,7 +1119,9 @@ impl LiquidatorBot {
                         };
 
                         let status = check_margin_status(&margin_info);
-                        if status.is_liquidatable() {
+                        if status.is_liquidatable()
+                            || user_needs_bankruptcy_resolution(&user_meta.user)
+                        {
                             // log::debug!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
                             liquidatable_users.push((pubkey, user_meta.user.clone(), status));
                         }
@@ -1295,7 +1311,9 @@ impl LiquidatorBot {
 
                     let status = check_margin_status(&margin_info);
 
-                    if status.is_liquidatable() {
+                    if status.is_liquidatable()
+                        || user_needs_bankruptcy_resolution(&user_meta.user)
+                    {
                         high_risk.insert(*pubkey);
                         newly_high_risk += 1;
                         log::info!(target: TARGET, "found liquidatable user: {pubkey:?}, margin:{margin_info:?}");
@@ -3402,6 +3420,208 @@ impl PrimaryLiquidationStrategy {
         .await;
     }
 
+    fn find_perp_bankrupting_markets(user: &User) -> Vec<u16> {
+        let mut markets = BTreeSet::new();
+        for position in user.perp_positions.iter().filter(|p| !p.is_available()) {
+            if position.quote_asset_amount < 0 {
+                markets.insert(position.market_index);
+            }
+        }
+        markets.into_iter().collect()
+    }
+
+    fn find_spot_bankrupting_markets(user: &User) -> Vec<u16> {
+        let mut markets = BTreeSet::new();
+        for position in user.spot_positions.iter().filter(|p| !p.is_available()) {
+            if position.balance_type == SpotBalanceType::Borrow && position.scaled_balance > 0 {
+                markets.insert(position.market_index);
+            }
+        }
+        markets.into_iter().collect()
+    }
+
+    async fn resolve_bankruptcy(
+        drift: &DriftClient,
+        subaccounts: &[Pubkey],
+        liquidatee: Pubkey,
+        user_account: Arc<User>,
+        tx_sender: TxSender,
+        priority_fee: u64,
+        cu_limit: u32,
+        slot: u64,
+        pyth_price_update: Option<PythPriceUpdate>,
+    ) -> bool {
+        let Some(subaccount) = subaccounts.first().copied() else {
+            log::warn!(target: TARGET, "no subaccount configured for bankruptcy resolution");
+            return false;
+        };
+
+        let keeper_account_data = match drift.try_get_account::<User>(&subaccount) {
+            Ok(data) => data,
+            Err(_) => {
+                log::warn!(target: TARGET, "keeper account lookup failed for bankruptcy resolution");
+                return false;
+            }
+        };
+
+        let user_ref = user_account.as_ref();
+        let mut sent_any = false;
+        let perp_markets = Self::find_perp_bankrupting_markets(user_ref);
+        let spot_markets = Self::find_spot_bankrupting_markets(user_ref);
+
+        let quote_market = match drift
+            .program_data()
+            .spot_market_config_by_index(MarketId::QUOTE_SPOT.index())
+        {
+            Some(market) => market,
+            None => {
+                log::warn!(target: TARGET, "quote spot market unavailable for bankruptcy resolution");
+                return false;
+            }
+        };
+
+        if quote_market.has_transfer_hook() {
+            log::warn!(target: TARGET, "quote spot market has transfer hook; skipping perp bankruptcy resolution");
+        } else {
+            for market_index in perp_markets {
+                let mut tx_builder = TransactionBuilder::new(
+                    drift.program_data(),
+                    subaccount,
+                    std::borrow::Cow::Owned(keeper_account_data.clone()),
+                    false,
+                )
+                .with_priority_fee(priority_fee, Some(cu_limit));
+
+                if let Some(ref update) = pyth_price_update {
+                    tx_builder = tx_builder
+                        .post_pyth_lazer_oracle_update(&[update.feed_id], &update.message);
+                }
+
+                let mut accounts = build_accounts(
+                    drift.program_data(),
+                    drift_rs::types::accounts::ResolvePerpBankruptcy {
+                        state: *state_account(),
+                        authority: *drift.wallet.authority(),
+                        liquidator: subaccount,
+                        liquidator_stats: Wallet::derive_stats_account(&drift.wallet.authority()),
+                        user: liquidatee,
+                        user_stats: Wallet::derive_stats_account(&user_ref.authority),
+                        spot_market_vault: quote_market.vault,
+                        insurance_fund_vault: quote_market.insurance_fund.vault,
+                        drift_signer: constants::derive_drift_signer(),
+                        token_program: quote_market.token_program(),
+                    },
+                    [&keeper_account_data, user_ref].into_iter(),
+                    std::iter::empty(),
+                    [MarketId::QUOTE_SPOT, MarketId::perp(market_index)].iter(),
+                );
+                accounts.push(AccountMeta::new_readonly(quote_market.mint, false));
+
+                let ix = Instruction {
+                    program_id: constants::PROGRAM_ID,
+                    accounts,
+                    data: InstructionData::data(&drift_rs::drift_idl::instructions::ResolvePerpBankruptcy {
+                        quote_spot_market_index: MarketId::QUOTE_SPOT.index(),
+                        market_index,
+                    }),
+                };
+
+                let tx = tx_builder.add_ix(ix).build();
+                if tx_sender
+                    .send_tx(
+                        tx,
+                        TxIntent::ResolvePerpBankruptcy {
+                            market_index,
+                            liquidatee,
+                            slot,
+                        },
+                        cu_limit as u64,
+                    )
+                    .await
+                    .is_some()
+                {
+                    sent_any = true;
+                }
+            }
+        }
+
+        for market_index in spot_markets {
+            let Some(spot_market) = drift.program_data().spot_market_config_by_index(market_index)
+            else {
+                continue;
+            };
+
+            if spot_market.has_transfer_hook() {
+                log::warn!(
+                    target: TARGET,
+                    "spot market {} has transfer hook; skipping spot bankruptcy resolution",
+                    market_index
+                );
+                continue;
+            }
+
+            let mut tx_builder = TransactionBuilder::new(
+                drift.program_data(),
+                subaccount,
+                std::borrow::Cow::Owned(keeper_account_data.clone()),
+                false,
+            )
+            .with_priority_fee(priority_fee, Some(cu_limit));
+
+            if let Some(ref update) = pyth_price_update {
+                tx_builder =
+                    tx_builder.post_pyth_lazer_oracle_update(&[update.feed_id], &update.message);
+            }
+
+            let mut accounts = build_accounts(
+                drift.program_data(),
+                drift_rs::types::accounts::ResolveSpotBankruptcy {
+                    state: *state_account(),
+                    authority: *drift.wallet.authority(),
+                    liquidator: subaccount,
+                    liquidator_stats: Wallet::derive_stats_account(&drift.wallet.authority()),
+                    user: liquidatee,
+                    user_stats: Wallet::derive_stats_account(&user_ref.authority),
+                    spot_market_vault: spot_market.vault,
+                    insurance_fund_vault: spot_market.insurance_fund.vault,
+                    drift_signer: constants::derive_drift_signer(),
+                    token_program: spot_market.token_program(),
+                },
+                [&keeper_account_data, user_ref].into_iter(),
+                std::iter::empty(),
+                std::iter::once(&MarketId::spot(market_index)),
+            );
+            accounts.push(AccountMeta::new_readonly(spot_market.mint, false));
+
+            let ix = Instruction {
+                program_id: constants::PROGRAM_ID,
+                accounts,
+                data: InstructionData::data(
+                    &drift_rs::drift_idl::instructions::ResolveSpotBankruptcy { market_index },
+                ),
+            };
+
+            let tx = tx_builder.add_ix(ix).build();
+            if tx_sender
+                .send_tx(
+                    tx,
+                    TxIntent::ResolveSpotBankruptcy {
+                        market_index,
+                        liquidatee,
+                        slot,
+                    },
+                    cu_limit as u64,
+                )
+                .await
+                .is_some()
+            {
+                sent_any = true;
+            }
+        }
+
+        sent_any
+    }
+
     // Settle perp pnl
     async fn settle_perp_pnl(
         drift: &DriftClient,
@@ -3480,6 +3700,30 @@ impl LiquidationStrategy for PrimaryLiquidationStrategy {
 
         let (safest_perp_tier, safest_spot_tier) =
             Self::get_safest_tiers(&user_account, &self.drift);
+
+        if user_needs_bankruptcy_resolution(&user_account) {
+            return async move {
+                let sent = Self::resolve_bankruptcy(
+                    &self.drift,
+                    self.subaccounts.as_slice(),
+                    liquidatee,
+                    Arc::clone(&user_account),
+                    tx_sender,
+                    priority_fee,
+                    cu_limit,
+                    slot,
+                    pyth_price_update,
+                )
+                .await;
+
+                if sent {
+                    LiquidationOutcome::TxSent
+                } else {
+                    LiquidationOutcome::Skipped("bankruptcy_resolution_not_sent")
+                }
+            }
+            .boxed();
+        }
 
         let Some((liability, asset)) = Self::pick_best_asset_liability_combo(
             Arc::clone(&self.market_state),

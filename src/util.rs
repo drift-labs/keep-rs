@@ -143,6 +143,16 @@ pub enum TxIntent {
         liquidatee: Pubkey,
         slot: u64,
     },
+    ResolvePerpBankruptcy {
+        market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
+    ResolveSpotBankruptcy {
+        market_index: u16,
+        liquidatee: Pubkey,
+        slot: u64,
+    },
     Derisk {
         market_index: u16,
         subaccount: Pubkey,
@@ -178,6 +188,8 @@ impl TxIntent {
             TxIntent::LiquidatePerpPnlForDeposit { .. } => "liq_perp_pnl_for_deposit",
             TxIntent::LiquidateBorrowForPerpPnl { .. } => "liq_borrow_for_perp_pnl",
             TxIntent::LiquidateSpot { .. } => "liq_spot",
+            TxIntent::ResolvePerpBankruptcy { .. } => "resolve_perp_bankruptcy",
+            TxIntent::ResolveSpotBankruptcy { .. } => "resolve_spot_bankruptcy",
             TxIntent::Derisk { .. } => "derisk",
             TxIntent::SettlePnl { .. } => "settle_pnl",
         }
@@ -199,6 +211,8 @@ impl TxIntent {
             TxIntent::LiquidatePerpPnlForDeposit { .. } => 0,
             TxIntent::LiquidateBorrowForPerpPnl { .. } => 0,
             TxIntent::LiquidateSpot { .. } => 0,
+            TxIntent::ResolvePerpBankruptcy { .. } => 0,
+            TxIntent::ResolveSpotBankruptcy { .. } => 0,
             TxIntent::Derisk { .. } => 0,
             TxIntent::SettlePnl { .. } => 0,
         }
@@ -228,6 +242,8 @@ impl TxIntent {
             Self::LiquidatePerpPnlForDeposit { slot, .. } => (vec![], *slot),
             Self::LiquidateBorrowForPerpPnl { slot, .. } => (vec![], *slot),
             Self::LiquidateSpot { slot, .. } => (vec![], *slot),
+            Self::ResolvePerpBankruptcy { slot, .. } => (vec![], *slot),
+            Self::ResolveSpotBankruptcy { slot, .. } => (vec![], *slot),
             TxIntent::Derisk { .. } => (vec![], 0),
             TxIntent::SettlePnl { .. } => (vec![], 0),
         }
@@ -241,7 +257,9 @@ impl TxIntent {
             | Self::LiquidatePerp { slot, .. }
             | Self::LiquidatePerpPnlForDeposit { slot, .. }
             | Self::LiquidateBorrowForPerpPnl { slot, .. }
-            | Self::LiquidateSpot { slot, .. } => Some(*slot),
+            | Self::LiquidateSpot { slot, .. }
+            | Self::ResolvePerpBankruptcy { slot, .. }
+            | Self::ResolveSpotBankruptcy { slot, .. } => Some(*slot),
             _ => None,
         }
     }
@@ -253,7 +271,9 @@ impl TxIntent {
             | Self::LiquidatePerp { liquidatee, .. }
             | Self::LiquidatePerpPnlForDeposit { liquidatee, .. }
             | Self::LiquidateBorrowForPerpPnl { liquidatee, .. }
-            | Self::LiquidateSpot { liquidatee, .. } => Some(*liquidatee),
+            | Self::LiquidateSpot { liquidatee, .. }
+            | Self::ResolvePerpBankruptcy { liquidatee, .. }
+            | Self::ResolveSpotBankruptcy { liquidatee, .. } => Some(*liquidatee),
             _ => None,
         }
     }
@@ -267,6 +287,8 @@ impl TxIntent {
                 | Self::LiquidatePerpPnlForDeposit { .. }
                 | Self::LiquidateBorrowForPerpPnl { .. }
                 | Self::LiquidateSpot { .. }
+                | Self::ResolvePerpBankruptcy { .. }
+                | Self::ResolveSpotBankruptcy { .. }
         )
     }
 }
