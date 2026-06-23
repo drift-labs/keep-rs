@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install jq -y && rustup component add rustfmt
 # RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # install libdrift
-RUN SO_URL=$(curl -s https://api.github.com/repos/drift-labs/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url') &&\
+RUN SO_URL=$(curl -s https://api.github.com/repos/velocity-exchange/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url') &&\
     curl -L -o libdrift_ffi_sys.so "$SO_URL" &&\
     cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
 

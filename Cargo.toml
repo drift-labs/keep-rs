@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust keeper bots for Drift protocol"
 license = "MIT"
-repository = "https://github.com/drift-labs/keep-rs"
+repository = "https://github.com/velocity-exchange/keep-rs"
 keywords = ["drift", "defi", "solana", "trading-bot", "liquidity"]
 categories = ["financial", "network-programming"]
 
