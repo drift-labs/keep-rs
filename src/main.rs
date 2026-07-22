@@ -55,6 +55,9 @@ pub struct Config {
     pub swift_cu_limit: u32,
     #[clap(long, default_value = "256000")]
     pub fill_cu_limit: u32,
+    /// Enable vAMM taker fills against crossed post-only makers
+    #[clap(long, env = "ENABLE_VAMM_TAKER", default_value = "false")]
+    pub enable_vamm_taker: bool,
     #[clap(long, env = "DRY_RUN", default_value = "false")]
     pub dry: bool,
     #[clap(long, default_value = "0")]
