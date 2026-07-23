@@ -489,6 +489,16 @@ async fn try_swift_fill(
 ) {
     log::info!(target: TARGET, "try fill swift order: {}", swift_order.order_uuid_str());
     let taker_order = swift_order.order_params();
+    if taker_order.market_type != MarketType::Perp {
+        log::warn!(
+            target: TARGET,
+            "skip swift order for non-perp market: uuid={}, market_type={:?}, market_index={}",
+            swift_order.order_uuid_str(),
+            taker_order.market_type,
+            taker_order.market_index
+        );
+        return;
+    }
     let taker_subaccount = swift_order.taker_subaccount();
     let taker_authority = swift_order.taker_authority;
 
@@ -608,6 +618,29 @@ async fn try_auction_fill(
         let taker_account_data = drift
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");
+        let Some(user_order) = taker_account_data
+            .orders
+            .iter()
+            .find(|o| o.order_id == taker_order.order_id)
+        else {
+            log::warn!(
+                target: TARGET,
+                "skip auction fill: taker order missing (order_id={}, user={})",
+                taker_order.order_id,
+                taker_subaccount
+            );
+            continue;
+        };
+        if user_order.market_type != MarketType::Perp {
+            log::warn!(
+                target: TARGET,
+                "skip non-perp auction fill: order_id={}, market_type={:?}, user={}",
+                taker_order.order_id,
+                user_order.market_type,
+                taker_subaccount
+            );
+            continue;
+        }
 
         let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
             &taker_account_data.authority,
@@ -640,20 +673,14 @@ async fn try_auction_fill(
             OrderKind::TriggerMarket | OrderKind::TriggerLimit
         );
         if taker_is_trigger {
-            let actual_order = taker_account_data
-                .orders
-                .iter()
-                .find(|o| o.order_id == taker_order.order_id)
-                .expect("trigger order exists");
-
             let trigger_above = matches!(
-                actual_order.trigger_condition,
+                user_order.trigger_condition,
                 OrderTriggerCondition::Above | OrderTriggerCondition::TriggeredAbove
             );
 
-            let can_trigger = if trigger_above && trigger_price > actual_order.trigger_price {
+            let can_trigger = if trigger_above && trigger_price > user_order.trigger_price {
                 true
-            } else if !trigger_above && trigger_price < actual_order.trigger_price {
+            } else if !trigger_above && trigger_price < user_order.trigger_price {
                 true
             } else {
                 false
@@ -664,7 +691,7 @@ async fn try_auction_fill(
             log::info!(
                 target: TARGET,
                 "attempting trigger and fill: trigger_price={trigger_price}, order_price={}, {:?}/{:?}",
-                actual_order.trigger_price,
+                user_order.trigger_price,
                 taker_order.order_id,
                 taker_order.user
             );
@@ -857,6 +884,29 @@ async fn try_uncross(
         let taker_account_data = drift
             .try_get_account::<User>(&taker_subaccount)
             .expect("taker account");
+        let Some(user_order) = taker_account_data
+            .orders
+            .iter()
+            .find(|o| o.order_id == taker_order_id)
+        else {
+            log::warn!(
+                target: TARGET,
+                "skip uncross: taker order missing (order_id={}, user={})",
+                taker_order_id,
+                taker_subaccount
+            );
+            continue;
+        };
+        if user_order.market_type != MarketType::Perp {
+            log::warn!(
+                target: TARGET,
+                "skip non-perp uncross: order_id={}, market_type={:?}, user={}",
+                taker_order_id,
+                user_order.market_type,
+                taker_subaccount
+            );
+            continue;
+        }
 
         let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
             &taker_account_data.authority,
